@@ -27,14 +27,50 @@ class Finding:
         return f"{self.path}:{self.line}: {self.message}"
 
 
-def candidate_files() -> list[Path]:
+@dataclass(frozen=True)
+class Candidate:
+    path: Path
+    source: str
+
+
+FORBIDDEN_BASENAMES = {
+    ".DS_Store",
+    "AGENTS.md",
+    "CLAUDE.md",
+}
+
+FORBIDDEN_MEDIA_SUFFIXES = {
+    ".aac",
+    ".avi",
+    ".flac",
+    ".m4a",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".wav",
+    ".webm",
+}
+
+
+def git_paths(*args: str) -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        ["git", "ls-files", "-z", *args],
         check=True,
         capture_output=True,
     )
     names = result.stdout.decode().split("\0")
     return [Path(name) for name in names if name]
+
+
+def candidate_files() -> list[Candidate]:
+    cached_paths = git_paths("--cached")
+    other_paths = git_paths("--others", "--exclude-standard")
+    candidates = [Candidate(path, "index") for path in cached_paths]
+    cached = set(cached_paths)
+    candidates.extend(Candidate(path, "worktree") for path in other_paths if path not in cached)
+    return candidates
 
 
 def forbidden_path_reason(path: Path) -> str | None:
@@ -53,11 +89,8 @@ def forbidden_path_reason(path: Path) -> str | None:
         ".serena/",
     )
     exact = {
-        ".DS_Store",
         ".review-journal.json",
         ".review-journal.version",
-        "AGENTS.md",
-        "CLAUDE.md",
         "gates.toml",
         "docs/GOALFLOW_TRACK.md",
         "docs/ORCHESTRATION.md",
@@ -66,10 +99,12 @@ def forbidden_path_reason(path: Path) -> str | None:
         "tools/capture_usage.py",
         "tools/gate_check.py",
     }
-    if text in exact or path.name in {".DS_Store"}:
+    if text in exact or path.name in FORBIDDEN_BASENAMES:
         return "forbidden public path"
     if any(text.startswith(prefix) for prefix in prefixes):
         return "forbidden public path prefix"
+    if path.suffix.lower() in FORBIDDEN_MEDIA_SUFFIXES:
+        return "audio/video media files are not allowed in the public tree"
     return None
 
 
@@ -104,12 +139,33 @@ def content_patterns() -> list[tuple[re.Pattern[str], str]]:
     return patterns
 
 
-def scan_content(path: Path, patterns: list[tuple[re.Pattern[str], str]]) -> list[Finding]:
+def read_candidate_text(candidate: Candidate) -> str | None:
+    if candidate.source == "index":
+        result = subprocess.run(
+            ["git", "show", f":{candidate.path.as_posix()}"],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return None
+        data = result.stdout
+    else:
+        data = candidate.path.read_bytes()
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def scan_content(
+    candidate: Candidate, patterns: list[tuple[re.Pattern[str], str]]
+) -> list[Finding]:
+    path = candidate.path
     if path in CONTENT_EXEMPT_PATHS:
         return []
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+    text = read_candidate_text(candidate)
+    if text is None:
         return []
 
     findings: list[Finding] = []
@@ -125,12 +181,13 @@ def main() -> int:
     patterns = content_patterns()
     findings: list[Finding] = []
 
-    for path in files:
+    for candidate in files:
+        path = candidate.path
         reason = forbidden_path_reason(path)
         if reason is not None:
             findings.append(Finding(path.as_posix(), None, reason))
-        if path.is_file():
-            findings.extend(scan_content(path, patterns))
+        if path.is_file() or candidate.source == "index":
+            findings.extend(scan_content(candidate, patterns))
 
     if findings:
         print("public safety check failed:", file=sys.stderr)
