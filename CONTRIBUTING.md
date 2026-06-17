@@ -24,9 +24,10 @@ Keep pull requests small and focused. A good PR explains:
 - how it was verified;
 - any known limits or follow-up work.
 
-The protected `main` branch requires CI, review, and resolved conversations
-before merge. Do not force-push over review feedback unless the branch is still
-your own unmerged PR branch and the rewrite is clearly helpful.
+The protected `main` branch requires CI, an automated review status, and
+resolved conversations before merge. Do not force-push over review feedback
+unless the branch is still your own unmerged PR branch and the rewrite is
+clearly helpful.
 
 ## Public Repository Safety
 
