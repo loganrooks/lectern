@@ -1,0 +1,219 @@
+{
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A produced file, content-addressed for idempotence checks.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "Source": {
+      "description": "Provenance. `local` sources trigger the privacy hard rule (ADR-0002).",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "ref": {
+          "title": "Ref",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Channel"
+        },
+        "published": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Published"
+        },
+        "duration_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration S"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "SourceKind": {
+      "enum": [
+        "youtube",
+        "local",
+        "url"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "StageName": {
+      "enum": [
+        "acquire",
+        "normalize",
+        "transcribe",
+        "diarize",
+        "visual",
+        "enrich",
+        "situate",
+        "synthesize"
+      ],
+      "title": "StageName",
+      "type": "string"
+    },
+    "StageRecord": {
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/StageState",
+          "default": "pending"
+        },
+        "started": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started"
+        },
+        "finished": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished"
+        },
+        "outputs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "title": "Outputs",
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "title": "StageRecord",
+      "type": "object"
+    },
+    "StageState": {
+      "enum": [
+        "pending",
+        "running",
+        "done",
+        "failed",
+        "skipped"
+      ],
+      "title": "StageState",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "default": "0.1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "bundle_id": {
+      "title": "Bundle Id",
+      "type": "string"
+    },
+    "created": {
+      "format": "date-time",
+      "title": "Created",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/Source"
+    },
+    "stages": {
+      "additionalProperties": {
+        "$ref": "#/$defs/StageRecord"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/StageName"
+      },
+      "title": "Stages",
+      "type": "object"
+    }
+  },
+  "required": [
+    "bundle_id",
+    "source"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

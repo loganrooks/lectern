@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+
+dist/
+build/
+*.egg-info/
+
+.DS_Store
+
+# Generated user data and local run output.
+bundles/
+pytest-cache-files-*/

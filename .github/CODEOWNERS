@@ -1,0 +1,5 @@
+# Repository ownership for protected public surfaces.
+/.github/CODEOWNERS @loganrooks
+/.github/workflows/ @loganrooks
+/LICENSE @loganrooks
+/docs/adr/ @loganrooks
