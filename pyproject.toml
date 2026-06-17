@@ -37,7 +37,7 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "tools"]
 extraPaths = ["src", "tools"]
 typeCheckingMode = "strict"
 

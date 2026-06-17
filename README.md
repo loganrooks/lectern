@@ -1,29 +1,50 @@
 # lectern
 
-**Turn talks into thought.** Lectern ingests recorded talks — YouTube videos, streams, and your own live lecture recordings — and renders them into *knowledge bundles*: timestamped transcripts, analyzed visual aids, extracted references, and grounded summaries, structured for both human reading and agentic workflows (summarize, chat-with-talk, trace the surrounding discourse, surface follow-up questions).
+[![CI](https://github.com/loganrooks/lectern/actions/workflows/ci.yml/badge.svg)](https://github.com/loganrooks/lectern/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
-> Working name. Candidates under consideration: **lectern** (where the talk happens), **rostrum**, **ruminant** (the digestion metaphor), **colloq**. Rename is trivial pre-publication; see `docs/DESIGN.md` §Open Items.
+**Turn talks into thought.** Lectern ingests recorded talks and produces local,
+inspectable knowledge bundles for humans and agents.
 
-## Why
+Lectern is currently pre-release. The design is documented, the core bundle
+schema and CLI scaffold exist, and the project is building toward a local-first
+media pipeline.
 
-AI research talks are dense with expert guidance that never makes it into papers — but there are too many to watch, and "Watch Later" is where they go to die. Lectern replaces that dead-end with an ingestion queue: add a video to a dedicated playlist (or drop a recording in a folder), and it becomes a fully analyzable artifact you can interrogate instead of a 90-minute obligation.
+## Design Shape
 
-## Status
+- Pipeline of pure stages: acquire, normalize, transcribe, diarize, visual,
+  enrich, situate, synthesize.
+- Durable bundle artifacts on disk, with explicit manifests and stage records.
+- Local-first media processing with per-stage opt-in for remote APIs.
+- Synthetic fixtures only; no copyrighted media fixtures in the repository.
 
-**Pre-implementation.** Design is complete (`docs/DESIGN.md`); implementation is early. Nothing is usable yet.
+## Development
 
-## Design at a glance
+Prerequisites:
 
-- **Pipeline of pure stages**: acquire → normalize → transcribe → diarize → visual → enrich → situate → synthesize. Each stage reads/writes typed on-disk artifacts inside a *bundle* — the durable contract (`docs/adr/0003`).
-- **Local-first compute**: transcription via mlx-whisper / whisper.cpp / faster-whisper on your machine; cloud APIs are per-stage opt-in (`docs/adr/0002`). Local recordings never leave your machine without explicit per-item consent.
-- **Portable core, platform adapters**: one Python core + CLI everywhere; hardware/OS-specific backends (MLX on Apple Silicon, CUDA elsewhere, macOS Vision OCR vs tesseract) behind capability interfaces (`docs/adr/0001`).
-- **CLI + watch daemon first, GUI later** (`docs/adr/0004`).
-- **Agent-ready output**: deterministic bundle layout, every claim timestamp-anchored, plus an MCP server for chat-with-talk.
+- Python 3.12 or newer
+- `uv`
+- `ffmpeg` for media work beyond the scaffold
 
-## For contributors
+```bash
+make sync
+make verify
+```
 
-Read `docs/DESIGN.md`, then `docs/GREY_AREAS.md` (the honest list of legal/technical grey zones and how we handle them). Verification entrypoint: `make verify`.
+`make verify` is the local and CI verification entrypoint. It runs linting,
+format checks, type checks, tests, and the public repository safety check.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security
+and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
+
+## Documentation
+
+- [Design](docs/DESIGN.md)
+- [Grey Areas](docs/GREY_AREAS.md)
+- [Architecture decisions](docs/adr/)
 
 ## License
 
-MIT (see `LICENSE`). Lectern processes media you have the right to access, on your own machine, and provides no redistribution features — see `docs/GREY_AREAS.md` §1.
+MIT. Lectern processes media you have the right to access, on your own machine,
+and provides no redistribution features.

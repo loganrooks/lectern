@@ -1,0 +1,25 @@
+name: Documentation
+description: Report unclear or missing documentation.
+title: "docs: "
+labels:
+  - documentation
+body:
+  - type: textarea
+    id: location
+    attributes:
+      label: Location
+      description: Which page or section is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: Issue
+      description: What was confusing, missing, or stale?
+    validations:
+      required: true
+  - type: textarea
+    id: suggested
+    attributes:
+      label: Suggested Change
+      description: Optional wording or structure that would help.
