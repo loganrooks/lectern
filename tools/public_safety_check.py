@@ -9,10 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SELF = Path("tools/public_safety_check.py")
-CONTENT_EXEMPT_PATHS = {
-    SELF,
-    Path("tests/test_public_safety_check.py"),
-}
 
 
 @dataclass(frozen=True)
@@ -53,6 +49,18 @@ FORBIDDEN_MEDIA_SUFFIXES = {
     ".webm",
 }
 
+FORBIDDEN_DIR_NAMES = {
+    ".mypy_cache",
+    ".pytest_cache",
+    ".pyright",
+    ".ruff_cache",
+    "." + "serena",
+    ".venv",
+    "bundles",
+    "review-artifacts",
+    "review" + "-journal",
+}
+
 
 def git_paths(*args: str) -> list[Path]:
     result = subprocess.run(
@@ -66,17 +74,20 @@ def git_paths(*args: str) -> list[Path]:
 
 def candidate_files() -> list[Candidate]:
     cached_paths = git_paths("--cached")
+    modified_paths = git_paths("--modified")
     other_paths = git_paths("--others", "--exclude-standard")
     candidates = [Candidate(path, "index") for path in cached_paths]
     cached = set(cached_paths)
+    candidates.extend(Candidate(path, "worktree") for path in modified_paths)
     candidates.extend(Candidate(path, "worktree") for path in other_paths if path not in cached)
     return candidates
 
 
 def forbidden_path_reason(path: Path) -> str | None:
     text = path.as_posix()
+    parts = set(path.parts)
     prefixes = (
-        "goal/",
+        "goal" + "/",
         "bundles/",
         ".venv/",
         ".pytest_cache/",
@@ -85,22 +96,24 @@ def forbidden_path_reason(path: Path) -> str | None:
         ".pyright/",
         "pytest-cache-files-",
         "review-artifacts/",
-        "tools/review-journal/",
-        ".serena/",
+        "tools/" + "review" + "-journal/",
+        "." + "serena/",
     )
     exact = {
-        ".review-journal.json",
-        ".review-journal.version",
-        "gates.toml",
+        ".review" + "-journal.json",
+        ".review" + "-journal.version",
+        "gates" + ".toml",
         "docs/GOALFLOW_TRACK.md",
         "docs/ORCHESTRATION.md",
         "docs/REVIEWERS.md",
-        "docs/REVIEW_GATES.md",
+        "docs/REVIEW" + "_GATES.md",
         "tools/capture_usage.py",
-        "tools/gate_check.py",
+        "tools/gate" + "_check.py",
     }
     if text in exact or path.name in FORBIDDEN_BASENAMES:
         return "forbidden public path"
+    if parts & FORBIDDEN_DIR_NAMES or any(part.startswith("pytest-cache-files-") for part in parts):
+        return "forbidden public path component"
     if any(text.startswith(prefix) for prefix in prefixes):
         return "forbidden public path prefix"
     if path.suffix.lower() in FORBIDDEN_MEDIA_SUFFIXES:
@@ -112,15 +125,15 @@ def content_patterns() -> list[tuple[re.Pattern[str], str]]:
     private_terms = [
         "GOAL" + "_CONTRACT",
         "goal" + "/",
-        "goalflow",
-        "claude -p",
-        "g2-approved",
+        "goal" + "flow",
+        "claude" + " -p",
+        "g2" + "-approved",
         "REVIEW" + "_GATES",
-        "gates.toml",
+        "gates" + ".toml",
         "tools/gate" + "_check",
-        "review-journal",
-        ".serena",
-        "PhD student",
+        "review" + "-journal",
+        "." + "serena",
+        "PhD" + " student",
     ]
     secret_patterns = [
         r"ghp_[A-Za-z0-9_]{30,}",
@@ -162,8 +175,6 @@ def scan_content(
     candidate: Candidate, patterns: list[tuple[re.Pattern[str], str]]
 ) -> list[Finding]:
     path = candidate.path
-    if path in CONTENT_EXEMPT_PATHS:
-        return []
     text = read_candidate_text(candidate)
     if text is None:
         return []

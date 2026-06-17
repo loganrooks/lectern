@@ -17,6 +17,7 @@ SPEC.loader.exec_module(public_safety_check)
 
 content_patterns = public_safety_check.content_patterns
 Candidate = public_safety_check.Candidate
+candidate_files = public_safety_check.candidate_files
 forbidden_path_reason = public_safety_check.forbidden_path_reason
 scan_content = public_safety_check.scan_content
 
@@ -32,14 +33,16 @@ def messages_for(path: Path) -> list[str]:
 
 
 def test_forbidden_public_paths_are_blocked() -> None:
-    assert forbidden_path_reason(Path("goal/GOAL.md")) is not None
+    assert forbidden_path_reason(Path("goal" + "/GOAL.md")) is not None
     assert forbidden_path_reason(Path("bundles/example/manifest.json")) is not None
     assert forbidden_path_reason(Path("AGENTS.md")) is not None
     assert forbidden_path_reason(Path("docs/AGENTS.md")) is not None
     assert forbidden_path_reason(Path("src/CLAUDE.md")) is not None
-    assert forbidden_path_reason(Path("tools/gate_check.py")) is not None
+    assert forbidden_path_reason(Path("tools/gate" + "_check.py")) is not None
     assert forbidden_path_reason(Path("tests/fixtures/talk.mp4")) is not None
     assert forbidden_path_reason(Path("tests/fixtures/recording.wav")) is not None
+    assert forbidden_path_reason(Path("docs/review-artifacts/raw.txt")) is not None
+    assert forbidden_path_reason(Path("examples/.venv/pyvenv.cfg")) is not None
 
 
 def test_normal_project_vocabulary_is_allowed(tmp_path: Path) -> None:
@@ -56,7 +59,13 @@ def test_normal_project_vocabulary_is_allowed(tmp_path: Path) -> None:
 def test_private_governance_terms_are_blocked(tmp_path: Path) -> None:
     path = write_tmp(
         tmp_path / "notes.md",
-        "Do not publish GOAL_CONTRACT details, goal/ state, or review-journal output.\n",
+        "Do not publish "
+        + "GOAL"
+        + "_CONTRACT details, "
+        + "goal"
+        + "/ state, or "
+        + "review"
+        + "-journal output.\n",
     )
 
     assert messages_for(path) == [
@@ -67,11 +76,12 @@ def test_private_governance_terms_are_blocked(tmp_path: Path) -> None:
 
 
 def test_modern_secret_shapes_are_blocked(tmp_path: Path) -> None:
+    ant_key = "sk-" + "ant-api03-" + ("A" * 24)
+    project_key = "sk-" + "proj-" + ("B" * 24)
+    service_key = "sk-" + "svcacct-" + ("C" * 24)
     path = write_tmp(
         tmp_path / "leak.txt",
-        "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA\n"
-        "sk-proj-BBBBBBBBBBBBBBBBBBBBBBBB\n"
-        "sk-svcacct-CCCCCCCCCCCCCCCCCCCCCCCC\n",
+        f"{ant_key}\n{project_key}\n{service_key}\n",
     )
 
     assert messages_for(path) == ["possible secret", "possible secret", "possible secret"]
@@ -95,10 +105,11 @@ def test_index_content_is_scanned_even_when_worktree_differs(
 
     def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         del args, kwargs
+        ant_key = "sk-" + "ant-api03-" + ("A" * 24)
         return subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=b"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA\n",
+            stdout=f"{ant_key}\n".encode(),
         )
 
     monkeypatch.setattr(public_safety_check.subprocess, "run", fake_run)
@@ -106,3 +117,31 @@ def test_index_content_is_scanned_even_when_worktree_differs(
     assert [finding.message for finding in scan_content(candidate, content_patterns())] == [
         "possible secret"
     ]
+
+
+def test_dirty_tracked_files_get_worktree_candidates(monkeypatch: MonkeyPatch) -> None:
+    def fake_git_paths(*args: str) -> list[Path]:
+        if args == ("--cached",):
+            return [Path("README.md")]
+        if args == ("--modified",):
+            return [Path("README.md")]
+        if args == ("--others", "--exclude-standard"):
+            return []
+        raise AssertionError(f"unexpected args: {args}")
+
+    monkeypatch.setattr(public_safety_check, "git_paths", fake_git_paths)
+
+    assert candidate_files() == [
+        Candidate(Path("README.md"), "index"),
+        Candidate(Path("README.md"), "worktree"),
+    ]
+
+
+def test_test_vector_file_is_not_blanket_exempt(tmp_path: Path) -> None:
+    leaked_key = "sk-" + "ant-api03-" + ("D" * 24)
+    path = write_tmp(
+        tmp_path / "test_public_safety_check.py",
+        f"unexpected leak = '{leaked_key}'\n",
+    )
+
+    assert messages_for(path) == ["possible secret"]
