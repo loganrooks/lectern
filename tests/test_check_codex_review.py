@@ -74,6 +74,12 @@ def test_has_required_review_accepts_all_submitted_states() -> None:
         assert has_required_review(reviews, "chatgpt-codex-connector", "abc123")
 
 
+def test_has_required_review_accepts_bot_suffix() -> None:
+    reviews = [Review("chatgpt-codex-connector[bot]", "COMMENTED", "abc123")]
+
+    assert has_required_review(reviews, "chatgpt-codex-connector", "abc123")
+
+
 def test_has_required_review_rejects_unsubmitted_states() -> None:
     for state in ["DISMISSED", "PENDING"]:
         reviews = [Review("chatgpt-codex-connector", state, "abc123")]
@@ -121,4 +127,63 @@ def test_main_queries_most_recent_reviews(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(check_codex_review, "graphql_request", fake_graphql_request)
 
     assert check_codex_review.main() == 0
-    assert "reviews(last: 100)" in captured_query
+    assert "reviews(last: 100, before: $before)" in captured_query
+
+
+def test_main_pages_through_older_reviews(monkeypatch: pytest.MonkeyPatch) -> None:
+    before_values: list[object] = []
+
+    def fake_graphql_request(token: str, query: str, variables: dict[str, object]) -> object:
+        before_values.append(variables["before"])
+        if variables["before"] is None:
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviews": {
+                                "pageInfo": {
+                                    "hasPreviousPage": True,
+                                    "startCursor": "cursor-1",
+                                },
+                                "nodes": [
+                                    {
+                                        "author": {"login": "loganrooks"},
+                                        "state": "COMMENTED",
+                                        "commit": {"oid": "abc123"},
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "pageInfo": {
+                                "hasPreviousPage": False,
+                                "startCursor": "cursor-0",
+                            },
+                            "nodes": [
+                                {
+                                    "author": {"login": "chatgpt-codex-connector"},
+                                    "state": "COMMENTED",
+                                    "commit": {"oid": "abc123"},
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "loganrooks/lectern")
+    monkeypatch.setenv("PR_NUMBER", "2")
+    monkeypatch.setenv("HEAD_SHA", "abc123")
+    monkeypatch.setattr(check_codex_review, "graphql_request", fake_graphql_request)
+
+    assert check_codex_review.main() == 0
+    assert before_values == [None, "cursor-1"]

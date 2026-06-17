@@ -20,6 +20,13 @@ class Review:
     commit_oid: str | None
 
 
+@dataclass(frozen=True)
+class ReviewPage:
+    reviews: list[Review]
+    has_previous_page: bool
+    start_cursor: str | None
+
+
 def as_dict(value: object) -> dict[str, object]:
     if isinstance(value, dict):
         return cast(dict[str, object], value)
@@ -51,11 +58,15 @@ def raise_for_graphql_errors(payload: object) -> None:
     raise RuntimeError("GitHub GraphQL error: " + "; ".join(messages))
 
 
-def reviews_from_payload(payload: object) -> list[Review]:
+def pull_request_from_payload(payload: object) -> dict[str, object]:
     root = as_dict(payload)
     data = as_dict(root.get("data"))
     repository = as_dict(data.get("repository"))
-    pull_request = as_dict(repository.get("pullRequest"))
+    return as_dict(repository.get("pullRequest"))
+
+
+def reviews_from_payload(payload: object) -> list[Review]:
+    pull_request = pull_request_from_payload(payload)
     reviews = as_dict(pull_request.get("reviews"))
     nodes = as_list(reviews.get("nodes"))
 
@@ -74,9 +85,28 @@ def reviews_from_payload(payload: object) -> list[Review]:
     return parsed
 
 
+def review_page_from_payload(payload: object) -> ReviewPage:
+    pull_request = pull_request_from_payload(payload)
+    reviews = as_dict(pull_request.get("reviews"))
+    page_info = as_dict(reviews.get("pageInfo"))
+    return ReviewPage(
+        reviews=reviews_from_payload(payload),
+        has_previous_page=page_info.get("hasPreviousPage") is True,
+        start_cursor=as_str(page_info.get("startCursor")) or None,
+    )
+
+
+def normalize_login(login: str) -> str:
+    return login.removesuffix("[bot]")
+
+
+def reviewer_login_matches(author: str, reviewer_login: str) -> bool:
+    return normalize_login(author) == normalize_login(reviewer_login)
+
+
 def has_required_review(reviews: list[Review], reviewer_login: str, head_sha: str) -> bool:
     return any(
-        review.author == reviewer_login
+        reviewer_login_matches(review.author, reviewer_login)
         and review.state in SUBMITTED_STATES
         and review.commit_oid == head_sha
         for review in reviews
@@ -137,10 +167,14 @@ def main() -> int:
         return 1
 
     query = """
-    query($owner: String!, $repo: String!, $number: Int!) {
+    query($owner: String!, $repo: String!, $number: Int!, $before: String) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
-            reviews(last: 100) {
+          reviews(last: 100, before: $before) {
+            pageInfo {
+              hasPreviousPage
+              startCursor
+            }
             nodes {
               author { login }
               state
@@ -151,19 +185,26 @@ def main() -> int:
       }
     }
     """
+    before: str | None = None
     try:
-        payload = graphql_request(
-            token,
-            query,
-            {"owner": owner, "repo": repo, "number": number},
-        )
+        while True:
+            payload = graphql_request(
+                token,
+                query,
+                {"owner": owner, "repo": repo, "number": number, "before": before},
+            )
+            review_page = review_page_from_payload(payload)
+            if has_required_review(review_page.reviews, reviewer_login, head_sha):
+                print(f"codex review: found {reviewer_login} review for {head_sha}")
+                return 0
+            if not review_page.has_previous_page:
+                break
+            before = review_page.start_cursor
+            if before is None:
+                break
     except RuntimeError as error:
         print(f"codex review: {error}", file=sys.stderr)
         return 1
-    reviews = reviews_from_payload(payload)
-    if has_required_review(reviews, reviewer_login, head_sha):
-        print(f"codex review: found {reviewer_login} review for {head_sha}")
-        return 0
 
     print(
         f"codex review: missing {reviewer_login} review for current head {head_sha}",
