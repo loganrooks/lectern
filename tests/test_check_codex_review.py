@@ -80,8 +80,8 @@ def test_has_required_review_accepts_bot_suffix() -> None:
     assert has_required_review(reviews, "chatgpt-codex-connector", "abc123")
 
 
-def test_has_required_review_rejects_unsubmitted_states() -> None:
-    for state in ["DISMISSED", "PENDING"]:
+def test_has_required_review_rejects_unaccepted_states() -> None:
+    for state in ["CHANGES_REQUESTED", "DISMISSED", "PENDING"]:
         reviews = [Review("chatgpt-codex-connector", state, "abc123")]
 
         assert not has_required_review(reviews, "chatgpt-codex-connector", "abc123")

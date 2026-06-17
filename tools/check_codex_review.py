@@ -10,7 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import cast
 
-SUBMITTED_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+SUBMITTED_STATES = {"APPROVED", "COMMENTED"}
 
 
 @dataclass(frozen=True)
