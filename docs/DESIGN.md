@@ -29,6 +29,7 @@ parameters, timing, and artifact hashes.
 | diarize | audio + transcript | `transcript/diarization.json` | Optional speaker structure. |
 | visual | video | `visual/frames/`, `visual/slides.json` | Frame sampling, OCR, and visual descriptions. |
 | enrich | transcript + visuals | `refs/references.json` | Extracted names, titles, URLs, and identifiers. |
+| situate | transcript + references | contextual notes for synthesis | Positions the source in relation to resolved references and prior bundle context. |
 | synthesize | bundle artifacts | `analysis/summary.md`, `analysis/claims.md`, `analysis/questions.md` | Timestamp-grounded analysis. |
 
 ## Bundle Layout
