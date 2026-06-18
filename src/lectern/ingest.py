@@ -52,10 +52,15 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
     if not source.is_file():
         raise IngestError(f"source file does not exist: {source}")
 
+    transcript = _read_fixture_transcript(source)
     source_digest = _sha256(source)
-    source_duration = _wav_duration_seconds(source)
     bundle_id = f"{_slug(source.stem)}-{source_digest[:12]}"
     bundle_dir = output_root / bundle_id
+
+    _ensure_bundle_dirs(bundle_dir)
+    audio_path = bundle_dir / "media" / "audio.wav"
+    _normalize_to_canonical_wav(source, audio_path)
+    source_duration = _wav_duration_seconds(audio_path)
 
     manifest = Manifest(
         bundle_id=bundle_id,
@@ -66,8 +71,6 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
             duration_s=source_duration,
         ),
     )
-
-    _ensure_bundle_dirs(bundle_dir)
 
     source_json = bundle_dir / "source.json"
     _write_json(
@@ -80,11 +83,8 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
     )
     manifest.stages[StageName.ACQUIRE] = _done_stage(bundle_dir, [source_json])
 
-    audio_path = bundle_dir / "media" / "audio.wav"
-    _normalize_to_canonical_wav(source, audio_path)
     manifest.stages[StageName.NORMALIZE] = _done_stage(bundle_dir, [audio_path])
 
-    transcript = _read_fixture_transcript(source)
     segments_path = bundle_dir / "transcript" / "segments.json"
     transcript_path = bundle_dir / "transcript" / "transcript.md"
     _write_json(segments_path, _segments_for(transcript, source_duration))
@@ -130,6 +130,7 @@ def _normalize_to_canonical_wav(source: Path, output: Path) -> None:
     if ffmpeg is None:
         raise IngestError("ffmpeg is required to normalize non-canonical audio")
 
+    temp_output = output.with_suffix(".tmp.wav")
     result = subprocess.run(
         [
             ffmpeg,
@@ -143,7 +144,7 @@ def _normalize_to_canonical_wav(source: Path, output: Path) -> None:
             str(CANONICAL_CHANNELS),
             "-ar",
             str(CANONICAL_SAMPLE_RATE),
-            str(output),
+            str(temp_output),
         ],
         check=False,
         capture_output=True,
@@ -151,7 +152,9 @@ def _normalize_to_canonical_wav(source: Path, output: Path) -> None:
     )
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "unknown ffmpeg failure"
+        temp_output.unlink(missing_ok=True)
         raise IngestError(f"audio normalization failed: {message}")
+    temp_output.replace(output)
 
 
 def _is_canonical_wav(path: Path) -> bool:
@@ -162,7 +165,7 @@ def _is_canonical_wav(path: Path) -> bool:
                 and audio.getframerate() == CANONICAL_SAMPLE_RATE
                 and audio.getsampwidth() == CANONICAL_SAMPLE_WIDTH
             )
-    except wave.Error:
+    except (EOFError, wave.Error):
         return False
 
 
@@ -173,7 +176,7 @@ def _wav_duration_seconds(path: Path) -> float | None:
             if frame_rate <= 0:
                 return None
             return audio.getnframes() / frame_rate
-    except wave.Error:
+    except (EOFError, wave.Error):
         return None
 
 
@@ -207,11 +210,11 @@ def _done_stage(bundle_dir: Path, outputs: list[Path]) -> StageRecord:
 
 
 def _artifact_ref(bundle_dir: Path, path: Path) -> ArtifactRef:
-    data = path.read_bytes()
+    digest, size = _digest_and_size(path)
     return ArtifactRef(
         path=path.relative_to(bundle_dir).as_posix(),
-        sha256=hashlib.sha256(data).hexdigest(),
-        bytes=len(data),
+        sha256=digest,
+        bytes=size,
     )
 
 
@@ -220,7 +223,17 @@ def _write_json(path: Path, payload: object) -> None:
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return _digest_and_size(path)[0]
+
+
+def _digest_and_size(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
 
 
 def _slug(value: str) -> str:
