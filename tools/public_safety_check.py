@@ -100,10 +100,6 @@ def tracked_paths_under(path: Path) -> list[Path]:
     return git_paths("--cached", "--", path.as_posix())
 
 
-def path_exists(path: Path) -> bool:
-    return path.exists()
-
-
 def candidate_files() -> list[Candidate]:
     cached_paths = git_paths("--cached")
     modified_paths = git_paths("--modified")
@@ -126,12 +122,12 @@ def local_only_boundary_findings() -> list[Finding]:
                     "local-only path is tracked in the public repository",
                 )
             )
-        if path_exists(path) and not git_reports_ignored(path):
+        if not git_reports_ignored(path):
             findings.append(
                 Finding(
                     path.as_posix(),
                     None,
-                    "local-only path exists but is not ignored/excluded",
+                    "local-only path is not ignored/excluded",
                 )
             )
     return findings

@@ -143,15 +143,12 @@ def test_dirty_tracked_files_get_worktree_candidates(monkeypatch: MonkeyPatch) -
     ]
 
 
-def test_local_only_boundary_allows_existing_ignored_paths(
+def test_local_only_boundary_allows_ignored_paths(
     monkeypatch: MonkeyPatch,
 ) -> None:
     def no_tracked_paths(path: Path) -> list[Path]:
         del path
         return []
-
-    def path_exists(path: Path) -> bool:
-        return path == Path("goal")
 
     def reports_ignored(path: Path) -> bool:
         del path
@@ -159,21 +156,17 @@ def test_local_only_boundary_allows_existing_ignored_paths(
 
     monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
     monkeypatch.setattr(public_safety_check, "tracked_paths_under", no_tracked_paths)
-    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
     monkeypatch.setattr(public_safety_check, "git_reports_ignored", reports_ignored)
 
     assert local_only_boundary_findings() == []
 
 
-def test_local_only_boundary_flags_existing_unignored_paths(
+def test_local_only_boundary_flags_unignored_paths_even_when_absent(
     monkeypatch: MonkeyPatch,
 ) -> None:
     def no_tracked_paths(path: Path) -> list[Path]:
         del path
         return []
-
-    def path_exists(path: Path) -> bool:
-        return path == Path("goal")
 
     def reports_ignored(path: Path) -> bool:
         del path
@@ -181,27 +174,24 @@ def test_local_only_boundary_flags_existing_unignored_paths(
 
     monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
     monkeypatch.setattr(public_safety_check, "tracked_paths_under", no_tracked_paths)
-    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
     monkeypatch.setattr(public_safety_check, "git_reports_ignored", reports_ignored)
 
     findings = local_only_boundary_findings()
 
-    assert [finding.message for finding in findings] == [
-        "local-only path exists but is not ignored/excluded"
-    ]
+    assert [finding.message for finding in findings] == ["local-only path is not ignored/excluded"]
 
 
 def test_local_only_boundary_flags_tracked_paths(monkeypatch: MonkeyPatch) -> None:
     def tracked_paths(path: Path) -> list[Path]:
         return [path / "GOAL.md"]
 
-    def path_exists(path: Path) -> bool:
+    def reports_ignored(path: Path) -> bool:
         del path
-        return False
+        return True
 
     monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
     monkeypatch.setattr(public_safety_check, "tracked_paths_under", tracked_paths)
-    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
+    monkeypatch.setattr(public_safety_check, "git_reports_ignored", reports_ignored)
 
     findings = local_only_boundary_findings()
 

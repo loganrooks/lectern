@@ -29,6 +29,7 @@ def payload(
     review_nodes: list[dict[str, Any]],
     comment_nodes: list[dict[str, Any]] | None = None,
     *,
+    head_sha: str = "abc123456789",
     has_previous_page: bool = False,
     start_cursor: str | None = "cursor-0",
 ) -> dict[str, Any]:
@@ -36,6 +37,7 @@ def payload(
         "data": {
             "repository": {
                 "pullRequest": {
+                    "headRefOid": head_sha,
                     "reviews": {
                         "pageInfo": {
                             "hasPreviousPage": has_previous_page,
@@ -51,12 +53,12 @@ def payload(
 
 
 def review_node(
-    author: str = "chatgpt-codex-connector",
+    author: str | None = "chatgpt-codex-connector",
     state: str = "COMMENTED",
     commit_oid: str | None = "abc123",
 ) -> dict[str, Any]:
     return {
-        "author": {"login": author},
+        "author": {"login": author} if author is not None else None,
         "state": state,
         "commit": {"oid": commit_oid} if commit_oid is not None else None,
     }
@@ -64,9 +66,9 @@ def review_node(
 
 def comment_node(
     body: str,
-    author: str = "chatgpt-codex-connector[bot]",
+    author: str | None = "chatgpt-codex-connector[bot]",
 ) -> dict[str, Any]:
-    return {"author": {"login": author}, "body": body}
+    return {"author": {"login": author} if author is not None else None, "body": body}
 
 
 def clean_review_body(commit: str) -> str:
@@ -78,6 +80,11 @@ def markdown_clean_review_body(commit: str) -> str:
         "Codex Review: Didn't find any major issues. Chef's kiss.\n\n"
         f"**Reviewed commit:** `{commit}`"
     )
+
+
+def resolve_to_head(ref: str) -> str | None:
+    del ref
+    return "abc123456789"
 
 
 def test_review_on_current_head_passes() -> None:
@@ -104,22 +111,43 @@ def test_changes_requested_does_not_pass() -> None:
     assert not has_required_review(reviews, "chatgpt-codex-connector", "abc123")
 
 
-def test_clean_review_comment_on_current_head_passes() -> None:
+def test_clean_review_comment_on_current_head_passes_with_resolver() -> None:
     comments = [
         ReviewComment("chatgpt-codex-connector[bot]", markdown_clean_review_body("abc1234"))
     ]
 
-    assert has_required_review_comment(comments, "chatgpt-codex-connector", "abc123456789")
+    assert has_required_review_comment(
+        comments, "chatgpt-codex-connector", "abc123456789", resolve_to_head
+    )
+
+
+def test_clean_review_comment_requires_unambiguous_prefix() -> None:
+    def resolve_to_different_commit(ref: str) -> str:
+        del ref
+        return "abc1234different"
+
+    assert not comment_reviews_head(markdown_clean_review_body("abc1234"), "abc123456789")
+    assert not comment_reviews_head(
+        markdown_clean_review_body("abc1234"),
+        "abc123456789",
+        resolve_to_different_commit,
+    )
+
+
+def test_clean_review_comment_accepts_full_head_without_resolver() -> None:
+    assert comment_reviews_head(clean_review_body("abc123456789"), "abc123456789")
 
 
 def test_clean_review_comment_on_old_head_fails() -> None:
     comments = [ReviewComment("chatgpt-codex-connector[bot]", clean_review_body("old1234"))]
 
-    assert not has_required_review_comment(comments, "chatgpt-codex-connector", "abc123456789")
+    assert not has_required_review_comment(
+        comments, "chatgpt-codex-connector", "abc123456789", resolve_to_head
+    )
 
 
 def test_clean_review_comment_requires_connector_author() -> None:
-    comments = [ReviewComment("loganrooks", clean_review_body("abc1234"))]
+    comments = [ReviewComment("loganrooks", clean_review_body("abc123456789"))]
 
     assert not has_required_review_comment(comments, "chatgpt-codex-connector", "abc123456789")
 
@@ -134,10 +162,22 @@ def test_reviews_from_payload_parses_review_nodes() -> None:
     assert reviews == [Review("chatgpt-codex-connector", "COMMENTED", "abc123")]
 
 
+def test_reviews_from_payload_treats_null_author_as_non_match() -> None:
+    reviews = reviews_from_payload(payload([review_node(author=None)]))
+
+    assert reviews == [Review("", "COMMENTED", "abc123")]
+
+
 def test_comments_from_payload_parses_comment_nodes() -> None:
     comments = comments_from_payload(payload([], [comment_node(clean_review_body("abc1234"))]))
 
     assert comments == [ReviewComment("chatgpt-codex-connector[bot]", clean_review_body("abc1234"))]
+
+
+def test_comments_from_payload_treats_null_author_as_non_match() -> None:
+    comments = comments_from_payload(payload([], [comment_node("body", author=None)]))
+
+    assert comments == [ReviewComment("", "body")]
 
 
 def test_main_accepts_paginated_review(monkeypatch: MonkeyPatch) -> None:
@@ -163,12 +203,33 @@ def test_main_accepts_paginated_review(monkeypatch: MonkeyPatch) -> None:
 def test_main_accepts_clean_review_comment(monkeypatch: MonkeyPatch) -> None:
     def fake_graphql_request(token: str, query: str, variables: dict[str, object]) -> object:
         del token, query, variables
-        return payload([], [comment_node(clean_review_body("abc1234"))])
+        return payload([], [comment_node(markdown_clean_review_body("abc1234"))])
+
+    def fake_commit_oid_for_ref(token: str, repository: str, ref: str) -> str:
+        del token, repository, ref
+        return "abc123456789"
 
     monkeypatch.setenv("GITHUB_TOKEN", "token")
     monkeypatch.setenv("GITHUB_REPOSITORY", "loganrooks/lectern")
     monkeypatch.setenv("PR_NUMBER", "3")
     monkeypatch.setenv("HEAD_SHA", "abc123456789")
+    monkeypatch.setattr(check_codex_review, "graphql_request", fake_graphql_request)
+    monkeypatch.setattr(check_codex_review, "commit_oid_for_ref", fake_commit_oid_for_ref)
+
+    assert check_codex_review.main() == 0
+
+
+def test_main_uses_pr_head_when_env_head_sha_is_missing(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_graphql_request(token: str, query: str, variables: dict[str, object]) -> object:
+        del token, query, variables
+        return payload([review_node(commit_oid="abc123456789")])
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "loganrooks/lectern")
+    monkeypatch.setenv("PR_NUMBER", "3")
+    monkeypatch.delenv("HEAD_SHA", raising=False)
     monkeypatch.setattr(check_codex_review, "graphql_request", fake_graphql_request)
 
     assert check_codex_review.main() == 0

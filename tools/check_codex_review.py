@@ -8,11 +8,14 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
 SUBMITTED_STATES = {"APPROVED", "COMMENTED"}
 REVIEWED_COMMIT_PATTERN = re.compile(r"(?:\*\*)?Reviewed commit:(?:\*\*)?\s*`([0-9a-fA-F]{7,40})`")
+
+CommitResolver = Callable[[str], str | None]
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,7 @@ class ReviewComment:
 
 @dataclass(frozen=True)
 class ReviewPage:
+    head_sha: str
     reviews: list[Review]
     comments: list[ReviewComment]
     has_previous_page: bool
@@ -54,6 +58,12 @@ def as_str(value: object) -> str:
     raise RuntimeError(f"expected string, got {type(value).__name__}")
 
 
+def author_login(value: object) -> str:
+    if value is None:
+        return ""
+    return as_str(as_dict(value).get("login", ""))
+
+
 def raise_for_graphql_errors(payload: object) -> None:
     root = as_dict(payload)
     errors = root.get("errors")
@@ -68,18 +78,25 @@ def pull_request_from_payload(payload: object) -> dict[str, object]:
     return as_dict(repository.get("pullRequest", {}))
 
 
+def head_sha_from_pull_request(pull_request: dict[str, object]) -> str:
+    return as_str(pull_request.get("headRefOid", ""))
+
+
+def head_sha_from_payload(payload: object) -> str:
+    return head_sha_from_pull_request(pull_request_from_payload(payload))
+
+
 def reviews_from_pull_request(pull_request: dict[str, object]) -> list[Review]:
     reviews_payload = as_dict(pull_request.get("reviews", {}))
     nodes = as_list(reviews_payload.get("nodes", []))
     reviews: list[Review] = []
     for node in nodes:
         review = as_dict(node)
-        author = as_dict(review.get("author", {}))
         commit = review.get("commit")
         commit_oid = as_str(as_dict(commit).get("oid", "")) if commit is not None else None
         reviews.append(
             Review(
-                author=as_str(author.get("login", "")),
+                author=author_login(review.get("author")),
                 state=as_str(review.get("state", "")),
                 commit_oid=commit_oid,
             )
@@ -97,10 +114,9 @@ def comments_from_pull_request(pull_request: dict[str, object]) -> list[ReviewCo
     comments: list[ReviewComment] = []
     for node in nodes:
         comment = as_dict(node)
-        author = as_dict(comment.get("author", {}))
         comments.append(
             ReviewComment(
-                author=as_str(author.get("login", "")),
+                author=author_login(comment.get("author")),
                 body=as_str(comment.get("body", "")),
             )
         )
@@ -116,6 +132,7 @@ def review_page_from_payload(payload: object) -> ReviewPage:
     reviews_payload = as_dict(pull_request.get("reviews", {}))
     page_info = as_dict(reviews_payload.get("pageInfo", {}))
     return ReviewPage(
+        head_sha=head_sha_from_pull_request(pull_request),
         reviews=reviews_from_pull_request(pull_request),
         comments=comments_from_pull_request(pull_request),
         has_previous_page=bool(page_info.get("hasPreviousPage")),
@@ -140,20 +157,33 @@ def has_required_review(reviews: list[Review], reviewer_login: str, head_sha: st
     )
 
 
-def comment_reviews_head(body: str, head_sha: str) -> bool:
+def comment_reviews_head(
+    body: str, head_sha: str, resolve_commit: CommitResolver | None = None
+) -> bool:
     head = head_sha.casefold()
-    return any(
-        head.startswith(match.group(1).casefold())
-        for match in REVIEWED_COMMIT_PATTERN.finditer(body)
-    )
+    for match in REVIEWED_COMMIT_PATTERN.finditer(body):
+        reviewed_commit = match.group(1).casefold()
+        if reviewed_commit == head:
+            return True
+        if not head.startswith(reviewed_commit):
+            continue
+        if resolve_commit is None:
+            continue
+        resolved_commit = resolve_commit(reviewed_commit)
+        if resolved_commit is not None and resolved_commit.casefold() == head:
+            return True
+    return False
 
 
 def has_required_review_comment(
-    comments: list[ReviewComment], reviewer_login: str, head_sha: str
+    comments: list[ReviewComment],
+    reviewer_login: str,
+    head_sha: str,
+    resolve_commit: CommitResolver | None = None,
 ) -> bool:
     return any(
         reviewer_login_matches(comment.author, reviewer_login)
-        and comment_reviews_head(comment.body, head_sha)
+        and comment_reviews_head(comment.body, head_sha, resolve_commit)
         for comment in comments
     )
 
@@ -182,6 +212,33 @@ def graphql_request(token: str, query: str, variables: dict[str, object]) -> obj
         raise RuntimeError(f"GitHub GraphQL request failed: {error}") from error
 
 
+def rest_request(token: str, path: str) -> object:
+    request = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub REST request failed: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"GitHub REST request failed: {error}") from error
+
+
+def commit_oid_for_ref(token: str, repository: str, ref: str) -> str | None:
+    try:
+        payload = rest_request(token, f"/repos/{repository}/commits/{ref}")
+    except RuntimeError:
+        return None
+    return as_str(as_dict(payload).get("sha", ""))
+
+
 def main() -> int:
     token = os.environ.get("GITHUB_TOKEN", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
@@ -195,7 +252,6 @@ def main() -> int:
             "GITHUB_TOKEN": token,
             "GITHUB_REPOSITORY": repository,
             "PR_NUMBER": pr_number,
-            "HEAD_SHA": head_sha,
         }.items()
         if not value
     ]
@@ -214,6 +270,7 @@ def main() -> int:
     query($owner: String!, $repo: String!, $number: Int!, $before: String) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
+          headRefOid
           reviews(last: 100, before: $before) {
             pageInfo {
               hasPreviousPage
@@ -245,11 +302,25 @@ def main() -> int:
                 {"owner": owner, "repo": repo, "number": number, "before": before},
             )
             review_page = review_page_from_payload(payload)
-            if has_required_review(review_page.reviews, reviewer_login, head_sha):
-                print(f"codex review: found {reviewer_login} review for {head_sha}")
+            current_head_sha = head_sha or review_page.head_sha
+            if not current_head_sha:
+                print("codex review: missing PR head sha", file=sys.stderr)
+                return 1
+
+            if has_required_review(review_page.reviews, reviewer_login, current_head_sha):
+                print(f"codex review: found {reviewer_login} review for {current_head_sha}")
                 return 0
-            if has_required_review_comment(review_page.comments, reviewer_login, head_sha):
-                print(f"codex review: found {reviewer_login} clean-review comment for {head_sha}")
+
+            def resolve_commit(ref: str) -> str | None:
+                return commit_oid_for_ref(token, repository, ref)
+
+            if has_required_review_comment(
+                review_page.comments, reviewer_login, current_head_sha, resolve_commit
+            ):
+                print(
+                    f"codex review: found {reviewer_login} clean-review comment "
+                    f"for {current_head_sha}"
+                )
                 return 0
             if not review_page.has_previous_page:
                 break
