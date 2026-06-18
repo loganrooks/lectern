@@ -72,7 +72,9 @@ def _export_schema(args: Sequence[str]) -> int:
 def _ingest(args: Sequence[str]) -> int:
     if not args or args[0].startswith("-"):
         print(
-            "usage: lectern ingest SOURCE [--output DIR] [--state PATH] [--json]", file=sys.stderr
+            "usage: lectern ingest SOURCE [--output DIR] [--state PATH] "
+            "[--transcriber-command COMMAND] [--json]",
+            file=sys.stderr,
         )
         return 2
 
@@ -80,6 +82,7 @@ def _ingest(args: Sequence[str]) -> int:
     output_root = Path("bundles")
     state_path = DEFAULT_STATE_PATH
     json_output = False
+    transcriber_command: str | None = None
     rest = list(args[1:])
     index = 0
     while index < len(rest):
@@ -90,19 +93,27 @@ def _ingest(args: Sequence[str]) -> int:
         elif token == "--state" and index + 1 < len(rest):
             state_path = Path(rest[index + 1])
             index += 2
+        elif token == "--transcriber-command" and index + 1 < len(rest):
+            transcriber_command = rest[index + 1]
+            index += 2
         elif token == "--json":
             json_output = True
             index += 1
         else:
             print(
-                "usage: lectern ingest SOURCE [--output DIR] [--state PATH] [--json]",
+                "usage: lectern ingest SOURCE [--output DIR] [--state PATH] "
+                "[--transcriber-command COMMAND] [--json]",
                 file=sys.stderr,
             )
             return 2
 
     try:
         with open_state(state_path) as state:
-            result = state.ingest_one_shot(source, output_root)
+            result = state.ingest_one_shot(
+                source,
+                output_root,
+                transcriber_command=transcriber_command,
+            )
     except IngestError as exc:
         print(f"ingest: {exc}", file=sys.stderr)
         return 1
@@ -319,14 +330,26 @@ def _queue_ingest(args: Sequence[str], state_path: Path, json_output: bool) -> i
         return 2
     queue_item_id = args[0]
     output_root = Path("bundles")
+    transcriber_command: str | None = None
     rest = list(args[1:])
-    if rest:
-        if len(rest) != 2 or rest[0] != "--output":
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--output" and index + 1 < len(rest):
+            output_root = Path(rest[index + 1])
+            index += 2
+        elif token == "--transcriber-command" and index + 1 < len(rest):
+            transcriber_command = rest[index + 1]
+            index += 2
+        else:
             _queue_usage()
             return 2
-        output_root = Path(rest[1])
     with open_state(state_path) as state:
-        result = state.ingest_queue_item(queue_item_id, output_root)
+        result = state.ingest_queue_item(
+            queue_item_id,
+            output_root,
+            transcriber_command=transcriber_command,
+        )
     if json_output:
         _print_json(
             {
@@ -429,7 +452,7 @@ def _queue_usage() -> None:
     print(
         "usage: lectern queue "
         "{list [--queue-state STATE]|show ITEM|approve ITEM|skip ITEM|retry ITEM|"
-        "ingest ITEM [--output DIR]} "
+        "ingest ITEM [--output DIR] [--transcriber-command COMMAND]} "
         "[--state PATH] [--json]",
         file=sys.stderr,
     )

@@ -1,6 +1,7 @@
 """CLI scaffold behavior for M0+."""
 
 import json
+import sys
 from pathlib import Path
 
 from pytest import CaptureFixture, MonkeyPatch
@@ -21,6 +22,13 @@ def copy_fixture(directory: Path) -> Path:
         SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    return media
+
+
+def copy_media_without_sidecar(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    media = directory / "local_talk.wav"
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
     return media
 
 
@@ -157,6 +165,51 @@ def test_ingest_command_writes_bundle(tmp_path: Path, capsys: CaptureFixture[str
     assert bundle_dir.is_dir()
     manifest = Manifest.load(bundle_dir)
     assert manifest.stages[StageName.TRANSCRIBE].state is StageState.DONE
+
+
+def test_ingest_command_accepts_local_transcriber_command_json(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"segments": [{"start_s": 3.0, "text": "CLI transcript."}]}),
+    )
+
+    assert (
+        cli.main(
+            [
+                "ingest",
+                str(source),
+                "--output",
+                str(tmp_path / "bundles"),
+                "--state",
+                str(tmp_path / "state.sqlite"),
+                "--transcriber-command",
+                f"{sys.executable} {transcriber}",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    bundle_dir = Path(payload["bundle_dir"])
+    source_json = json.loads((bundle_dir / "source.json").read_text(encoding="utf-8"))
+    assert payload["bundle_id"]
+    assert source_json["transcript"]["method"] == "local_command_json"
+    assert "[t=00:03] CLI transcript." in (bundle_dir / "analysis" / "summary.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_ingest_usage_error_mentions_transcriber_command(
+    capsys: CaptureFixture[str],
+) -> None:
+    assert cli.main(["ingest", "file.wav", "--bad-flag"]) == 2
+
+    captured = capsys.readouterr()
+    assert "--transcriber-command COMMAND" in captured.err
 
 
 def test_source_queue_library_commands_emit_json(
@@ -308,3 +361,11 @@ def test_cli_reports_corrupt_state_store_cleanly(
     captured = capsys.readouterr()
     assert "state database error" in captured.err
     assert "Traceback" not in captured.err
+
+
+def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:
+    path.write_text(
+        f"import sys\nsys.stdout.write({stdout!r})\nraise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    return path

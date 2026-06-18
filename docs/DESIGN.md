@@ -25,7 +25,7 @@ parameters, timing, and artifact hashes.
 | --- | --- | --- | --- |
 | acquire | source reference | `media/`, `source.json` | Source metadata and media capture. |
 | normalize | media | `media/audio.wav` | Local ffmpeg normalization. |
-| transcribe | audio | `transcript/segments.json`, `transcript.md` | Timestamped speech segments. |
+| transcribe | audio | `transcript/segments.json`, `transcript/transcript.md`, `transcript/metadata.json` | Timestamped speech segments plus method/provenance metadata. |
 | diarize | audio + transcript | `transcript/diarization.json` | Optional speaker structure. |
 | visual | video | `visual/frames/`, `visual/slides.json` | Frame sampling, OCR, and visual descriptions. |
 | enrich | transcript + visuals | `refs/references.json` | Extracted names, titles, URLs, and identifiers. |
@@ -40,10 +40,11 @@ parameters, timing, and artifact hashes.
   source.json
   media/
     audio.wav
-  transcript/
-    segments.json
-    transcript.md
-    diarization.json
+transcript/
+  segments.json
+  transcript.md
+  metadata.json
+  diarization.json
   visual/
     frames/
     slides.json
@@ -97,4 +98,7 @@ without explicit per-item consent.
 
 - Lectern does not redistribute copyrighted media.
 - Lectern is not a real-time transcription product.
+- Lectern's local command transcriber path records method metadata and timestamp
+  anchors; it does not prove transcript faithfulness or prove that a
+  user-supplied command is network-free.
 - Lectern does not require a hosted service to run the local pipeline.

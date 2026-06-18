@@ -458,7 +458,13 @@ class AutomationState:
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
         return self._set_queue_state(queue_item_id, QueueState.DISCOVERED, clear_error=True)
 
-    def ingest_queue_item(self, queue_item_id: str, output_root: Path) -> IngestResult:
+    def ingest_queue_item(
+        self,
+        queue_item_id: str,
+        output_root: Path,
+        *,
+        transcriber_command: str | None = None,
+    ) -> IngestResult:
         queue_item = self.get_queue_item(queue_item_id)
         if queue_item.state is not QueueState.APPROVED:
             raise AutomationError("queue item requires explicit approval before ingest")
@@ -479,9 +485,13 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
         try:
-            planned_bundle_id = plan_local_bundle_id(source_path)
+            planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
             self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
-            result = ingest_local(source_path, output_root)
+            result = ingest_local(
+                source_path,
+                output_root,
+                transcriber_command=transcriber_command,
+            )
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -508,9 +518,15 @@ class AutomationState:
             manifest=Manifest.load(result.bundle_dir),
         )
 
-    def ingest_one_shot(self, source_path: Path, output_root: Path) -> IngestResult:
+    def ingest_one_shot(
+        self,
+        source_path: Path,
+        output_root: Path,
+        *,
+        transcriber_command: str | None = None,
+    ) -> IngestResult:
         source_path = source_path.expanduser()
-        planned_bundle_id = plan_local_bundle_id(source_path)
+        planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
@@ -520,7 +536,11 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         try:
-            result = ingest_local(source_path, output_root)
+            result = ingest_local(
+                source_path,
+                output_root,
+                transcriber_command=transcriber_command,
+            )
         except (IngestError, OSError) as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -958,7 +978,12 @@ def attach_provenance_to_bundle(
         "consent": consent,
         "remote_services": {
             "allowed": False,
+            "scope": "lectern_core",
+            "lectern_invoked": False,
             "requires_explicit_per_item_consent": True,
+            "transcriber_network_posture": source_payload.get("transcript", {})
+            .get("remote_services", {})
+            .get("transcriber_network_posture", "not_recorded"),
         },
     }
     source_path.write_text(json.dumps(source_payload, indent=2) + "\n", encoding="utf-8")

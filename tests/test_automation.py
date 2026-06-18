@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,13 @@ def copy_fixture(directory: Path, name: str = "synthetic_talk.wav") -> Path:
         SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    return media
+
+
+def copy_media_without_sidecar(directory: Path, name: str = "local_talk.wav") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    media = directory / name
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
     return media
 
 
@@ -231,6 +239,81 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
 
 
+def test_queue_ingest_uses_local_transcriber_for_no_sidecar_source(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "start_s": 4.0,
+                        "end_s": 5.0,
+                        "text": "Queue command transcript.",
+                    }
+                ]
+            }
+        ),
+    )
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(
+            approved.id,
+            output_root,
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+        completed = state.get_queue_item(approved.id)
+        library = state.get_library_bundle(result.manifest.bundle_id)
+
+    source_json = json.loads((result.bundle_dir / "source.json").read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (result.bundle_dir / "transcript" / "metadata.json").read_text(encoding="utf-8")
+    )
+    summary = (result.bundle_dir / "analysis" / "summary.md").read_text(encoding="utf-8")
+
+    assert completed.state is QueueState.COMPLETED
+    assert library.queue_item_id == completed.id
+    assert source_json["transcript"]["method"] == "local_command_json"
+    assert source_json["provenance"]["remote_services"]["allowed"] is False
+    assert source_json["provenance"]["remote_services"]["scope"] == "lectern_core"
+    assert source_json["provenance"]["remote_services"]["transcriber_network_posture"] == (
+        "unverifiable_user_command"
+    )
+    assert metadata["remote_services"]["lectern_invoked"] is False
+    assert "[t=00:04] Queue command transcript." in summary
+
+
+def test_queue_ingest_records_failed_local_transcriber(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        "transcriber failed",
+        exit_code=7,
+    )
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(IngestError, match="local transcriber command failed"):
+            state.ingest_queue_item(
+                approved.id,
+                tmp_path / "bundles",
+                transcriber_command=f"{sys.executable} {transcriber}",
+            )
+        failed = state.get_queue_item(approved.id)
+
+    assert failed.state is QueueState.FAILED
+    assert failed.last_error is not None
+    assert "local transcriber command failed" in failed.last_error
+
+
 def test_queue_ingest_rejects_file_changed_after_approval(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     media = copy_fixture(source_dir)
@@ -387,3 +470,11 @@ def test_local_folder_scan_does_not_open_network_socket(
         delta = state.scan_source(source.id)
 
     assert len(delta.added) == 1
+
+
+def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:
+    path.write_text(
+        f"import sys\nsys.stdout.write({stdout!r})\nraise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    return path
