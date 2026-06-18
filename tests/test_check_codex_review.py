@@ -32,6 +32,8 @@ def payload(
     head_sha: str = "abc123456789",
     has_previous_page: bool = False,
     start_cursor: str | None = "cursor-0",
+    comment_has_previous_page: bool = False,
+    comment_start_cursor: str | None = "comment-cursor-0",
 ) -> dict[str, Any]:
     return {
         "data": {
@@ -45,7 +47,13 @@ def payload(
                         },
                         "nodes": review_nodes,
                     },
-                    "comments": {"nodes": comment_nodes or []},
+                    "comments": {
+                        "pageInfo": {
+                            "hasPreviousPage": comment_has_previous_page,
+                            "startCursor": comment_start_cursor,
+                        },
+                        "nodes": comment_nodes or [],
+                    },
                 }
             }
         }
@@ -217,6 +225,38 @@ def test_main_accepts_clean_review_comment(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(check_codex_review, "commit_oid_for_ref", fake_commit_oid_for_ref)
 
     assert check_codex_review.main() == 0
+
+
+def test_main_paginates_clean_review_comments(monkeypatch: MonkeyPatch) -> None:
+    before_values: list[object] = []
+
+    def fake_graphql_request(token: str, query: str, variables: dict[str, object]) -> object:
+        del token
+        if "reviews(last: 100" in query:
+            return payload([])
+
+        before_values.append(variables["before"])
+        if variables["before"] is None:
+            return payload(
+                [],
+                comment_has_previous_page=True,
+                comment_start_cursor="comment-cursor-1",
+            )
+        return payload([], [comment_node(markdown_clean_review_body("abc1234"))])
+
+    def fake_commit_oid_for_ref(token: str, repository: str, ref: str) -> str:
+        del token, repository, ref
+        return "abc123456789"
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "loganrooks/lectern")
+    monkeypatch.setenv("PR_NUMBER", "3")
+    monkeypatch.setenv("HEAD_SHA", "abc123456789")
+    monkeypatch.setattr(check_codex_review, "graphql_request", fake_graphql_request)
+    monkeypatch.setattr(check_codex_review, "commit_oid_for_ref", fake_commit_oid_for_ref)
+
+    assert check_codex_review.main() == 0
+    assert before_values == [None, "comment-cursor-1"]
 
 
 def test_main_uses_pr_head_when_env_head_sha_is_missing(

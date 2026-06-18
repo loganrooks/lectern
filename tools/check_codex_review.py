@@ -35,6 +35,13 @@ class ReviewComment:
 class ReviewPage:
     head_sha: str
     reviews: list[Review]
+    has_previous_page: bool
+    start_cursor: str | None
+
+
+@dataclass(frozen=True)
+class CommentPage:
+    head_sha: str
     comments: list[ReviewComment]
     has_previous_page: bool
     start_cursor: str | None
@@ -134,6 +141,17 @@ def review_page_from_payload(payload: object) -> ReviewPage:
     return ReviewPage(
         head_sha=head_sha_from_pull_request(pull_request),
         reviews=reviews_from_pull_request(pull_request),
+        has_previous_page=bool(page_info.get("hasPreviousPage")),
+        start_cursor=(as_str(page_info["startCursor"]) if page_info.get("startCursor") else None),
+    )
+
+
+def comment_page_from_payload(payload: object) -> CommentPage:
+    pull_request = pull_request_from_payload(payload)
+    comments_payload = as_dict(pull_request.get("comments", {}))
+    page_info = as_dict(comments_payload.get("pageInfo", {}))
+    return CommentPage(
+        head_sha=head_sha_from_pull_request(pull_request),
         comments=comments_from_pull_request(pull_request),
         has_previous_page=bool(page_info.get("hasPreviousPage")),
         start_cursor=(as_str(page_info["startCursor"]) if page_info.get("startCursor") else None),
@@ -266,7 +284,7 @@ def main() -> int:
         print("invalid GITHUB_REPOSITORY or PR_NUMBER", file=sys.stderr)
         return 1
 
-    query = """
+    reviews_query = """
     query($owner: String!, $repo: String!, $number: Int!, $before: String) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
@@ -282,7 +300,20 @@ def main() -> int:
               commit { oid }
             }
           }
-          comments(last: 100) {
+        }
+      }
+    }
+    """
+    comments_query = """
+    query($owner: String!, $repo: String!, $number: Int!, $before: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          headRefOid
+          comments(last: 100, before: $before) {
+            pageInfo {
+              hasPreviousPage
+              startCursor
+            }
             nodes {
               author { login }
               body
@@ -293,13 +324,13 @@ def main() -> int:
     }
     """
 
-    before: str | None = None
+    review_before: str | None = None
     try:
         while True:
             payload = graphql_request(
                 token,
-                query,
-                {"owner": owner, "repo": repo, "number": number, "before": before},
+                reviews_query,
+                {"owner": owner, "repo": repo, "number": number, "before": review_before},
             )
             review_page = review_page_from_payload(payload)
             current_head_sha = head_sha or review_page.head_sha
@@ -311,21 +342,40 @@ def main() -> int:
                 print(f"codex review: found {reviewer_login} review for {current_head_sha}")
                 return 0
 
+            if not review_page.has_previous_page:
+                break
+            review_before = review_page.start_cursor
+            if review_before is None:
+                break
+
+        comment_before: str | None = None
+        while True:
+            payload = graphql_request(
+                token,
+                comments_query,
+                {"owner": owner, "repo": repo, "number": number, "before": comment_before},
+            )
+            comment_page = comment_page_from_payload(payload)
+            current_head_sha = head_sha or comment_page.head_sha
+            if not current_head_sha:
+                print("codex review: missing PR head sha", file=sys.stderr)
+                return 1
+
             def resolve_commit(ref: str) -> str | None:
                 return commit_oid_for_ref(token, repository, ref)
 
             if has_required_review_comment(
-                review_page.comments, reviewer_login, current_head_sha, resolve_commit
+                comment_page.comments, reviewer_login, current_head_sha, resolve_commit
             ):
                 print(
                     f"codex review: found {reviewer_login} clean-review comment "
                     f"for {current_head_sha}"
                 )
                 return 0
-            if not review_page.has_previous_page:
+            if not comment_page.has_previous_page:
                 break
-            before = review_page.start_cursor
-            if before is None:
+            comment_before = comment_page.start_cursor
+            if comment_before is None:
                 break
     except RuntimeError as error:
         print(f"codex review: {error}", file=sys.stderr)
