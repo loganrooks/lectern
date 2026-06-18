@@ -42,6 +42,9 @@ def test_local_ingest_acceptance_for_synthetic_talk(tmp_path: Path) -> None:
     assert (bundle_dir / "transcript" / "segments.json").is_file()
     assert (bundle_dir / "transcript" / "transcript.md").is_file()
     assert (bundle_dir / "analysis" / "summary.md").is_file()
+    source_record = json.loads((bundle_dir / "source.json").read_text(encoding="utf-8"))
+    assert source_record["transcript_sidecar"]["path"] == str(SYNTHETIC_TRANSCRIPT)
+    assert source_record["transcript_sidecar"]["bytes"] == SYNTHETIC_TRANSCRIPT.stat().st_size
 
     reference = SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8").strip()
     transcript = (bundle_dir / "transcript" / "transcript.md").read_text(encoding="utf-8").strip()
@@ -60,7 +63,10 @@ def test_local_ingest_acceptance_for_synthetic_talk(tmp_path: Path) -> None:
     ]
 
     summary = (bundle_dir / "analysis" / "summary.md").read_text(encoding="utf-8")
-    assert "Lectern turns recorded talks into local inspectable knowledge bundles." in summary
+    assert (
+        "[t=00:00] Lectern turns recorded talks into local inspectable knowledge bundles."
+        in summary
+    )
 
 
 def test_local_ingest_rejects_missing_source(tmp_path: Path) -> None:
@@ -85,6 +91,31 @@ def test_local_ingest_rejects_empty_transcript_sidecar(tmp_path: Path) -> None:
 
     with pytest.raises(IngestError, match="fixture transcript is empty"):
         ingest_local(source, tmp_path / "bundles")
+
+
+def test_local_ingest_rejects_invalid_transcript_sidecar(tmp_path: Path) -> None:
+    source = tmp_path / "synthetic_talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    source.with_suffix(".transcript.txt").write_bytes(b"\xff\xfe\x00")
+
+    with pytest.raises(IngestError, match="not valid UTF-8"):
+        ingest_local(source, tmp_path / "bundles")
+
+
+def test_transcript_sidecar_changes_bundle_identity(tmp_path: Path) -> None:
+    first_source = tmp_path / "first" / "synthetic_talk.wav"
+    second_source = tmp_path / "second" / "synthetic_talk.wav"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    second_source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    first_source.with_suffix(".transcript.txt").write_text("first transcript\n", encoding="utf-8")
+    second_source.with_suffix(".transcript.txt").write_text("second transcript\n", encoding="utf-8")
+
+    first = ingest_local(first_source, tmp_path / "bundles")
+    second = ingest_local(second_source, tmp_path / "bundles")
+
+    assert first.bundle_dir != second.bundle_dir
 
 
 def test_noncanonical_audio_requires_ffmpeg(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

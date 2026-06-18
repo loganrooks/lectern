@@ -45,6 +45,16 @@ class IngestResult:
     manifest: Manifest
 
 
+@dataclass(frozen=True)
+class FixtureTranscript:
+    """Synthetic fixture transcript sidecar metadata."""
+
+    path: Path
+    text: str
+    sha256: str
+    bytes: int
+
+
 def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> IngestResult:
     """Ingest a local media file into a Lectern bundle."""
 
@@ -54,7 +64,8 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
 
     transcript = _read_fixture_transcript(source)
     source_digest = _sha256(source)
-    bundle_id = f"{_slug(source.stem)}-{source_digest[:12]}"
+    bundle_digest = _combined_digest(source_digest, transcript.sha256)
+    bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
     bundle_dir = output_root / bundle_id
 
     _ensure_bundle_dirs(bundle_dir)
@@ -79,6 +90,11 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
             "source": manifest.source.model_dump(mode="json"),
             "sha256": source_digest,
             "bytes": source.stat().st_size,
+            "transcript_sidecar": {
+                "path": str(transcript.path),
+                "sha256": transcript.sha256,
+                "bytes": transcript.bytes,
+            },
         },
     )
     manifest.stages[StageName.ACQUIRE] = _done_stage(bundle_dir, [source_json])
@@ -87,15 +103,15 @@ def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> Inge
 
     segments_path = bundle_dir / "transcript" / "segments.json"
     transcript_path = bundle_dir / "transcript" / "transcript.md"
-    _write_json(segments_path, _segments_for(transcript, source_duration))
-    transcript_path.write_text(transcript.rstrip() + "\n", encoding="utf-8")
+    _write_json(segments_path, _segments_for(transcript.text, source_duration))
+    transcript_path.write_text(transcript.text.rstrip() + "\n", encoding="utf-8")
     manifest.stages[StageName.TRANSCRIBE] = _done_stage(
         bundle_dir,
         [segments_path, transcript_path],
     )
 
     summary_path = bundle_dir / "analysis" / "summary.md"
-    summary_path.write_text(_summary_lite(transcript), encoding="utf-8")
+    summary_path.write_text(_summary_lite(transcript.text), encoding="utf-8")
     manifest.stages[StageName.SYNTHESIZE] = _done_stage(bundle_dir, [summary_path])
 
     manifest.save(bundle_dir)
@@ -107,12 +123,21 @@ def _ensure_bundle_dirs(bundle_dir: Path) -> None:
         (bundle_dir / relative).mkdir(parents=True, exist_ok=True)
 
 
-def _read_fixture_transcript(source: Path) -> str:
+def _read_fixture_transcript(source: Path) -> FixtureTranscript:
     transcript_path = source.with_suffix(".transcript.txt")
     if transcript_path.is_file():
-        transcript = transcript_path.read_text(encoding="utf-8").strip()
+        digest, size = _digest_and_size(transcript_path)
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise IngestError(f"fixture transcript is not valid UTF-8: {transcript_path}") from exc
         if transcript:
-            return transcript
+            return FixtureTranscript(
+                path=transcript_path,
+                text=transcript,
+                sha256=digest,
+                bytes=size,
+            )
         raise IngestError(f"fixture transcript is empty: {transcript_path}")
 
     raise IngestError(
@@ -196,7 +221,7 @@ def _summary_lite(transcript: str) -> str:
     normalized = " ".join(transcript.split())
     first_sentence = normalized.split(". ", maxsplit=1)[0].rstrip(".") + "."
     word_count = len(normalized.split())
-    return f"# Summary\n\n{first_sentence}\n\nWords: {word_count}\n"
+    return f"# Summary\n\n[t=00:00] {first_sentence}\n\nWords: {word_count}\n"
 
 
 def _done_stage(bundle_dir: Path, outputs: list[Path]) -> StageRecord:
@@ -224,6 +249,14 @@ def _write_json(path: Path, payload: object) -> None:
 
 def _sha256(path: Path) -> str:
     return _digest_and_size(path)[0]
+
+
+def _combined_digest(*digests: str) -> str:
+    digest = hashlib.sha256()
+    for value in digests:
+        digest.update(value.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _digest_and_size(path: Path) -> tuple[str, int]:
