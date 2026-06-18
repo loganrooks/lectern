@@ -66,6 +66,7 @@ ALLOWED_SYNTHETIC_MEDIA_FIXTURE_SHA256 = {
 }
 
 FORBIDDEN_DIR_NAMES = {
+    ".lectern",
     ".mypy_cache",
     ".pytest_cache",
     ".pyright",
@@ -78,6 +79,7 @@ FORBIDDEN_DIR_NAMES = {
 }
 
 LOCAL_ONLY_PATHS = (
+    Path(".lectern"),
     Path("goal"),
     Path("." + "serena"),
     Path("bundles"),

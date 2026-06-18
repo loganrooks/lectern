@@ -64,6 +64,9 @@ and resumability stay centralized.
 
 - The portable core is Python-first: bundle management, schemas, CLI entry
   points, and stage orchestration live in the package.
+- Local automation state is SQLite-backed. Source registry, discovery queue,
+  policy state, and the minimal library index live in local state rather than in
+  hidden process memory.
 - Platform adapters are edges, not the core. YouTube, local file, and future UI
   integrations should feed the same bundle contract.
 - The CLI is the first stable interface. GUI and daemon surfaces can be added

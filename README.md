@@ -35,7 +35,7 @@ make verify
 `make verify` is the local and CI verification entrypoint. It runs linting,
 format checks, type checks, tests, and the public repository safety check.
 
-## Current ingest support
+## Current local support
 
 The current `lectern ingest` path is the M1 local synthetic-fixture path:
 
@@ -47,6 +47,24 @@ That fixture uses a committed `.transcript.txt` sidecar so CI can check bundle
 behavior and transcript passthrough without downloading ASR models or sending
 media to remote services. General ASR for arbitrary recordings is not shipped
 yet; files without a local transcript sidecar fail with an explicit local error.
+
+Lectern also has an early local automation spine for folder sources. It records
+source and queue state in local SQLite, scans local folders without network
+access, requires explicit queue approval before ingesting a discovered item, and
+indexes completed bundles:
+
+```bash
+uv run lectern sources add-folder talks ~/Talks
+uv run lectern sources scan talks
+uv run lectern queue list
+uv run lectern queue approve <queue-item-id>
+uv run lectern queue ingest <queue-item-id>
+uv run lectern library list
+```
+
+Use `--json` on source, queue, and library commands for machine-readable output.
+The state database is local run state under `.lectern/` by default and should not
+be committed.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security
 and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
