@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SELF = Path("tools/public_safety_check.py")
+PUBLIC_AGENT_GUIDANCE = Path("AGENTS.md")
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,10 @@ class Candidate:
 
 FORBIDDEN_BASENAMES = {
     ".DS_Store",
+    "CLAUDE.md",
+}
+
+FORBIDDEN_AGENT_DOC_BASENAMES = {
     "AGENTS.md",
     "CLAUDE.md",
 }
@@ -61,6 +66,16 @@ FORBIDDEN_DIR_NAMES = {
     "review" + "-journal",
 }
 
+LOCAL_ONLY_PATHS = (
+    Path("goal"),
+    Path("." + "serena"),
+    Path("bundles"),
+    Path("review-artifacts"),
+    Path("tools") / ("review" + "-journal"),
+    Path("." + "review" + "-journal.json"),
+    Path("." + "review" + "-journal.version"),
+)
+
 
 def git_paths(*args: str) -> list[Path]:
     result = subprocess.run(
@@ -70,6 +85,23 @@ def git_paths(*args: str) -> list[Path]:
     )
     names = result.stdout.decode().split("\0")
     return [Path(name) for name in names if name]
+
+
+def git_reports_ignored(path: Path) -> bool:
+    probe = path if path.suffix else path / ".public-safety-probe"
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", probe.as_posix()],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def tracked_paths_under(path: Path) -> list[Path]:
+    return git_paths("--cached", "--", path.as_posix())
+
+
+def path_exists(path: Path) -> bool:
+    return path.exists()
 
 
 def candidate_files() -> list[Candidate]:
@@ -83,9 +115,36 @@ def candidate_files() -> list[Candidate]:
     return candidates
 
 
+def local_only_boundary_findings() -> list[Finding]:
+    findings: list[Finding] = []
+    for path in LOCAL_ONLY_PATHS:
+        if tracked_paths_under(path):
+            findings.append(
+                Finding(
+                    path.as_posix(),
+                    None,
+                    "local-only path is tracked in the public repository",
+                )
+            )
+        if path_exists(path) and not git_reports_ignored(path):
+            findings.append(
+                Finding(
+                    path.as_posix(),
+                    None,
+                    "local-only path exists but is not ignored/excluded",
+                )
+            )
+    return findings
+
+
 def forbidden_path_reason(path: Path) -> str | None:
+    if path == PUBLIC_AGENT_GUIDANCE:
+        return None
+
     text = path.as_posix()
     parts = set(path.parts)
+    normalized_name = path.name.casefold()
+    normalized_parts = {part.casefold() for part in path.parts}
     prefixes = (
         "goal" + "/",
         "bundles/",
@@ -110,9 +169,15 @@ def forbidden_path_reason(path: Path) -> str | None:
         "tools/capture_usage.py",
         "tools/gate" + "_check.py",
     }
-    if text in exact or path.name in FORBIDDEN_BASENAMES:
+    if (
+        text in exact
+        or path.name in FORBIDDEN_BASENAMES
+        or normalized_name in {name.casefold() for name in FORBIDDEN_AGENT_DOC_BASENAMES}
+    ):
         return "forbidden public path"
-    if parts & FORBIDDEN_DIR_NAMES or any(part.startswith("pytest-cache-files-") for part in parts):
+    if normalized_parts & {name.casefold() for name in FORBIDDEN_DIR_NAMES} or any(
+        part.startswith("pytest-cache-files-") for part in parts
+    ):
         return "forbidden public path component"
     if any(text.startswith(prefix) for prefix in prefixes):
         return "forbidden public path prefix"
@@ -190,7 +255,7 @@ def scan_content(
 def main() -> int:
     files = candidate_files()
     patterns = content_patterns()
-    findings: list[Finding] = []
+    findings = local_only_boundary_findings()
 
     for candidate in files:
         path = candidate.path

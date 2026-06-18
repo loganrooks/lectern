@@ -43,6 +43,7 @@ and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 - [Design](docs/DESIGN.md)
 - [Grey Areas](docs/GREY_AREAS.md)
 - [Architecture decisions](docs/adr/)
+- [Automated contributor guidance](AGENTS.md)
 
 ## License
 

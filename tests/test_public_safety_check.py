@@ -20,6 +20,7 @@ Candidate = public_safety_check.Candidate
 candidate_files = public_safety_check.candidate_files
 forbidden_path_reason = public_safety_check.forbidden_path_reason
 scan_content = public_safety_check.scan_content
+local_only_boundary_findings = public_safety_check.local_only_boundary_findings
 
 
 def write_tmp(path: Path, text: str) -> Path:
@@ -35,8 +36,13 @@ def messages_for(path: Path) -> list[str]:
 def test_forbidden_public_paths_are_blocked() -> None:
     assert forbidden_path_reason(Path("goal" + "/GOAL.md")) is not None
     assert forbidden_path_reason(Path("bundles/example/manifest.json")) is not None
-    assert forbidden_path_reason(Path("AGENTS.md")) is not None
+    assert forbidden_path_reason(Path("AGENTS.md")) is None
+    assert forbidden_path_reason(Path("agents.md")) is not None
+    assert forbidden_path_reason(Path("AGENTS.MD")) is not None
     assert forbidden_path_reason(Path("docs/AGENTS.md")) is not None
+    assert forbidden_path_reason(Path("docs/Agents.md")) is not None
+    assert forbidden_path_reason(Path("CLAUDE.md")) is not None
+    assert forbidden_path_reason(Path("Claude.md")) is not None
     assert forbidden_path_reason(Path("src/CLAUDE.md")) is not None
     assert forbidden_path_reason(Path("tools/gate" + "_check.py")) is not None
     assert forbidden_path_reason(Path("tests/fixtures/talk.mp4")) is not None
@@ -134,6 +140,73 @@ def test_dirty_tracked_files_get_worktree_candidates(monkeypatch: MonkeyPatch) -
     assert candidate_files() == [
         Candidate(Path("README.md"), "index"),
         Candidate(Path("README.md"), "worktree"),
+    ]
+
+
+def test_local_only_boundary_allows_existing_ignored_paths(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def no_tracked_paths(path: Path) -> list[Path]:
+        del path
+        return []
+
+    def path_exists(path: Path) -> bool:
+        return path == Path("goal")
+
+    def reports_ignored(path: Path) -> bool:
+        del path
+        return True
+
+    monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
+    monkeypatch.setattr(public_safety_check, "tracked_paths_under", no_tracked_paths)
+    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
+    monkeypatch.setattr(public_safety_check, "git_reports_ignored", reports_ignored)
+
+    assert local_only_boundary_findings() == []
+
+
+def test_local_only_boundary_flags_existing_unignored_paths(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def no_tracked_paths(path: Path) -> list[Path]:
+        del path
+        return []
+
+    def path_exists(path: Path) -> bool:
+        return path == Path("goal")
+
+    def reports_ignored(path: Path) -> bool:
+        del path
+        return False
+
+    monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
+    monkeypatch.setattr(public_safety_check, "tracked_paths_under", no_tracked_paths)
+    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
+    monkeypatch.setattr(public_safety_check, "git_reports_ignored", reports_ignored)
+
+    findings = local_only_boundary_findings()
+
+    assert [finding.message for finding in findings] == [
+        "local-only path exists but is not ignored/excluded"
+    ]
+
+
+def test_local_only_boundary_flags_tracked_paths(monkeypatch: MonkeyPatch) -> None:
+    def tracked_paths(path: Path) -> list[Path]:
+        return [path / "GOAL.md"]
+
+    def path_exists(path: Path) -> bool:
+        del path
+        return False
+
+    monkeypatch.setattr(public_safety_check, "LOCAL_ONLY_PATHS", (Path("goal"),))
+    monkeypatch.setattr(public_safety_check, "tracked_paths_under", tracked_paths)
+    monkeypatch.setattr(public_safety_check, "path_exists", path_exists)
+
+    findings = local_only_boundary_findings()
+
+    assert [finding.message for finding in findings] == [
+        "local-only path is tracked in the public repository"
     ]
 
 
