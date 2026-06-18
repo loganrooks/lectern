@@ -260,7 +260,10 @@ class LocalFolderAdapter:
             except ValueError:
                 continue
             relative = path.relative_to(root).as_posix()
-            digest, size = _approval_digest_and_media_size(path)
+            try:
+                digest, size = _approval_digest_and_media_size(path, root=root_resolved)
+            except AutomationError:
+                continue
             stat = path.stat()
             now = _now()
             items.append(
@@ -462,8 +465,12 @@ class AutomationState:
         source = self.get_source(queue_item.source_id)
         source_item = self.get_source_item(queue_item.source_item_id)
         source_path = Path(source_item.absolute_path)
+        root = Path(source.root_path).resolve() if source.kind is SourceKind.LOCAL_FOLDER else None
         try:
-            current_digest, _ = _approval_digest_and_media_size(source_path)
+            current_digest, _ = _approval_digest_and_media_size(source_path, root=root)
+        except AutomationError as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
         except OSError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -473,7 +480,7 @@ class AutomationState:
             raise AutomationError(message)
         try:
             planned_bundle_id = plan_local_bundle_id(source_path)
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item)
+            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             result = ingest_local(source_path, output_root)
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
@@ -508,7 +515,7 @@ class AutomationState:
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
         try:
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item)
+            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -846,12 +853,20 @@ class AutomationState:
         )
         self._connection.commit()
 
-    def _ensure_bundle_id_available(self, bundle_id: str, queue_item: QueueItem) -> None:
+    def _ensure_bundle_id_available(
+        self, bundle_id: str, queue_item: QueueItem, output_root: Path
+    ) -> None:
         existing = self._connection.execute(
             "SELECT * FROM library_bundles WHERE bundle_id = ?",
             (bundle_id,),
         ).fetchone()
         if existing is None:
+            bundle_dir = output_root / bundle_id
+            if bundle_dir.exists():
+                raise AutomationError(
+                    "bundle id already exists on disk but is not recorded in state; "
+                    "choose a different output directory or remove the existing bundle"
+                )
             return
         existing_bundle = _library_bundle_from_row(existing)
         if existing_bundle.queue_item_id == queue_item.id:
@@ -1040,7 +1055,7 @@ def _digest_and_size(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _approval_digest_and_media_size(path: Path) -> tuple[str, int]:
+def _approval_digest_and_media_size(path: Path, *, root: Path | None = None) -> tuple[str, int]:
     media_digest, media_size = _digest_and_size(path)
     sidecar = path.with_suffix(".transcript.txt")
     digest = hashlib.sha256()
@@ -1049,6 +1064,13 @@ def _approval_digest_and_media_size(path: Path) -> tuple[str, int]:
     digest.update(media_digest.encode("ascii"))
     digest.update(b"\0")
     if sidecar.is_file():
+        if root is not None:
+            if sidecar.is_symlink():
+                raise AutomationError("transcript sidecar must be inside the source root")
+            try:
+                sidecar.resolve().relative_to(root)
+            except ValueError as exc:
+                raise AutomationError("transcript sidecar must be inside the source root") from exc
         sidecar_digest, _ = _digest_and_size(sidecar)
         digest.update(b"transcript-sidecar")
         digest.update(b"\0")

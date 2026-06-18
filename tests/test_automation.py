@@ -144,6 +144,29 @@ def test_source_scan_skips_symlinks_that_escape_source_root(tmp_path: Path) -> N
     assert delta.queued == []
 
 
+def test_source_scan_skips_transcript_sidecars_that_escape_source_root(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    external_dir = tmp_path / "external"
+    source_dir.mkdir()
+    external_dir.mkdir()
+    media = source_dir / "synthetic_talk.wav"
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    external_sidecar = external_dir / "synthetic_talk.transcript.txt"
+    external_sidecar.write_text(SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    sidecar = source_dir / "synthetic_talk.transcript.txt"
+    try:
+        sidecar.symlink_to(external_sidecar)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not supported here: {exc}")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert delta.added == []
+    assert delta.queued == []
+
+
 def test_policy_states_control_queueing(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     disabled_dir = tmp_path / "disabled"
@@ -307,6 +330,29 @@ def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_pat
 
     source_json = json.loads((first_result.bundle_dir / "source.json").read_text(encoding="utf-8"))
     assert source_json["provenance"]["queue_item_id"] == first_queue.id
+    assert failed.state is QueueState.FAILED
+
+
+def test_queue_ingest_rejects_existing_unindexed_bundle_directory(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    output_root = tmp_path / "bundles"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "first.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        state.approve_queue_item(queue_item.id)
+        state.ingest_queue_item(queue_item.id, output_root)
+
+    with open_state(tmp_path / "second.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match="already exists on disk"):
+            state.ingest_queue_item(queue_item.id, output_root)
+
+        failed = state.get_queue_item(queue_item.id)
+
     assert failed.state is QueueState.FAILED
 
 
