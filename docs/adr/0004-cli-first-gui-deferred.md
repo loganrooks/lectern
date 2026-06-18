@@ -1,6 +1,8 @@
-# ADR-0004: CLI + daemon first; GUI (and Electron-vs-Swift) deliberately deferred
+# ADR-0004: CLI First; GUI Deliberately Deferred
 
 Status: accepted · 2026-06-10
+
+Amended by: ADR-0005 (`lectern watch` daemon timing deferred beyond the current M0-M8 roadmap).
 
 ## Context
 
@@ -8,7 +10,7 @@ A polished Mac experience suggests a native app; portability suggests Electron/w
 
 ## Decision
 
-v1 ships `lectern` (CLI), `lectern watch` (daemon), and `lectern mcp` (agent serving). No GUI. The durable assets are the pipeline and bundle format; any future GUI — Swift menubar app, web UI, or both — is a thin client over the bundle library + MCP server and can be chosen per platform later without architectural cost.
+v1 ships `lectern` (CLI) first, with `lectern mcp` following once the library and retrieval surfaces are stable. ADR-0005 defers `lectern watch` daemon timing beyond the current M0-M8 roadmap. No GUI. The durable assets are the pipeline and bundle format; any future GUI — Swift menubar app, web UI, or both — is a thin client over the bundle library + MCP server and can be chosen per platform later without architectural cost.
 
 ## Consequences
 
