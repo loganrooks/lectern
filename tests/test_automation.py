@@ -17,6 +17,7 @@ from lectern.automation import (
     open_state,
 )
 from lectern.bundle import Manifest, StageName
+from lectern.ingest import IngestError
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -258,6 +259,15 @@ def test_one_shot_ingest_expands_user_home_before_state_setup(
     assert queue_item.state is QueueState.COMPLETED
 
 
+def test_one_shot_ingest_validates_source_before_recording_state(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        with pytest.raises(IngestError, match="source file does not exist"):
+            state.ingest_one_shot(tmp_path / "missing.wav", tmp_path / "bundles")
+
+        assert state.list_sources() == []
+        assert state.list_queue() == []
+
+
 def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> None:
     source = copy_fixture(tmp_path / "source")
 
@@ -274,6 +284,30 @@ def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> 
     assert provenance["consent"] == "explicit_cli_invocation"
     assert provenance["queue_item_id"] == queue_items[0].id
     assert [bundle.bundle_id for bundle in library] == [result.manifest.bundle_id]
+
+
+def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_path: Path) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    copy_fixture(first_dir)
+    copy_fixture(second_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first_source = state.add_local_folder_source("first", first_dir)
+        first_queue = state.scan_source(first_source.id).queued[0]
+        state.approve_queue_item(first_queue.id)
+        first_result = state.ingest_queue_item(first_queue.id, tmp_path / "bundles")
+
+        second_source = state.add_local_folder_source("second", second_dir)
+        second_queue = state.scan_source(second_source.id).queued[0]
+        state.approve_queue_item(second_queue.id)
+        with pytest.raises(AutomationError, match="duplicate-content multi-source"):
+            state.ingest_queue_item(second_queue.id, tmp_path / "bundles")
+        failed = state.get_queue_item(second_queue.id)
+
+    source_json = json.loads((first_result.bundle_dir / "source.json").read_text(encoding="utf-8"))
+    assert source_json["provenance"]["queue_item_id"] == first_queue.id
+    assert failed.state is QueueState.FAILED
 
 
 def test_queue_skip_and_retry_are_inspectable(tmp_path: Path) -> None:

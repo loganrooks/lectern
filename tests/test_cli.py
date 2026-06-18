@@ -107,6 +107,25 @@ def test_doctor_reports_existing_read_only_state_store(
         state.chmod(0o644)
 
 
+def test_doctor_rejects_state_parent_that_is_a_file(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_which(name: str) -> str | None:
+        if name == "ffmpeg":
+            return "/usr/bin/ffmpeg"
+        return None
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.shutil, "which", fake_which)
+    (tmp_path / ".lectern").write_text("not a directory", encoding="utf-8")
+
+    assert cli.main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "state: ERROR" in captured.out
+
+
 def test_schema_export_writes_manifest_schema(tmp_path: Path) -> None:
     output = tmp_path / "manifest.schema.json"
 

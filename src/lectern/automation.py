@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
 from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
-from lectern.ingest import IngestError, IngestResult, ingest_local
+from lectern.ingest import IngestError, IngestResult, ingest_local, plan_local_bundle_id
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
@@ -472,7 +472,12 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
         try:
+            planned_bundle_id = plan_local_bundle_id(source_path)
+            self._ensure_bundle_id_available(planned_bundle_id, queue_item)
             result = ingest_local(source_path, output_root)
+        except AutomationError as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
         except (IngestError, OSError) as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -498,9 +503,15 @@ class AutomationState:
 
     def ingest_one_shot(self, source_path: Path, output_root: Path) -> IngestResult:
         source_path = source_path.expanduser()
+        planned_bundle_id = plan_local_bundle_id(source_path)
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
+        try:
+            self._ensure_bundle_id_available(planned_bundle_id, queue_item)
+        except AutomationError as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
         try:
             result = ingest_local(source_path, output_root)
         except (IngestError, OSError) as exc:
@@ -835,6 +846,21 @@ class AutomationState:
         )
         self._connection.commit()
 
+    def _ensure_bundle_id_available(self, bundle_id: str, queue_item: QueueItem) -> None:
+        existing = self._connection.execute(
+            "SELECT * FROM library_bundles WHERE bundle_id = ?",
+            (bundle_id,),
+        ).fetchone()
+        if existing is None:
+            return
+        existing_bundle = _library_bundle_from_row(existing)
+        if existing_bundle.queue_item_id == queue_item.id:
+            return
+        raise AutomationError(
+            "bundle id already exists for different source provenance; "
+            "duplicate-content multi-source provenance is not implemented"
+        )
+
 
 def open_state(path: Path = DEFAULT_STATE_PATH) -> AutomationState:
     try:
@@ -1046,7 +1072,7 @@ def _nearest_existing_parent_is_writable(path: Path) -> bool:
     candidate = path.parent
     while not candidate.exists() and candidate != candidate.parent:
         candidate = candidate.parent
-    return candidate.exists() and os.access(candidate, os.W_OK)
+    return candidate.is_dir() and os.access(candidate, os.W_OK)
 
 
 def _source_id(kind: str, root_path: str) -> str:

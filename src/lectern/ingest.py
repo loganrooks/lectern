@@ -55,6 +55,18 @@ class FixtureTranscript:
     bytes: int
 
 
+def plan_local_bundle_id(source_path: Path) -> str:
+    """Return the bundle id `ingest_local` would use without writing artifacts."""
+    source = source_path.expanduser()
+    if not source.is_file():
+        raise IngestError(f"source file does not exist: {source}")
+
+    transcript = _read_fixture_transcript(source)
+    source_digest = _sha256(source)
+    bundle_digest = _combined_digest(source_digest, transcript.sha256)
+    return f"{_slug(source.stem)}-{bundle_digest[:12]}"
+
+
 def ingest_local(source_path: Path, output_root: Path = Path("bundles")) -> IngestResult:
     """Ingest a local media file into a Lectern bundle."""
 
