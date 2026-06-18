@@ -96,9 +96,14 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
         raise IngestError(f"source file does not exist: {source}")
 
     source_digest = _sha256(source)
-    command = _resolve_transcriber_command(transcriber_command)
+    command = _explicit_transcriber_command(transcriber_command)
     if command is not None:
         component = _command_identity_component(command)
+    elif source.with_suffix(".transcript.txt").is_file():
+        sidecar = _read_transcript_sidecar(source)
+        component = sidecar.identity_component
+    elif (environment_command := _environment_transcriber_command()) is not None:
+        component = _command_identity_component(environment_command)
     else:
         sidecar = _read_transcript_sidecar(source)
         component = sidecar.identity_component
@@ -106,10 +111,15 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
     return f"{_slug(source.stem)}-{bundle_digest[:12]}"
 
 
-def can_plan_local_bundle_id(transcriber_command: str | None = None) -> bool:
+def can_plan_local_bundle_id(source_path: Path, transcriber_command: str | None = None) -> bool:
     """Return whether bundle id can be known before media normalization/transcription."""
 
-    return _resolve_transcriber_command(transcriber_command) is None
+    source = source_path.expanduser()
+    if _explicit_transcriber_command(transcriber_command) is not None:
+        return False
+    if source.with_suffix(".transcript.txt").is_file():
+        return True
+    return _environment_transcriber_command() is None
 
 
 def ingest_local(
@@ -219,16 +229,26 @@ def _resolve_transcript(
     duration_s: float | None,
     transcriber_command: str | None,
 ) -> TranscriptResult:
-    command = _resolve_transcriber_command(transcriber_command)
+    command = _explicit_transcriber_command(transcriber_command)
     if command is not None:
         return _transcribe_with_local_command(command, normalized_audio, duration_s)
-    return _read_transcript_sidecar(source, duration_s=duration_s)
+    try:
+        return _read_transcript_sidecar(source, duration_s=duration_s)
+    except IngestError:
+        command = _environment_transcriber_command()
+        if command is not None:
+            return _transcribe_with_local_command(command, normalized_audio, duration_s)
+        raise
 
 
-def _resolve_transcriber_command(transcriber_command: str | None) -> str | None:
+def _explicit_transcriber_command(transcriber_command: str | None) -> str | None:
     if transcriber_command is not None:
         command = transcriber_command.strip()
         return command or None
+    return None
+
+
+def _environment_transcriber_command() -> str | None:
     command = os.environ.get(TRANSCRIBER_COMMAND_ENV, "").strip()
     return command or None
 
@@ -281,7 +301,6 @@ def _transcribe_with_local_command(
             check=False,
             capture_output=True,
             shell=False,
-            text=True,
             timeout=DEFAULT_TRANSCRIBER_TIMEOUT_S,
         )
     except FileNotFoundError as exc:
@@ -290,12 +309,15 @@ def _transcribe_with_local_command(
         raise IngestError(
             f"local transcriber command timed out after {DEFAULT_TRANSCRIBER_TIMEOUT_S}s"
         ) from exc
+    stdout = _decode_transcriber_pipe(result.stdout, "stdout")
+    stderr = _decode_transcriber_pipe(result.stderr, "stderr")
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        message = stderr.strip() or stdout.strip() or "no diagnostic output"
         raise IngestError(f"local transcriber command failed ({result.returncode}): {message}")
 
-    payload = _parse_transcriber_json(result.stdout)
+    payload = _parse_transcriber_json(stdout)
     segments, transcript_text = _segments_from_payload(payload, duration_s)
+    command_digest = _command_identity_component(command)
     argv_digest = _digest_text(json.dumps(argv, separators=(",", ":")))
     transcript_digest = _digest_text(
         json.dumps([segment.to_dict() for segment in segments], sort_keys=True)
@@ -307,6 +329,7 @@ def _transcribe_with_local_command(
         backend={
             "kind": "local_command",
             "argv0": argv[0],
+            "command_sha256": command_digest,
             "argv_sha256": argv_digest,
             "input_argument_mode": (
                 "placeholder" if _command_uses_placeholder(command) else "append"
@@ -320,10 +343,17 @@ def _transcribe_with_local_command(
         remote_services=_remote_services(transcriber_network_posture="unverifiable_user_command"),
         identity={
             "method": "local_command_json",
-            "argv_sha256": argv_digest,
+            "command_sha256": command_digest,
             "transcript_sha256": transcript_digest,
         },
     )
+
+
+def _decode_transcriber_pipe(data: bytes, stream_name: str) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise IngestError(f"local transcriber {stream_name} is not valid UTF-8") from exc
 
 
 def _build_transcriber_argv(command: str, audio_path: Path) -> list[str]:

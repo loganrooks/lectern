@@ -491,7 +491,7 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
         try:
-            if can_plan_local_bundle_id(transcriber_command):
+            if can_plan_local_bundle_id(source_path, transcriber_command):
                 planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             result = ingest_local(
@@ -535,12 +535,20 @@ class AutomationState:
         source_path = source_path.expanduser()
         planned_bundle_id = (
             plan_local_bundle_id(source_path, transcriber_command)
-            if can_plan_local_bundle_id(transcriber_command)
+            if can_plan_local_bundle_id(source_path, transcriber_command)
             else None
         )
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
+        if queue_item.state is QueueState.COMPLETED and queue_item.bundle_id is not None:
+            library_bundle = self.get_library_bundle(queue_item.bundle_id)
+            bundle_dir = Path(library_bundle.bundle_path)
+            if bundle_dir.is_dir():
+                return IngestResult(
+                    bundle_dir=bundle_dir,
+                    manifest=Manifest.load(bundle_dir),
+                )
         try:
             if planned_bundle_id is not None:
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
@@ -827,6 +835,16 @@ class AutomationState:
 
     def _ensure_one_shot_queue(self, source: SourceRecord, item: SourceItem) -> QueueItem:
         queue_item_id = _queue_item_id(item.id, item.sha256)
+        existing = self._connection.execute(
+            "SELECT * FROM queue_items WHERE id = ?",
+            (queue_item_id,),
+        ).fetchone()
+        if existing is not None:
+            queue_item = _queue_from_row(existing)
+            if queue_item.state is QueueState.COMPLETED:
+                return queue_item
+            return self._set_queue_state(queue_item.id, QueueState.APPROVED, clear_error=True)
+
         now = _now()
         self._connection.execute(
             """
@@ -835,10 +853,6 @@ class AutomationState:
                 bundle_id, attempts, last_error, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, ?, ?)
-            ON CONFLICT(source_item_id, content_sha256) DO UPDATE SET
-                state = excluded.state,
-                last_error = NULL,
-                updated_at = excluded.updated_at
             """,
             (
                 queue_item_id,

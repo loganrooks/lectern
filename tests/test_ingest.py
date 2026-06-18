@@ -255,6 +255,32 @@ def test_local_command_transcriber_uses_environment_fallback(
     ).read_text(encoding="utf-8")
 
 
+def test_environment_transcriber_does_not_override_sidecar(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "synthetic_talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    source.with_suffix(".transcript.txt").write_text("sidecar transcript\n", encoding="utf-8")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "environment transcript"}),
+    )
+    monkeypatch.setenv(
+        ingest_module.TRANSCRIBER_COMMAND_ENV,
+        f"{sys.executable} {transcriber}",
+    )
+
+    result = ingest_local(source, tmp_path / "bundles")
+
+    metadata = json.loads(
+        (result.bundle_dir / "transcript" / "metadata.json").read_text(encoding="utf-8")
+    )
+    transcript = (result.bundle_dir / "transcript" / "transcript.md").read_text(encoding="utf-8")
+    assert metadata["method"] == "fixture_transcript_sidecar"
+    assert transcript == "sidecar transcript\n"
+
+
 def test_local_command_transcriber_rejects_invalid_json_without_partial_bundle(
     tmp_path: Path,
 ) -> None:
@@ -282,6 +308,23 @@ def test_local_command_transcriber_rejects_ill_typed_segments(tmp_path: Path) ->
     )
 
     with pytest.raises(IngestError, match="start_s must be a number"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcriber_rejects_non_utf8_stdout(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "import sys\nsys.stdout.buffer.write(b'\\xff')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(IngestError, match="stdout is not valid UTF-8"):
         ingest_local(
             source,
             tmp_path / "bundles",
@@ -335,6 +378,23 @@ def test_local_command_transcript_output_changes_bundle_identity(tmp_path: Path)
     second = ingest_local(source, output_root, transcriber_command=command)
 
     assert first.manifest.bundle_id != second.manifest.bundle_id
+
+
+def test_local_command_identical_output_keeps_bundle_identity_stable(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    first = ingest_local(source, output_root, transcriber_command=command)
+    with pytest.raises(IngestError, match="bundle already exists"):
+        ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.bundle_dir.is_dir()
 
 
 def test_local_command_transcriber_uses_argv_without_shell_interpretation(

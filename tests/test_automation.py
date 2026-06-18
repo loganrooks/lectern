@@ -392,6 +392,22 @@ def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> 
     assert [bundle.bundle_id for bundle in library] == [result.manifest.bundle_id]
 
 
+def test_one_shot_reingest_returns_existing_bundle_without_failing_queue(
+    tmp_path: Path,
+) -> None:
+    source = copy_fixture(tmp_path / "source")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, tmp_path / "bundles")
+        second = state.ingest_one_shot(source, tmp_path / "bundles")
+        queue_item = state.list_queue()[0]
+
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert second.bundle_dir == first.bundle_dir
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.last_error is None
+
+
 def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_path: Path) -> None:
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
