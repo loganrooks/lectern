@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -52,6 +53,16 @@ FORBIDDEN_MEDIA_SUFFIXES = {
     ".ogg",
     ".wav",
     ".webm",
+}
+
+ALLOWED_SYNTHETIC_MEDIA_FIXTURES = {
+    Path("tests/fixtures/synthetic_talk.wav"),
+}
+
+ALLOWED_SYNTHETIC_MEDIA_FIXTURE_SHA256 = {
+    Path("tests/fixtures/synthetic_talk.wav"): (
+        "cc3abf150b1768dfa87f75ae7d7b06308b005cbaf09631e818cdf41c5cadfb2e"
+    ),
 }
 
 FORBIDDEN_DIR_NAMES = {
@@ -181,7 +192,10 @@ def forbidden_path_reason(path: Path) -> str | None:
         return "forbidden public path component"
     if any(text.startswith(prefix) for prefix in prefixes):
         return "forbidden public path prefix"
-    if path.suffix.lower() in FORBIDDEN_MEDIA_SUFFIXES:
+    if (
+        path.suffix.lower() in FORBIDDEN_MEDIA_SUFFIXES
+        and path not in ALLOWED_SYNTHETIC_MEDIA_FIXTURES
+    ):
         return "audio/video media files are not allowed in the public tree"
     return None
 
@@ -217,7 +231,7 @@ def content_patterns() -> list[tuple[re.Pattern[str], str]]:
     return patterns
 
 
-def read_candidate_text(candidate: Candidate) -> str | None:
+def read_candidate_bytes(candidate: Candidate) -> bytes | None:
     if candidate.source == "index":
         result = subprocess.run(
             ["git", "show", f":{candidate.path.as_posix()}"],
@@ -226,14 +240,32 @@ def read_candidate_text(candidate: Candidate) -> str | None:
         )
         if result.returncode != 0:
             return None
-        data = result.stdout
-    else:
-        data = candidate.path.read_bytes()
+        return result.stdout
+    if not candidate.path.is_file():
+        return None
+    return candidate.path.read_bytes()
 
+
+def read_candidate_text(candidate: Candidate) -> str | None:
+    data = read_candidate_bytes(candidate)
+    if data is None:
+        return None
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def synthetic_media_fixture_reason(candidate: Candidate) -> str | None:
+    expected = ALLOWED_SYNTHETIC_MEDIA_FIXTURE_SHA256.get(candidate.path)
+    if expected is None:
+        return None
+    data = read_candidate_bytes(candidate)
+    if data is None:
+        return "allowed synthetic media fixture is not readable"
+    if hashlib.sha256(data).hexdigest() != expected:
+        return "allowed synthetic media fixture content does not match generated fixture"
+    return None
 
 
 def scan_content(
@@ -262,6 +294,9 @@ def main() -> int:
         reason = forbidden_path_reason(path)
         if reason is not None:
             findings.append(Finding(path.as_posix(), None, reason))
+        media_reason = synthetic_media_fixture_reason(candidate)
+        if media_reason is not None:
+            findings.append(Finding(path.as_posix(), None, media_reason))
         if path.is_file() or candidate.source == "index":
             findings.extend(scan_content(candidate, patterns))
 

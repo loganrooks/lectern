@@ -215,3 +215,25 @@ def test_test_vector_file_is_not_blanket_exempt(tmp_path: Path) -> None:
     )
 
     assert messages_for(path) == ["possible secret"]
+
+
+def test_only_generated_synthetic_media_fixture_is_allowed() -> None:
+    assert forbidden_path_reason(Path("tests/fixtures/synthetic_talk.wav")) is None
+    assert forbidden_path_reason(Path("tests/fixtures/private_talk.wav")) is not None
+    assert forbidden_path_reason(Path("docs/demo.wav")) is not None
+
+
+def test_allowed_synthetic_media_fixture_is_content_pinned(monkeypatch: MonkeyPatch) -> None:
+    candidate = Candidate(path=Path("tests/fixtures/synthetic_talk.wav"), source="worktree")
+    assert public_safety_check.synthetic_media_fixture_reason(candidate) is None
+
+    monkeypatch.setattr(
+        public_safety_check,
+        "ALLOWED_SYNTHETIC_MEDIA_FIXTURE_SHA256",
+        {Path("tests/fixtures/synthetic_talk.wav"): "0" * 64},
+    )
+
+    assert (
+        public_safety_check.synthetic_media_fixture_reason(candidate)
+        == "allowed synthetic media fixture content does not match generated fixture"
+    )

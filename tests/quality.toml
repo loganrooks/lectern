@@ -1,0 +1,4 @@
+# M1 checks fixture transcript passthrough fidelity for the synthetic WAV.
+# This is not an ASR quality claim for arbitrary recordings.
+[transcript.synthetic_talk]
+word_accuracy_threshold = 1.0

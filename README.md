@@ -35,6 +35,19 @@ make verify
 `make verify` is the local and CI verification entrypoint. It runs linting,
 format checks, type checks, tests, and the public repository safety check.
 
+## Current ingest support
+
+The current `lectern ingest` path is the M1 local synthetic-fixture path:
+
+```bash
+uv run lectern ingest tests/fixtures/synthetic_talk.wav
+```
+
+That fixture uses a committed `.transcript.txt` sidecar so CI can check bundle
+behavior and transcript passthrough without downloading ASR models or sending
+media to remote services. General ASR for arbitrary recordings is not shipped
+yet; files without a local transcript sidecar fail with an explicit local error.
+
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security
 and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 

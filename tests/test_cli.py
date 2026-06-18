@@ -5,7 +5,7 @@ from pathlib import Path
 from pytest import CaptureFixture, MonkeyPatch
 
 from lectern import __version__, cli
-from lectern.bundle import export_json_schema
+from lectern.bundle import Manifest, StageName, StageState, export_json_schema
 
 
 def test_version_flag(capsys: CaptureFixture[str]) -> None:
@@ -52,3 +52,16 @@ def test_schema_export_writes_manifest_schema(tmp_path: Path) -> None:
     assert cli.main(["schema", "export", "--output", str(output)]) == 0
 
     assert output.read_text() == export_json_schema()
+
+
+def test_ingest_command_writes_bundle(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    source = Path("tests/fixtures/synthetic_talk.wav")
+
+    assert cli.main(["ingest", str(source), "--output", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    bundle_dir = Path(captured.out.strip())
+    assert bundle_dir.is_dir()
+    manifest = Manifest.load(bundle_dir)
+    assert manifest.stages[StageName.TRANSCRIBE].state is StageState.DONE
