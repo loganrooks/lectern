@@ -3,6 +3,8 @@
 Lectern is early, but contributions should already be easy to review and safe
 to publish.
 
+Automated contributors and reviewers should also follow [AGENTS.md](AGENTS.md).
+
 ## Set Up
 
 Install Python 3.12 or newer and `uv`, then run:
@@ -41,6 +43,11 @@ Only publish material that belongs in the public project. Do not commit:
 
 Run `make public-check` when touching docs, workflows, fixtures, or repository
 metadata. CI also runs this check through `make verify`.
+
+`make public-check` covers files that could be published: tracked files,
+modified tracked files, and untracked non-ignored files. Ignored local-only
+content is not read, but local-only artifact paths must remain ignored and
+untracked.
 
 ## Fixtures
 
