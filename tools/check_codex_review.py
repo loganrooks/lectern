@@ -14,6 +14,7 @@ from typing import cast
 
 SUBMITTED_STATES = {"APPROVED", "COMMENTED"}
 REVIEWED_COMMIT_PATTERN = re.compile(r"(?:\*\*)?Reviewed commit:(?:\*\*)?\s*`([0-9a-fA-F]{7,40})`")
+CLEAN_REVIEW_PATTERN = re.compile(r"\b(?:didn't|did not) find any major issues\b", re.IGNORECASE)
 
 CommitResolver = Callable[[str], str | None]
 
@@ -193,6 +194,10 @@ def comment_reviews_head(
     return False
 
 
+def comment_is_clean_review(body: str) -> bool:
+    return bool(CLEAN_REVIEW_PATTERN.search(body))
+
+
 def has_required_review_comment(
     comments: list[ReviewComment],
     reviewer_login: str,
@@ -201,6 +206,7 @@ def has_required_review_comment(
 ) -> bool:
     return any(
         reviewer_login_matches(comment.author, reviewer_login)
+        and comment_is_clean_review(comment.body)
         and comment_reviews_head(comment.body, head_sha, resolve_commit)
         for comment in comments
     )

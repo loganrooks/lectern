@@ -164,6 +164,14 @@ def test_clean_review_comment_requires_reviewed_commit_line() -> None:
     assert not comment_reviews_head("Codex Review: all clear", "abc123456789")
 
 
+def test_clean_review_comment_requires_clean_review_marker() -> None:
+    comments = [
+        ReviewComment("chatgpt-codex-connector", "Found issues.\n\nReviewed commit: `abc123456789`")
+    ]
+
+    assert not has_required_review_comment(comments, "chatgpt-codex-connector", "abc123456789")
+
+
 def test_reviews_from_payload_parses_review_nodes() -> None:
     reviews = reviews_from_payload(payload([review_node()]))
 
