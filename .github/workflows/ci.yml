@@ -9,6 +9,9 @@ on:
     types:
       - dismissed
       - submitted
+  issue_comment:
+    types:
+      - created
   workflow_dispatch:
 
 permissions:
@@ -16,12 +19,13 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify-matrix:
     name: verify (${{ matrix.os }})
+    if: ${{ github.event_name != 'issue_comment' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,8 +52,8 @@ jobs:
   verify:
     name: verify
     needs: verify-matrix
+    if: ${{ github.event_name != 'issue_comment' && always() }}
     runs-on: ubuntu-latest
-    if: always()
     steps:
       - name: Check matrix result
         run: |
@@ -71,7 +75,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Require Codex connector review
+      - name: Require Codex
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -79,3 +83,37 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CODEX_REVIEWER_LOGIN: chatgpt-codex-connector
         run: python tools/check_codex_review.py
+
+  codex-review-refresh:
+    name: refresh codex review
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (
+        github.event.comment.user.login == 'chatgpt-codex-connector' ||
+        github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
+      ) &&
+      contains(github.event.comment.body, 'Codex Review:')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Refresh stale Codex review check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          CODEX_REVIEWER_LOGIN: chatgpt-codex-connector
+          CODEX_REVIEW_WORKFLOW_ID: ci.yml
+          CODEX_REVIEW_JOB_NAME: codex review
+        run: python tools/refresh_codex_review_check.py
