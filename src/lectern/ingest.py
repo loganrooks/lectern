@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -105,6 +106,12 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
     return f"{_slug(source.stem)}-{bundle_digest[:12]}"
 
 
+def can_plan_local_bundle_id(transcriber_command: str | None = None) -> bool:
+    """Return whether bundle id can be known before media normalization/transcription."""
+
+    return _resolve_transcriber_command(transcriber_command) is None
+
+
 def ingest_local(
     source_path: Path,
     output_root: Path = Path("bundles"),
@@ -115,13 +122,9 @@ def ingest_local(
     if not source.is_file():
         raise IngestError(f"source file does not exist: {source}")
 
-    bundle_id = plan_local_bundle_id(source, transcriber_command)
     output_root.mkdir(parents=True, exist_ok=True)
-    bundle_dir = output_root / bundle_id
-    if bundle_dir.exists():
-        raise IngestError(f"bundle already exists: {bundle_dir}")
 
-    temp_root = Path(tempfile.mkdtemp(prefix=f".{bundle_id}.", dir=output_root))
+    temp_root = Path(tempfile.mkdtemp(prefix=".lectern-ingest.", dir=output_root))
     try:
         _ensure_bundle_dirs(temp_root)
         audio_path = temp_root / "media" / "audio.wav"
@@ -135,6 +138,13 @@ def ingest_local(
             transcriber_command=transcriber_command,
         )
 
+        source_digest, source_size = _digest_and_size(source)
+        bundle_digest = _combined_digest(source_digest, transcript.identity_component)
+        bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
+        bundle_dir = output_root / bundle_id
+        if bundle_dir.exists():
+            raise IngestError(f"bundle already exists: {bundle_dir}")
+
         manifest = Manifest(
             bundle_id=bundle_id,
             source=Source(
@@ -145,7 +155,6 @@ def ingest_local(
             ),
         )
 
-        source_digest, source_size = _digest_and_size(source)
         source_json = temp_root / "source.json"
         _write_json(
             source_json,
@@ -288,6 +297,9 @@ def _transcribe_with_local_command(
     payload = _parse_transcriber_json(result.stdout)
     segments, transcript_text = _segments_from_payload(payload, duration_s)
     argv_digest = _digest_text(json.dumps(argv, separators=(",", ":")))
+    transcript_digest = _digest_text(
+        json.dumps([segment.to_dict() for segment in segments], sort_keys=True)
+    )
     return TranscriptResult(
         text=transcript_text,
         segments=tuple(segments),
@@ -306,7 +318,11 @@ def _transcribe_with_local_command(
             "timestamps but does not claim transcript faithfulness"
         ),
         remote_services=_remote_services(transcriber_network_posture="unverifiable_user_command"),
-        identity={"method": "local_command_json", "argv_sha256": argv_digest},
+        identity={
+            "method": "local_command_json",
+            "argv_sha256": argv_digest,
+            "transcript_sha256": transcript_digest,
+        },
     )
 
 
@@ -419,7 +435,10 @@ def _segments_from_payload(
 def _strict_number(value: Any, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise IngestError(f"local transcriber segment {field_name} must be a number")
-    return float(value)
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise IngestError(f"local transcriber segment {field_name} must be finite and non-negative")
+    return parsed
 
 
 def _normalize_to_canonical_wav(source: Path, output: Path) -> None:

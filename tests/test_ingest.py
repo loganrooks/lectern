@@ -83,7 +83,7 @@ def test_local_ingest_requires_transcript_sidecar(tmp_path: Path) -> None:
     with pytest.raises(IngestError, match="no local transcription backend"):
         ingest_local(source, tmp_path / "bundles")
 
-    assert not (tmp_path / "bundles").exists()
+    assert list((tmp_path / "bundles").iterdir()) == []
 
 
 def test_local_ingest_rejects_empty_transcript_sidecar(tmp_path: Path) -> None:
@@ -287,6 +287,54 @@ def test_local_command_transcriber_rejects_ill_typed_segments(tmp_path: Path) ->
             tmp_path / "bundles",
             transcriber_command=f"{sys.executable} {transcriber}",
         )
+
+
+def test_local_command_transcriber_rejects_negative_timestamps(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"segments": [{"start_s": -5.0, "text": "bad anchor"}]}),
+    )
+
+    with pytest.raises(IngestError, match="finite and non-negative"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcriber_rejects_non_finite_timestamps(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        '{"segments": [{"start_s": NaN, "text": "bad anchor"}]}',
+    )
+
+    with pytest.raises(IngestError, match="finite and non-negative"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcript_output_changes_bundle_identity(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    _write_transcriber_script(transcriber, json.dumps({"text": "First transcript."}))
+    first = ingest_local(source, output_root, transcriber_command=command)
+
+    _write_transcriber_script(transcriber, json.dumps({"text": "Second transcript."}))
+    second = ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.manifest.bundle_id != second.manifest.bundle_id
 
 
 def test_local_command_transcriber_uses_argv_without_shell_interpretation(

@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
 from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
-from lectern.ingest import IngestError, IngestResult, ingest_local, plan_local_bundle_id
+from lectern.ingest import (
+    IngestError,
+    IngestResult,
+    can_plan_local_bundle_id,
+    ingest_local,
+    plan_local_bundle_id,
+)
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
@@ -485,8 +491,9 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
         try:
-            planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
+            if can_plan_local_bundle_id(transcriber_command):
+                planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
+                self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             result = ingest_local(
                 source_path,
                 output_root,
@@ -526,12 +533,17 @@ class AutomationState:
         transcriber_command: str | None = None,
     ) -> IngestResult:
         source_path = source_path.expanduser()
-        planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
+        planned_bundle_id = (
+            plan_local_bundle_id(source_path, transcriber_command)
+            if can_plan_local_bundle_id(transcriber_command)
+            else None
+        )
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
         try:
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
+            if planned_bundle_id is not None:
+                self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
