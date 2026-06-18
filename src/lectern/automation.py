@@ -24,6 +24,7 @@ from lectern.ingest import IngestError, IngestResult, ingest_local
 STATE_SCHEMA_VERSION = 1
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
 MEDIA_EXTENSIONS = frozenset({".aac", ".flac", ".m4a", ".mp3", ".mp4", ".ogg", ".wav"})
+EXCLUDED_SCAN_DIR_NAMES = frozenset({".lectern", "bundles"})
 
 
 class AutomationError(RuntimeError):
@@ -238,11 +239,23 @@ class LocalFolderAdapter:
         if not root.is_dir():
             raise AutomationError(f"local folder source is not a directory: {root}")
 
+        root_resolved = root.resolve()
         items: list[SourceItem] = []
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+            relative_parts = path.relative_to(root).parts
+            if any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts):
+                continue
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.suffix.lower() not in MEDIA_EXTENSIONS
+            ):
                 continue
             absolute = path.resolve()
+            try:
+                absolute.relative_to(root_resolved)
+            except ValueError:
+                continue
             relative = path.relative_to(root).as_posix()
             digest, size = _digest_and_size(path)
             stat = path.stat()
@@ -445,8 +458,18 @@ class AutomationState:
             raise AutomationError("queue item requires explicit approval before ingest")
         source = self.get_source(queue_item.source_id)
         source_item = self.get_source_item(queue_item.source_item_id)
+        source_path = Path(source_item.absolute_path)
         try:
-            result = ingest_local(Path(source_item.absolute_path), output_root)
+            current_digest, _ = _digest_and_size(source_path)
+        except OSError as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
+        if current_digest != queue_item.content_sha256:
+            message = "source file changed since queue approval; rescan before ingest"
+            self._record_failed_queue_item(queue_item.id, message)
+            raise AutomationError(message)
+        try:
+            result = ingest_local(source_path, output_root)
         except (IngestError, OSError) as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise

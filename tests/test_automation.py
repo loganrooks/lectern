@@ -84,6 +84,38 @@ def test_source_scan_reports_delta_and_rescan_is_idempotent(tmp_path: Path) -> N
     assert [item.relative_path for item in removed.removed] == ["synthetic_talk.wav"]
 
 
+def test_source_scan_excludes_local_state_and_bundle_output_dirs(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    copy_fixture(source_dir / "bundles" / "generated" / "media", "audio.wav")
+    copy_fixture(source_dir / ".lectern", "state-audio.wav")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert [item.relative_path for item in delta.added] == ["synthetic_talk.wav"]
+    assert len(delta.queued) == 1
+
+
+def test_source_scan_skips_symlinks_that_escape_source_root(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    outside_media = copy_fixture(tmp_path / "outside")
+    symlink = source_dir / "linked.wav"
+    source_dir.mkdir()
+    try:
+        symlink.symlink_to(outside_media)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not supported here: {exc}")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert delta.added == []
+    assert delta.queued == []
+
+
 def test_policy_states_control_queueing(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     disabled_dir = tmp_path / "disabled"
@@ -146,6 +178,23 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert provenance["remote_services"]["allowed"] is False
     assert manifest.stages[StageName.ACQUIRE].outputs[0].path == "source.json"
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
+
+
+def test_queue_ingest_rejects_file_changed_after_approval(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    media = copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        media.write_bytes(SYNTHETIC_TALK.read_bytes() + b"changed")
+
+        with pytest.raises(AutomationError, match="changed since queue approval"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        failed = state.get_queue_item(approved.id)
+
+    assert failed.state is QueueState.FAILED
 
 
 def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> None:
