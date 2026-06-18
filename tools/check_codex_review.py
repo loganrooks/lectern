@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import cast
 
 SUBMITTED_STATES = {"APPROVED", "COMMENTED"}
-REVIEWED_COMMIT_PATTERN = re.compile(r"Reviewed commit:\s*`([0-9a-fA-F]{7,40})`")
+REVIEWED_COMMIT_PATTERN = re.compile(r"(?:\*\*)?Reviewed commit:(?:\*\*)?\s*`([0-9a-fA-F]{7,40})`")
 
 
 @dataclass(frozen=True)

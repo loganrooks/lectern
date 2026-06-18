@@ -73,6 +73,13 @@ def clean_review_body(commit: str) -> str:
     return f"Codex Review: Didn't find any major issues.\n\nReviewed commit: `{commit}`"
 
 
+def markdown_clean_review_body(commit: str) -> str:
+    return (
+        "Codex Review: Didn't find any major issues. Chef's kiss.\n\n"
+        f"**Reviewed commit:** `{commit}`"
+    )
+
+
 def test_review_on_current_head_passes() -> None:
     reviews = [Review("chatgpt-codex-connector", "COMMENTED", "abc123")]
 
@@ -98,7 +105,9 @@ def test_changes_requested_does_not_pass() -> None:
 
 
 def test_clean_review_comment_on_current_head_passes() -> None:
-    comments = [ReviewComment("chatgpt-codex-connector[bot]", clean_review_body("abc1234"))]
+    comments = [
+        ReviewComment("chatgpt-codex-connector[bot]", markdown_clean_review_body("abc1234"))
+    ]
 
     assert has_required_review_comment(comments, "chatgpt-codex-connector", "abc123456789")
 
