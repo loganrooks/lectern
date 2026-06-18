@@ -81,6 +81,32 @@ def test_doctor_does_not_create_state_store(
     assert not (tmp_path / ".lectern").exists()
 
 
+def test_doctor_reports_existing_read_only_state_store(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fake_which(name: str) -> str | None:
+        if name == "ffmpeg":
+            return "/usr/bin/ffmpeg"
+        return None
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.shutil, "which", fake_which)
+    state_dir = tmp_path / ".lectern"
+    state_dir.mkdir()
+    state = state_dir / "state.sqlite"
+    state.write_bytes(b"")
+    state.chmod(0o444)
+
+    try:
+        assert cli.main(["doctor"]) == 1
+        captured = capsys.readouterr()
+        assert "state: ERROR" in captured.out
+    finally:
+        state.chmod(0o644)
+
+
 def test_schema_export_writes_manifest_schema(tmp_path: Path) -> None:
     output = tmp_path / "manifest.schema.json"
 

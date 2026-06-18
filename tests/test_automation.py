@@ -87,15 +87,42 @@ def test_source_scan_reports_delta_and_rescan_is_idempotent(tmp_path: Path) -> N
 def test_source_scan_excludes_local_state_and_bundle_output_dirs(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     copy_fixture(source_dir)
-    copy_fixture(source_dir / "bundles" / "generated" / "media", "audio.wav")
     copy_fixture(source_dir / ".lectern", "state-audio.wav")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        first = state.scan_source(source.id)
+        approved = state.approve_queue_item(first.queued[0].id)
+        state.ingest_queue_item(approved.id, source_dir / "bundles")
+        second = state.scan_source(source.id)
+
+    assert [item.relative_path for item in first.added] == ["synthetic_talk.wav"]
+    assert second.added == []
+    assert second.changed == []
+    assert [item.relative_path for item in second.unchanged] == ["synthetic_talk.wav"]
+    assert second.queued == []
+
+
+def test_source_scan_does_not_skip_user_directory_named_bundles(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir / "archive" / "bundles")
 
     with open_state(tmp_path / "state.sqlite") as state:
         source = state.add_local_folder_source("talks", source_dir)
         delta = state.scan_source(source.id)
 
-    assert [item.relative_path for item in delta.added] == ["synthetic_talk.wav"]
-    assert len(delta.queued) == 1
+    assert [item.relative_path for item in delta.added] == ["archive/bundles/synthetic_talk.wav"]
+
+
+def test_source_scan_discovers_common_video_container_extensions(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir, "synthetic_talk.mov")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert [item.relative_path for item in delta.added] == ["synthetic_talk.mov"]
 
 
 def test_source_scan_skips_symlinks_that_escape_source_root(tmp_path: Path) -> None:
@@ -195,6 +222,40 @@ def test_queue_ingest_rejects_file_changed_after_approval(tmp_path: Path) -> Non
         failed = state.get_queue_item(approved.id)
 
     assert failed.state is QueueState.FAILED
+
+
+def test_queue_ingest_rejects_transcript_sidecar_changed_after_approval(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    media = copy_fixture(source_dir)
+    sidecar = media.with_suffix(".transcript.txt")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        sidecar.write_text("changed transcript\n", encoding="utf-8")
+
+        with pytest.raises(AutomationError, match="changed since queue approval"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+
+def test_one_shot_ingest_expands_user_home_before_state_setup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = copy_fixture(home / "source")
+    monkeypatch.setenv("HOME", str(home))
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        result = state.ingest_one_shot(
+            Path("~/source") / source.name,
+            tmp_path / "bundles",
+        )
+        queue_item = state.list_queue()[0]
+
+    assert result.bundle_dir.is_dir()
+    assert queue_item.state is QueueState.COMPLETED
 
 
 def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> None:

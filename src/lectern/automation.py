@@ -18,13 +18,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
-from lectern.bundle import ArtifactRef, Manifest, StageName
+from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
 from lectern.ingest import IngestError, IngestResult, ingest_local
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
-MEDIA_EXTENSIONS = frozenset({".aac", ".flac", ".m4a", ".mp3", ".mp4", ".ogg", ".wav"})
-EXCLUDED_SCAN_DIR_NAMES = frozenset({".lectern", "bundles"})
+MEDIA_EXTENSIONS = frozenset(
+    {".aac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".wav", ".webm"}
+)
+EXCLUDED_SCAN_DIR_NAMES = frozenset({".lectern"})
 
 
 class AutomationError(RuntimeError):
@@ -243,7 +245,8 @@ class LocalFolderAdapter:
         items: list[SourceItem] = []
         for path in sorted(root.rglob("*")):
             relative_parts = path.relative_to(root).parts
-            if any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts):
+            is_excluded_dir = any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts)
+            if is_excluded_dir or _is_bundle_output_path(root, path):
                 continue
             if (
                 path.is_symlink()
@@ -257,7 +260,7 @@ class LocalFolderAdapter:
             except ValueError:
                 continue
             relative = path.relative_to(root).as_posix()
-            digest, size = _digest_and_size(path)
+            digest, size = _approval_digest_and_media_size(path)
             stat = path.stat()
             now = _now()
             items.append(
@@ -460,7 +463,7 @@ class AutomationState:
         source_item = self.get_source_item(queue_item.source_item_id)
         source_path = Path(source_item.absolute_path)
         try:
-            current_digest, _ = _digest_and_size(source_path)
+            current_digest, _ = _approval_digest_and_media_size(source_path)
         except OSError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -494,6 +497,7 @@ class AutomationState:
         )
 
     def ingest_one_shot(self, source_path: Path, output_root: Path) -> IngestResult:
+        source_path = source_path.expanduser()
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
@@ -745,7 +749,7 @@ class AutomationState:
 
     def _ensure_one_shot_item(self, source: SourceRecord, source_path: Path) -> SourceItem:
         path = source_path.resolve()
-        digest, size = _digest_and_size(path)
+        digest, size = _approval_digest_and_media_size(path)
         stat = path.stat()
         now = _now()
         item = SourceItem(
@@ -871,6 +875,7 @@ def preflight_state_store(path: Path = DEFAULT_STATE_PATH) -> StateStorePrefligh
     schema_version: int | None = None
     error: str | None = None
     if exists:
+        writable_location = writable_location and os.access(resolved, os.W_OK)
         try:
             with sqlite3.connect(f"file:{resolved}?mode=ro", uri=True) as connection:
                 schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -1007,6 +1012,34 @@ def _digest_and_size(path: Path) -> tuple[str, int]:
             size += len(chunk)
             digest.update(chunk)
     return digest.hexdigest(), size
+
+
+def _approval_digest_and_media_size(path: Path) -> tuple[str, int]:
+    media_digest, media_size = _digest_and_size(path)
+    sidecar = path.with_suffix(".transcript.txt")
+    digest = hashlib.sha256()
+    digest.update(b"media")
+    digest.update(b"\0")
+    digest.update(media_digest.encode("ascii"))
+    digest.update(b"\0")
+    if sidecar.is_file():
+        sidecar_digest, _ = _digest_and_size(sidecar)
+        digest.update(b"transcript-sidecar")
+        digest.update(b"\0")
+        digest.update(sidecar_digest.encode("ascii"))
+    else:
+        digest.update(b"transcript-sidecar-absent")
+    return digest.hexdigest(), media_size
+
+
+def _is_bundle_output_path(root: Path, path: Path) -> bool:
+    ancestor = path.parent
+    while True:
+        if (ancestor / MANIFEST_NAME).is_file() and (ancestor / "source.json").is_file():
+            return True
+        if ancestor == root:
+            return False
+        ancestor = ancestor.parent
 
 
 def _nearest_existing_parent_is_writable(path: Path) -> bool:
