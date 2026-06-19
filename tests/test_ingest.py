@@ -229,7 +229,7 @@ def test_local_command_transcriber_produces_metadata_and_anchored_summary(
     assert "transcript/metadata.json" in transcribe_outputs
 
 
-def test_local_command_transcriber_uses_environment_fallback(
+def test_environment_transcriber_is_not_an_implicit_backend(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -240,19 +240,12 @@ def test_local_command_transcriber_uses_environment_fallback(
         json.dumps({"segments": [{"start_s": 2.0, "text": "Environment transcript."}]}),
     )
     monkeypatch.setenv(
-        ingest_module.TRANSCRIBER_COMMAND_ENV,
+        "LECTERN_TRANSCRIBER_COMMAND",
         f"{sys.executable} {transcriber}",
     )
 
-    result = ingest_local(source, tmp_path / "bundles")
-
-    metadata = json.loads(
-        (result.bundle_dir / "transcript" / "metadata.json").read_text(encoding="utf-8")
-    )
-    assert metadata["method"] == "local_command_json"
-    assert "[t=00:02] Environment transcript." in (
-        result.bundle_dir / "analysis" / "summary.md"
-    ).read_text(encoding="utf-8")
+    with pytest.raises(IngestError, match="pass --transcriber-command"):
+        ingest_local(source, tmp_path / "bundles")
 
 
 def test_environment_transcriber_does_not_override_sidecar(
@@ -267,7 +260,7 @@ def test_environment_transcriber_does_not_override_sidecar(
         json.dumps({"text": "environment transcript"}),
     )
     monkeypatch.setenv(
-        ingest_module.TRANSCRIBER_COMMAND_ENV,
+        "LECTERN_TRANSCRIBER_COMMAND",
         f"{sys.executable} {transcriber}",
     )
 
@@ -375,6 +368,29 @@ def test_local_command_transcript_output_changes_bundle_identity(tmp_path: Path)
     first = ingest_local(source, output_root, transcriber_command=command)
 
     _write_transcriber_script(transcriber, json.dumps({"text": "Second transcript."}))
+    second = ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.manifest.bundle_id != second.manifest.bundle_id
+
+
+def test_local_command_top_level_text_changes_bundle_identity(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+    segments = [{"start_s": 0.0, "text": "Stable segment."}]
+
+    _write_transcriber_script(
+        transcriber,
+        json.dumps({"segments": segments, "text": "First top-level transcript."}),
+    )
+    first = ingest_local(source, output_root, transcriber_command=command)
+
+    _write_transcriber_script(
+        transcriber,
+        json.dumps({"segments": segments, "text": "Second top-level transcript."}),
+    )
     second = ingest_local(source, output_root, transcriber_command=command)
 
     assert first.manifest.bundle_id != second.manifest.bundle_id

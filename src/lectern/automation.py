@@ -533,6 +533,8 @@ class AutomationState:
         transcriber_command: str | None = None,
     ) -> IngestResult:
         source_path = source_path.expanduser()
+        if not source_path.is_file():
+            raise IngestError(f"source file does not exist: {source_path}")
         planned_bundle_id = (
             plan_local_bundle_id(source_path, transcriber_command)
             if can_plan_local_bundle_id(source_path, transcriber_command)

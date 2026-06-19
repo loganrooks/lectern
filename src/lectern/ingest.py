@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import shlex
 import shutil
 import subprocess
@@ -36,7 +35,6 @@ from lectern.bundle import (
 CANONICAL_SAMPLE_RATE = 16_000
 CANONICAL_CHANNELS = 1
 CANONICAL_SAMPLE_WIDTH = 2
-TRANSCRIBER_COMMAND_ENV = "LECTERN_TRANSCRIBER_COMMAND"
 DEFAULT_TRANSCRIBER_TIMEOUT_S = 300
 
 
@@ -102,8 +100,6 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
     elif source.with_suffix(".transcript.txt").is_file():
         sidecar = _read_transcript_sidecar(source)
         component = sidecar.identity_component
-    elif (environment_command := _environment_transcriber_command()) is not None:
-        component = _command_identity_component(environment_command)
     else:
         sidecar = _read_transcript_sidecar(source)
         component = sidecar.identity_component
@@ -117,9 +113,7 @@ def can_plan_local_bundle_id(source_path: Path, transcriber_command: str | None 
     source = source_path.expanduser()
     if _explicit_transcriber_command(transcriber_command) is not None:
         return False
-    if source.with_suffix(".transcript.txt").is_file():
-        return True
-    return _environment_transcriber_command() is None
+    return source.with_suffix(".transcript.txt").is_file()
 
 
 def ingest_local(
@@ -232,13 +226,7 @@ def _resolve_transcript(
     command = _explicit_transcriber_command(transcriber_command)
     if command is not None:
         return _transcribe_with_local_command(command, normalized_audio, duration_s)
-    try:
-        return _read_transcript_sidecar(source, duration_s=duration_s)
-    except IngestError:
-        command = _environment_transcriber_command()
-        if command is not None:
-            return _transcribe_with_local_command(command, normalized_audio, duration_s)
-        raise
+    return _read_transcript_sidecar(source, duration_s=duration_s)
 
 
 def _explicit_transcriber_command(transcriber_command: str | None) -> str | None:
@@ -246,11 +234,6 @@ def _explicit_transcriber_command(transcriber_command: str | None) -> str | None
         command = transcriber_command.strip()
         return command or None
     return None
-
-
-def _environment_transcriber_command() -> str | None:
-    command = os.environ.get(TRANSCRIBER_COMMAND_ENV, "").strip()
-    return command or None
 
 
 def _read_transcript_sidecar(source: Path, duration_s: float | None = None) -> TranscriptResult:
@@ -285,7 +268,7 @@ def _read_transcript_sidecar(source: Path, duration_s: float | None = None) -> T
         raise IngestError(f"fixture transcript is empty: {transcript_path}")
     raise IngestError(
         "no local transcription backend is configured for this file; "
-        f"provide a .transcript.txt sidecar or set {TRANSCRIBER_COMMAND_ENV}"
+        "provide a .transcript.txt sidecar or pass --transcriber-command"
     )
 
 
@@ -320,7 +303,13 @@ def _transcribe_with_local_command(
     command_digest = _command_identity_component(command)
     argv_digest = _digest_text(json.dumps(argv, separators=(",", ":")))
     transcript_digest = _digest_text(
-        json.dumps([segment.to_dict() for segment in segments], sort_keys=True)
+        json.dumps(
+            {
+                "segments": [segment.to_dict() for segment in segments],
+                "text": transcript_text,
+            },
+            sort_keys=True,
+        )
     )
     return TranscriptResult(
         text=transcript_text,
