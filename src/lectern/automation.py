@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -499,6 +500,11 @@ class AutomationState:
                 output_root,
                 transcriber_command=transcriber_command,
             )
+            try:
+                self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
+            except AutomationError:
+                shutil.rmtree(result.bundle_dir, ignore_errors=True)
+                raise
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -543,8 +549,14 @@ class AutomationState:
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
-        if queue_item.state is QueueState.COMPLETED and queue_item.bundle_id is not None:
-            library_bundle = self.get_library_bundle(queue_item.bundle_id)
+        completed_bundle_id = queue_item.bundle_id
+        if (
+            planned_bundle_id is not None
+            and queue_item.state is QueueState.COMPLETED
+            and completed_bundle_id is not None
+            and completed_bundle_id == planned_bundle_id
+        ):
+            library_bundle = self.get_library_bundle(completed_bundle_id)
             bundle_dir = Path(library_bundle.bundle_path)
             if bundle_dir.is_dir():
                 return IngestResult(
@@ -878,51 +890,78 @@ class AutomationState:
         queue_item: QueueItem,
     ) -> None:
         manifest = Manifest.load(bundle_dir)
-        self._connection.execute(
-            """
-            INSERT INTO library_bundles(
-                bundle_id, bundle_path, source_id, source_item_id, queue_item_id, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(bundle_id) DO UPDATE SET
-                bundle_path = excluded.bundle_path,
-                source_id = excluded.source_id,
-                source_item_id = excluded.source_item_id,
-                queue_item_id = excluded.queue_item_id
-            """,
-            (
-                manifest.bundle_id,
-                str(bundle_dir.resolve()),
-                source.id,
-                source_item.id,
-                queue_item.id,
-                _now(),
-            ),
+        existing = self._existing_library_bundle(manifest.bundle_id)
+        values = (
+            str(bundle_dir.resolve()),
+            source.id,
+            source_item.id,
+            queue_item.id,
         )
+        if existing is None:
+            self._connection.execute(
+                """
+                INSERT INTO library_bundles(
+                    bundle_id, bundle_path, source_id, source_item_id, queue_item_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    manifest.bundle_id,
+                    *values,
+                    _now(),
+                ),
+            )
+        elif existing.queue_item_id == queue_item.id:
+            self._connection.execute(
+                """
+                UPDATE library_bundles
+                SET bundle_path = ?, source_id = ?, source_item_id = ?, queue_item_id = ?
+                WHERE bundle_id = ?
+                """,
+                (*values, manifest.bundle_id),
+            )
+        else:
+            raise AutomationError(
+                "bundle id already exists for different source provenance; "
+                "duplicate-content multi-source provenance is not implemented"
+            )
         self._connection.commit()
 
     def _ensure_bundle_id_available(
         self, bundle_id: str, queue_item: QueueItem, output_root: Path
     ) -> None:
-        existing = self._connection.execute(
-            "SELECT * FROM library_bundles WHERE bundle_id = ?",
-            (bundle_id,),
-        ).fetchone()
-        if existing is None:
-            bundle_dir = output_root / bundle_id
-            if bundle_dir.exists():
-                raise AutomationError(
-                    "bundle id already exists on disk but is not recorded in state; "
-                    "choose a different output directory or remove the existing bundle"
-                )
-            return
-        existing_bundle = _library_bundle_from_row(existing)
-        if existing_bundle.queue_item_id == queue_item.id:
+        existing_bundle = self._existing_library_bundle(bundle_id)
+        if existing_bundle is not None:
+            if existing_bundle.queue_item_id == queue_item.id:
+                return
+            raise AutomationError(
+                "bundle id already exists for different source provenance; "
+                "duplicate-content multi-source provenance is not implemented"
+            )
+        bundle_dir = output_root / bundle_id
+        if bundle_dir.exists():
+            raise AutomationError(
+                "bundle id already exists on disk but is not recorded in state; "
+                "choose a different output directory or remove the existing bundle"
+            )
+
+    def _ensure_library_bundle_id_available(self, bundle_id: str, queue_item: QueueItem) -> None:
+        existing_bundle = self._existing_library_bundle(bundle_id)
+        if existing_bundle is None or existing_bundle.queue_item_id == queue_item.id:
             return
         raise AutomationError(
             "bundle id already exists for different source provenance; "
             "duplicate-content multi-source provenance is not implemented"
         )
+
+    def _existing_library_bundle(self, bundle_id: str) -> LibraryBundle | None:
+        existing = self._connection.execute(
+            "SELECT * FROM library_bundles WHERE bundle_id = ?",
+            (bundle_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        return _library_bundle_from_row(existing)
 
 
 def open_state(path: Path = DEFAULT_STATE_PATH) -> AutomationState:

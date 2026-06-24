@@ -40,11 +40,11 @@ parameters, timing, and artifact hashes.
   source.json
   media/
     audio.wav
-transcript/
-  segments.json
-  transcript.md
-  metadata.json
-  diarization.json
+  transcript/
+    segments.json
+    transcript.md
+    metadata.json
+    diarization.json
   visual/
     frames/
     slides.json

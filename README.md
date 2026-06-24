@@ -54,8 +54,7 @@ without a sidecar:
 uv run lectern ingest local-talk.wav --transcriber-command "my-local-asr --json {input}"
 ```
 
-You can also set `LECTERN_TRANSCRIBER_COMMAND` for repeated local runs. The
-command is executed locally with the normalized audio path and must emit JSON
+The command is executed locally with the normalized audio path and must emit JSON
 segments or text. Lectern records transcript method metadata and timestamp
 anchors, but it does not bundle an ASR model, does not call remote transcription
 providers, and does not claim transcript faithfulness. A user-supplied command
