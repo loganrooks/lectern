@@ -46,6 +46,10 @@ The honest list: things that are legally, ethically, or technically unsettled, m
 
 **Position.** Manufacture cheap, decorrelated checks (DESIGN §7): a small gold-set with reference transcripts; official captions as a divergence alarm; timestamp-anchored claims verified by a separate verifier agent against the transcript span. None of these prove quality; together they bound it — and they're all runnable in CI or a nightly loop.
 
+Current pre-release code records transcript method metadata and timestamp
+anchors, but it does not yet implement the full gold-set, caption-divergence, or
+verifier-agent quality loop.
+
 ## 8. Storage growth
 
 **The grey zone.** Video is huge; a working ingestion habit will eat a disk within months.

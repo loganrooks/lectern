@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -19,7 +20,13 @@ from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
 from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
-from lectern.ingest import IngestError, IngestResult, ingest_local, plan_local_bundle_id
+from lectern.ingest import (
+    IngestError,
+    IngestResult,
+    can_plan_local_bundle_id,
+    ingest_local,
+    plan_local_bundle_id,
+)
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
@@ -27,6 +34,7 @@ MEDIA_EXTENSIONS = frozenset(
     {".aac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".wav", ".webm"}
 )
 EXCLUDED_SCAN_DIR_NAMES = frozenset({".lectern"})
+EXCLUDED_SCAN_DIR_PREFIXES = (".lectern-ingest.",)
 
 
 class AutomationError(RuntimeError):
@@ -244,9 +252,12 @@ class LocalFolderAdapter:
         root_resolved = root.resolve()
         items: list[SourceItem] = []
         for path in sorted(root.rglob("*")):
-            relative_parts = path.relative_to(root).parts
+            relative_parts = path.parent.relative_to(root).parts
             is_excluded_dir = any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts)
-            if is_excluded_dir or _is_bundle_output_path(root, path):
+            is_excluded_temp_dir = any(
+                part.startswith(EXCLUDED_SCAN_DIR_PREFIXES) for part in relative_parts
+            )
+            if is_excluded_dir or is_excluded_temp_dir or _is_bundle_output_path(root, path):
                 continue
             if (
                 path.is_symlink()
@@ -458,7 +469,13 @@ class AutomationState:
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
         return self._set_queue_state(queue_item_id, QueueState.DISCOVERED, clear_error=True)
 
-    def ingest_queue_item(self, queue_item_id: str, output_root: Path) -> IngestResult:
+    def ingest_queue_item(
+        self,
+        queue_item_id: str,
+        output_root: Path,
+        *,
+        transcriber_command: str | None = None,
+    ) -> IngestResult:
         queue_item = self.get_queue_item(queue_item_id)
         if queue_item.state is not QueueState.APPROVED:
             raise AutomationError("queue item requires explicit approval before ingest")
@@ -478,14 +495,49 @@ class AutomationState:
             message = "source file changed since queue approval; rescan before ingest"
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
+        planned_bundle_id: str | None = None
         try:
-            planned_bundle_id = plan_local_bundle_id(source_path)
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
-            result = ingest_local(source_path, output_root)
+            if can_plan_local_bundle_id(source_path, transcriber_command):
+                planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
+                if planned_bundle_id == queue_item.bundle_id:
+                    completed_result = self._queue_owned_bundle_result(queue_item)
+                    if completed_result is not None:
+                        self._set_queue_state(
+                            queue_item.id,
+                            QueueState.COMPLETED,
+                            bundle_id=planned_bundle_id,
+                            clear_error=True,
+                        )
+                        return completed_result
+                self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
+            result = ingest_local(
+                source_path,
+                output_root,
+                transcriber_command=transcriber_command,
+            )
+            try:
+                self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
+            except AutomationError:
+                shutil.rmtree(result.bundle_dir, ignore_errors=True)
+                raise
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         except (IngestError, OSError) as exc:
+            if (
+                isinstance(exc, IngestError)
+                and queue_item.bundle_id is not None
+                and _bundle_exists_error_matches(exc, queue_item.bundle_id)
+            ):
+                completed_result = self._queue_owned_bundle_result(queue_item)
+                if completed_result is not None:
+                    self._set_queue_state(
+                        queue_item.id,
+                        QueueState.COMPLETED,
+                        bundle_id=queue_item.bundle_id,
+                        clear_error=True,
+                    )
+                    return completed_result
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
@@ -508,21 +560,64 @@ class AutomationState:
             manifest=Manifest.load(result.bundle_dir),
         )
 
-    def ingest_one_shot(self, source_path: Path, output_root: Path) -> IngestResult:
+    def ingest_one_shot(
+        self,
+        source_path: Path,
+        output_root: Path,
+        *,
+        transcriber_command: str | None = None,
+    ) -> IngestResult:
         source_path = source_path.expanduser()
-        planned_bundle_id = plan_local_bundle_id(source_path)
+        if not source_path.is_file():
+            raise IngestError(f"source file does not exist: {source_path}")
+        planned_bundle_id = (
+            plan_local_bundle_id(source_path, transcriber_command)
+            if can_plan_local_bundle_id(source_path, transcriber_command)
+            else None
+        )
         source = self._ensure_one_shot_source(source_path)
         source_item = self._ensure_one_shot_item(source, source_path)
         queue_item = self._ensure_one_shot_queue(source, source_item)
+        completed_bundle_id = queue_item.bundle_id
+        if (
+            planned_bundle_id is not None
+            and queue_item.state is QueueState.COMPLETED
+            and completed_bundle_id is not None
+            and completed_bundle_id == planned_bundle_id
+        ):
+            completed_result = self._completed_bundle_result(completed_bundle_id)
+            if completed_result is not None:
+                return completed_result
         try:
-            self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
+            if planned_bundle_id is not None:
+                self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
         except AutomationError as exc:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         try:
-            result = ingest_local(source_path, output_root)
+            result = ingest_local(
+                source_path,
+                output_root,
+                transcriber_command=transcriber_command,
+            )
         except (IngestError, OSError) as exc:
-            self._record_failed_queue_item(queue_item.id, str(exc))
+            if (
+                isinstance(exc, IngestError)
+                and completed_bundle_id is not None
+                and _bundle_exists_error_matches(exc, completed_bundle_id)
+            ):
+                completed_result = self._completed_bundle_result(completed_bundle_id)
+                if completed_result is not None:
+                    return completed_result
+            if queue_item.state is not QueueState.COMPLETED:
+                self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
+        try:
+            self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
+        except AutomationError as exc:
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
+            if queue_item.state is not QueueState.COMPLETED:
+                self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
         attach_provenance_to_bundle(
@@ -795,6 +890,16 @@ class AutomationState:
 
     def _ensure_one_shot_queue(self, source: SourceRecord, item: SourceItem) -> QueueItem:
         queue_item_id = _queue_item_id(item.id, item.sha256)
+        existing = self._connection.execute(
+            "SELECT * FROM queue_items WHERE id = ?",
+            (queue_item_id,),
+        ).fetchone()
+        if existing is not None:
+            queue_item = _queue_from_row(existing)
+            if queue_item.state is QueueState.COMPLETED:
+                return queue_item
+            return self._set_queue_state(queue_item.id, QueueState.APPROVED, clear_error=True)
+
         now = _now()
         self._connection.execute(
             """
@@ -803,10 +908,6 @@ class AutomationState:
                 bundle_id, attempts, last_error, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, ?, ?)
-            ON CONFLICT(source_item_id, content_sha256) DO UPDATE SET
-                state = excluded.state,
-                last_error = NULL,
-                updated_at = excluded.updated_at
             """,
             (
                 queue_item_id,
@@ -830,50 +931,107 @@ class AutomationState:
         queue_item: QueueItem,
     ) -> None:
         manifest = Manifest.load(bundle_dir)
-        self._connection.execute(
-            """
-            INSERT INTO library_bundles(
-                bundle_id, bundle_path, source_id, source_item_id, queue_item_id, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(bundle_id) DO UPDATE SET
-                bundle_path = excluded.bundle_path,
-                source_id = excluded.source_id,
-                source_item_id = excluded.source_item_id,
-                queue_item_id = excluded.queue_item_id
-            """,
-            (
-                manifest.bundle_id,
-                str(bundle_dir.resolve()),
-                source.id,
-                source_item.id,
-                queue_item.id,
-                _now(),
-            ),
+        existing = self._existing_library_bundle(manifest.bundle_id)
+        values = (
+            str(bundle_dir.resolve()),
+            source.id,
+            source_item.id,
+            queue_item.id,
         )
+        if existing is None:
+            self._connection.execute(
+                """
+                INSERT INTO library_bundles(
+                    bundle_id, bundle_path, source_id, source_item_id, queue_item_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    manifest.bundle_id,
+                    *values,
+                    _now(),
+                ),
+            )
+        elif existing.queue_item_id == queue_item.id:
+            self._connection.execute(
+                """
+                UPDATE library_bundles
+                SET bundle_path = ?, source_id = ?, source_item_id = ?, queue_item_id = ?
+                WHERE bundle_id = ?
+                """,
+                (*values, manifest.bundle_id),
+            )
+        else:
+            raise AutomationError(
+                "bundle id already exists for different source provenance; "
+                "duplicate-content multi-source provenance is not implemented"
+            )
         self._connection.commit()
 
     def _ensure_bundle_id_available(
         self, bundle_id: str, queue_item: QueueItem, output_root: Path
     ) -> None:
+        existing_bundle = self._existing_library_bundle(bundle_id)
+        if existing_bundle is not None:
+            if existing_bundle.queue_item_id == queue_item.id:
+                return
+            raise AutomationError(
+                "bundle id already exists for different source provenance; "
+                "duplicate-content multi-source provenance is not implemented"
+            )
+        bundle_dir = output_root / bundle_id
+        if bundle_dir.exists():
+            raise AutomationError(
+                "bundle id already exists on disk but is not recorded in state; "
+                "choose a different output directory or remove the existing bundle"
+            )
+
+    def _ensure_library_bundle_id_available(self, bundle_id: str, queue_item: QueueItem) -> None:
+        existing_bundle = self._existing_library_bundle(bundle_id)
+        if existing_bundle is None or existing_bundle.queue_item_id == queue_item.id:
+            return
+        raise AutomationError(
+            "bundle id already exists for different source provenance; "
+            "duplicate-content multi-source provenance is not implemented"
+        )
+
+    def _existing_library_bundle(self, bundle_id: str) -> LibraryBundle | None:
         existing = self._connection.execute(
             "SELECT * FROM library_bundles WHERE bundle_id = ?",
             (bundle_id,),
         ).fetchone()
         if existing is None:
-            bundle_dir = output_root / bundle_id
-            if bundle_dir.exists():
-                raise AutomationError(
-                    "bundle id already exists on disk but is not recorded in state; "
-                    "choose a different output directory or remove the existing bundle"
-                )
-            return
-        existing_bundle = _library_bundle_from_row(existing)
-        if existing_bundle.queue_item_id == queue_item.id:
-            return
-        raise AutomationError(
-            "bundle id already exists for different source provenance; "
-            "duplicate-content multi-source provenance is not implemented"
+            return None
+        return _library_bundle_from_row(existing)
+
+    def _completed_bundle_result(self, bundle_id: str) -> IngestResult | None:
+        try:
+            library_bundle = self.get_library_bundle(bundle_id)
+        except AutomationError:
+            return None
+        bundle_dir = Path(library_bundle.bundle_path)
+        if not bundle_dir.is_dir():
+            return None
+        return IngestResult(
+            bundle_dir=bundle_dir,
+            manifest=Manifest.load(bundle_dir),
+        )
+
+    def _queue_owned_bundle_result(self, queue_item: QueueItem) -> IngestResult | None:
+        if queue_item.bundle_id is None:
+            return None
+        try:
+            library_bundle = self.get_library_bundle(queue_item.bundle_id)
+        except AutomationError:
+            return None
+        if library_bundle.queue_item_id != queue_item.id:
+            return None
+        bundle_dir = Path(library_bundle.bundle_path)
+        if not bundle_dir.is_dir():
+            return None
+        return IngestResult(
+            bundle_dir=bundle_dir,
+            manifest=Manifest.load(bundle_dir),
         )
 
 
@@ -958,7 +1116,12 @@ def attach_provenance_to_bundle(
         "consent": consent,
         "remote_services": {
             "allowed": False,
+            "scope": "lectern_core",
+            "lectern_invoked": False,
             "requires_explicit_per_item_consent": True,
+            "transcriber_network_posture": source_payload.get("transcript", {})
+            .get("remote_services", {})
+            .get("transcriber_network_posture", "not_recorded"),
         },
     }
     source_path.write_text(json.dumps(source_payload, indent=2) + "\n", encoding="utf-8")
@@ -1039,6 +1202,12 @@ def _library_bundle_from_row(row: sqlite3.Row) -> LibraryBundle:
         queue_item_id=cast(str, row["queue_item_id"]),
         created_at=cast(str, row["created_at"]),
     )
+
+
+def _bundle_exists_error_matches(exc: IngestError, bundle_id: str) -> bool:
+    prefix = "bundle already exists: "
+    message = str(exc)
+    return message.startswith(prefix) and Path(message.removeprefix(prefix)).name == bundle_id
 
 
 def _now() -> str:

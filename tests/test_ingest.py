@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import sys
 import tomllib
 import wave
 from pathlib import Path
@@ -81,7 +83,7 @@ def test_local_ingest_requires_transcript_sidecar(tmp_path: Path) -> None:
     with pytest.raises(IngestError, match="no local transcription backend"):
         ingest_local(source, tmp_path / "bundles")
 
-    assert not (tmp_path / "bundles").exists()
+    assert list((tmp_path / "bundles").iterdir()) == []
 
 
 def test_local_ingest_rejects_empty_transcript_sidecar(tmp_path: Path) -> None:
@@ -169,6 +171,335 @@ def test_empty_wav_probe_returns_ingest_error(tmp_path: Path, monkeypatch: Monke
         ingest_local(empty, tmp_path / "bundles")
 
 
+def test_local_command_transcriber_produces_metadata_and_anchored_summary(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "non_fixture_talk.wav"
+    _write_test_wav(source, 2.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "start_s": 12.2,
+                        "end_s": 13.4,
+                        "text": "First anchored claim.",
+                    },
+                    {
+                        "start_s": 20.0,
+                        "end_s": 21.0,
+                        "text": "Second anchored claim.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    def fail_socket(*args: object, **kwargs: object) -> socket.socket:
+        raise AssertionError("Lectern opened a socket during local transcription")
+
+    monkeypatch.setattr(socket, "socket", fail_socket)
+    result = ingest_local(
+        source,
+        tmp_path / "bundles",
+        transcriber_command=f"{sys.executable} {transcriber}",
+    )
+
+    bundle_dir = result.bundle_dir
+    segments = json.loads((bundle_dir / "transcript" / "segments.json").read_text())
+    assert segments[0]["start_s"] == 12.2
+    assert segments[0]["source"] == "local_command"
+
+    metadata = json.loads((bundle_dir / "transcript" / "metadata.json").read_text())
+    assert metadata["method"] == "local_command_json"
+    assert metadata["remote_services"]["allowed"] is False
+    assert metadata["remote_services"]["lectern_invoked"] is False
+    assert metadata["remote_services"]["transcriber_network_posture"] == (
+        "unverifiable_user_command"
+    )
+    assert metadata["schema_contract"]["manifest_schema_versioned"] is False
+
+    summary = (bundle_dir / "analysis" / "summary.md").read_text(encoding="utf-8")
+    assert "[t=00:12] First anchored claim." in summary
+
+    manifest = Manifest.load(bundle_dir)
+    transcribe_outputs = {output.path for output in manifest.stages[StageName.TRANSCRIBE].outputs}
+    assert "transcript/metadata.json" in transcribe_outputs
+
+
+def test_environment_transcriber_is_not_an_implicit_backend(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "env_talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"segments": [{"start_s": 2.0, "text": "Environment transcript."}]}),
+    )
+    monkeypatch.setenv(
+        "LECTERN_TRANSCRIBER_COMMAND",
+        f"{sys.executable} {transcriber}",
+    )
+
+    with pytest.raises(IngestError, match="pass --transcriber-command"):
+        ingest_local(source, tmp_path / "bundles")
+
+
+def test_environment_transcriber_does_not_override_sidecar(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "synthetic_talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    source.with_suffix(".transcript.txt").write_text("sidecar transcript\n", encoding="utf-8")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "environment transcript"}),
+    )
+    monkeypatch.setenv(
+        "LECTERN_TRANSCRIBER_COMMAND",
+        f"{sys.executable} {transcriber}",
+    )
+
+    result = ingest_local(source, tmp_path / "bundles")
+
+    metadata = json.loads(
+        (result.bundle_dir / "transcript" / "metadata.json").read_text(encoding="utf-8")
+    )
+    transcript = (result.bundle_dir / "transcript" / "transcript.md").read_text(encoding="utf-8")
+    assert metadata["method"] == "fixture_transcript_sidecar"
+    assert transcript == "sidecar transcript\n"
+
+
+def test_local_command_transcriber_rejects_invalid_json_without_partial_bundle(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(tmp_path / "transcriber.py", "not-json")
+    output_root = tmp_path / "bundles"
+
+    with pytest.raises(IngestError, match="valid JSON"):
+        ingest_local(
+            source,
+            output_root,
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+    assert list(output_root.iterdir()) == []
+
+
+def test_local_command_transcriber_rejects_ill_typed_segments(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"segments": [{"start_s": "0", "text": "bad timestamp"}]}),
+    )
+
+    with pytest.raises(IngestError, match="start_s must be a number"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcriber_rejects_non_utf8_stdout(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "import sys\nsys.stdout.buffer.write(b'\\xff')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(IngestError, match="stdout is not valid UTF-8"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcriber_allows_non_utf8_success_stderr(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "import sys\n"
+        'sys.stdout.write(\'{"text": "Valid stdout transcript."}\')\n'
+        "sys.stderr.buffer.write(b'\\xffprogress')\n",
+        encoding="utf-8",
+    )
+
+    result = ingest_local(
+        source,
+        tmp_path / "bundles",
+        transcriber_command=f"{sys.executable} {transcriber}",
+    )
+
+    assert (result.bundle_dir / "transcript" / "transcript.md").read_text(
+        encoding="utf-8"
+    ) == "Valid stdout transcript.\n"
+
+
+def test_local_command_transcriber_rejects_negative_timestamps(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"segments": [{"start_s": -5.0, "text": "bad anchor"}]}),
+    )
+
+    with pytest.raises(IngestError, match="finite and non-negative"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcriber_rejects_non_finite_timestamps(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        '{"segments": [{"start_s": NaN, "text": "bad anchor"}]}',
+    )
+
+    with pytest.raises(IngestError, match="finite and non-negative"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+
+def test_local_command_transcript_output_changes_bundle_identity(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    _write_transcriber_script(transcriber, json.dumps({"text": "First transcript."}))
+    first = ingest_local(source, output_root, transcriber_command=command)
+
+    _write_transcriber_script(transcriber, json.dumps({"text": "Second transcript."}))
+    second = ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.manifest.bundle_id != second.manifest.bundle_id
+
+
+def test_local_command_top_level_text_changes_bundle_identity(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+    segments = [{"start_s": 0.0, "text": "Stable segment."}]
+
+    _write_transcriber_script(
+        transcriber,
+        json.dumps({"segments": segments, "text": "First top-level transcript."}),
+    )
+    first = ingest_local(source, output_root, transcriber_command=command)
+
+    _write_transcriber_script(
+        transcriber,
+        json.dumps({"segments": segments, "text": "Second top-level transcript."}),
+    )
+    second = ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.manifest.bundle_id != second.manifest.bundle_id
+
+
+def test_local_command_identical_output_keeps_bundle_identity_stable(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    first = ingest_local(source, output_root, transcriber_command=command)
+    with pytest.raises(IngestError, match="bundle already exists"):
+        ingest_local(source, output_root, transcriber_command=command)
+
+    assert first.bundle_dir.is_dir()
+
+
+def test_local_command_ingest_rejects_source_changed_during_transcription(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(source)!r}).write_bytes(b'changed during transcription')\n"
+        'sys.stdout.write(\'{"text": "Transcript before source mutation."}\')\n',
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "bundles"
+
+    with pytest.raises(IngestError, match="source file changed during ingest"):
+        ingest_local(
+            source,
+            output_root,
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+    assert list(output_root.iterdir()) == []
+
+
+def test_plan_local_bundle_id_rejects_command_identity_guess(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+
+    with pytest.raises(IngestError, match="cannot be planned before transcription"):
+        ingest_module.plan_local_bundle_id(source, f"{sys.executable} transcriber.py")
+
+
+def test_local_command_transcriber_uses_argv_without_shell_interpretation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    marker = tmp_path / "shell-was-used"
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Text only local transcript."}),
+    )
+
+    ingest_local(
+        source,
+        tmp_path / "bundles",
+        transcriber_command=f"{sys.executable} {transcriber} ; touch {marker}",
+    )
+
+    assert not marker.exists()
+
+
+def test_local_command_transcriber_rejects_remote_endpoint(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+
+    with pytest.raises(IngestError, match="local executable"):
+        ingest_local(
+            source,
+            tmp_path / "bundles",
+            transcriber_command="https://api.example.test/transcribe",
+        )
+
+
 def _write_test_wav(path: Path, duration_s: float) -> None:
     frame_count = int(ingest_module.CANONICAL_SAMPLE_RATE * duration_s)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +508,14 @@ def _write_test_wav(path: Path, duration_s: float) -> None:
         audio.setsampwidth(ingest_module.CANONICAL_SAMPLE_WIDTH)
         audio.setframerate(ingest_module.CANONICAL_SAMPLE_RATE)
         audio.writeframes(b"\x00\x00" * frame_count)
+
+
+def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:
+    path.write_text(
+        f"import sys\nsys.stdout.write({stdout!r})\nraise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _synthetic_talk_threshold() -> float:

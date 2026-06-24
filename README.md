@@ -37,7 +37,7 @@ format checks, type checks, tests, and the public repository safety check.
 
 ## Current local support
 
-The current `lectern ingest` path is the M1 local synthetic-fixture path:
+The current `lectern ingest` path supports the synthetic fixture workflow:
 
 ```bash
 uv run lectern ingest tests/fixtures/synthetic_talk.wav
@@ -45,8 +45,21 @@ uv run lectern ingest tests/fixtures/synthetic_talk.wav
 
 That fixture uses a committed `.transcript.txt` sidecar so CI can check bundle
 behavior and transcript passthrough without downloading ASR models or sending
-media to remote services. General ASR for arbitrary recordings is not shipped
-yet; files without a local transcript sidecar fail with an explicit local error.
+media to remote services.
+
+Lectern can also use an optional local JSON transcriber command for media
+without a sidecar:
+
+```bash
+uv run lectern ingest local-talk.wav --transcriber-command "my-local-asr --json {input}"
+```
+
+The command is executed locally with the normalized audio path and must emit JSON
+segments or text. Lectern records transcript method metadata and timestamp
+anchors, but it does not bundle an ASR model, does not call remote transcription
+providers, and does not claim transcript faithfulness. A user-supplied command
+runs with the user's privileges; Lectern cannot prove that command never opens a
+network connection.
 
 Lectern also has an early local automation spine for folder sources. It records
 source and queue state in local SQLite, scans local folders without network

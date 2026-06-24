@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,13 @@ def copy_fixture(directory: Path, name: str = "synthetic_talk.wav") -> Path:
         SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    return media
+
+
+def copy_media_without_sidecar(directory: Path, name: str = "local_talk.wav") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    media = directory / name
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
     return media
 
 
@@ -102,6 +110,21 @@ def test_source_scan_excludes_local_state_and_bundle_output_dirs(tmp_path: Path)
     assert second.changed == []
     assert [item.relative_path for item in second.unchanged] == ["synthetic_talk.wav"]
     assert second.queued == []
+
+
+def test_local_folder_scan_ignores_in_progress_ingest_temp_dirs(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    temp_media = source_dir / "bundles" / ".lectern-ingest.review" / "media" / "audio.wav"
+    temp_media.parent.mkdir(parents=True)
+    temp_media.write_bytes(SYNTHETIC_TALK.read_bytes())
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert [item.relative_path for item in delta.added] == ["synthetic_talk.wav"]
+    assert len(delta.queued) == 1
 
 
 def test_source_scan_does_not_skip_user_directory_named_bundles(tmp_path: Path) -> None:
@@ -231,6 +254,138 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
 
 
+def test_retried_completed_queue_ingest_returns_existing_bundle(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+
+        retried = state.retry_queue_item(approved.id)
+        reapproved = state.approve_queue_item(retried.id)
+        second = state.ingest_queue_item(reapproved.id, output_root)
+        completed = state.get_queue_item(reapproved.id)
+
+    assert second.bundle_dir == first.bundle_dir
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert completed.state is QueueState.COMPLETED
+    assert completed.bundle_id == first.manifest.bundle_id
+    assert completed.last_error is None
+
+
+def test_queue_ingest_uses_local_transcriber_for_no_sidecar_source(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "start_s": 4.0,
+                        "end_s": 5.0,
+                        "text": "Queue command transcript.",
+                    }
+                ]
+            }
+        ),
+    )
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(
+            approved.id,
+            output_root,
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+        completed = state.get_queue_item(approved.id)
+        library = state.get_library_bundle(result.manifest.bundle_id)
+
+    source_json = json.loads((result.bundle_dir / "source.json").read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (result.bundle_dir / "transcript" / "metadata.json").read_text(encoding="utf-8")
+    )
+    summary = (result.bundle_dir / "analysis" / "summary.md").read_text(encoding="utf-8")
+
+    assert completed.state is QueueState.COMPLETED
+    assert library.queue_item_id == completed.id
+    assert source_json["transcript"]["method"] == "local_command_json"
+    assert source_json["provenance"]["remote_services"]["allowed"] is False
+    assert source_json["provenance"]["remote_services"]["scope"] == "lectern_core"
+    assert source_json["provenance"]["remote_services"]["transcriber_network_posture"] == (
+        "unverifiable_user_command"
+    )
+    assert metadata["remote_services"]["lectern_invoked"] is False
+    assert "[t=00:04] Queue command transcript." in summary
+
+
+def test_retried_command_queue_ingest_same_output_returns_existing_bundle(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable queue command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root, transcriber_command=command)
+
+        retried = state.retry_queue_item(approved.id)
+        reapproved = state.approve_queue_item(retried.id)
+        second = state.ingest_queue_item(
+            reapproved.id,
+            output_root,
+            transcriber_command=command,
+        )
+        completed = state.get_queue_item(reapproved.id)
+
+    assert second.bundle_dir == first.bundle_dir
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert completed.state is QueueState.COMPLETED
+    assert completed.bundle_id == first.manifest.bundle_id
+    assert completed.last_error is None
+
+
+def test_queue_ingest_records_failed_local_transcriber(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        "transcriber failed",
+        exit_code=7,
+    )
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(IngestError, match="local transcriber command failed"):
+            state.ingest_queue_item(
+                approved.id,
+                tmp_path / "bundles",
+                transcriber_command=f"{sys.executable} {transcriber}",
+            )
+        failed = state.get_queue_item(approved.id)
+
+    assert failed.state is QueueState.FAILED
+    assert failed.last_error is not None
+    assert "local transcriber command failed" in failed.last_error
+
+
 def test_queue_ingest_rejects_file_changed_after_approval(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     media = copy_fixture(source_dir)
@@ -309,6 +464,85 @@ def test_one_shot_ingest_records_source_and_queue_provenance(tmp_path: Path) -> 
     assert [bundle.bundle_id for bundle in library] == [result.manifest.bundle_id]
 
 
+def test_one_shot_reingest_returns_existing_bundle_without_failing_queue(
+    tmp_path: Path,
+) -> None:
+    source = copy_fixture(tmp_path / "source")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, tmp_path / "bundles")
+        second = state.ingest_one_shot(source, tmp_path / "bundles")
+        queue_item = state.list_queue()[0]
+
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert second.bundle_dir == first.bundle_dir
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.last_error is None
+
+
+def test_one_shot_command_reingest_reruns_transcriber(tmp_path: Path) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        _write_transcriber_script(transcriber, json.dumps({"text": "First command transcript."}))
+        first = state.ingest_one_shot(source, output_root, transcriber_command=command)
+
+        _write_transcriber_script(transcriber, json.dumps({"text": "Second command transcript."}))
+        second = state.ingest_one_shot(source, output_root, transcriber_command=command)
+        queue_item = state.list_queue()[0]
+
+    second_text = (second.bundle_dir / "transcript" / "transcript.md").read_text(encoding="utf-8")
+    assert second.manifest.bundle_id != first.manifest.bundle_id
+    assert "Second command transcript." in second_text
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.bundle_id == second.manifest.bundle_id
+
+
+def test_one_shot_command_reingest_same_output_returns_existing_bundle(
+    tmp_path: Path,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        second = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        queue_item = state.list_queue()[0]
+
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert second.bundle_dir == first.bundle_dir
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.last_error is None
+
+
+def test_one_shot_command_rerun_failure_preserves_completed_queue(
+    tmp_path: Path,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        _write_transcriber_script(transcriber, json.dumps({"text": "Completed transcript."}))
+        first = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+
+        _write_transcriber_script(transcriber, "rerun failed", exit_code=9)
+        with pytest.raises(IngestError, match="local transcriber command failed"):
+            state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        queue_item = state.list_queue()[0]
+
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.bundle_id == first.manifest.bundle_id
+    assert queue_item.last_error is None
+
+
 def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_path: Path) -> None:
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
@@ -331,6 +565,86 @@ def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_pat
     source_json = json.loads((first_result.bundle_dir / "source.json").read_text(encoding="utf-8"))
     assert source_json["provenance"]["queue_item_id"] == first_queue.id
     assert failed.state is QueueState.FAILED
+
+
+def test_command_duplicate_content_different_sources_do_not_overwrite_provenance(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    copy_media_without_sidecar(first_dir)
+    copy_media_without_sidecar(second_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Same command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first_source = state.add_local_folder_source("first", first_dir)
+        first_queue = state.scan_source(first_source.id).queued[0]
+        state.approve_queue_item(first_queue.id)
+        first_result = state.ingest_queue_item(
+            first_queue.id,
+            tmp_path / "first-bundles",
+            transcriber_command=command,
+        )
+
+        second_source = state.add_local_folder_source("second", second_dir)
+        second_queue = state.scan_source(second_source.id).queued[0]
+        state.approve_queue_item(second_queue.id)
+        with pytest.raises(AutomationError, match="duplicate-content multi-source"):
+            state.ingest_queue_item(
+                second_queue.id,
+                tmp_path / "second-bundles",
+                transcriber_command=command,
+            )
+        failed = state.get_queue_item(second_queue.id)
+        library = state.get_library_bundle(first_result.manifest.bundle_id)
+
+    source_json = json.loads((first_result.bundle_dir / "source.json").read_text(encoding="utf-8"))
+    duplicate_dir = tmp_path / "second-bundles" / first_result.manifest.bundle_id
+
+    assert source_json["provenance"]["queue_item_id"] == first_queue.id
+    assert library.queue_item_id == first_queue.id
+    assert failed.state is QueueState.FAILED
+    assert not duplicate_dir.exists()
+
+
+def test_one_shot_command_duplicate_content_different_sources_does_not_complete_duplicate(
+    tmp_path: Path,
+) -> None:
+    first = copy_media_without_sidecar(tmp_path / "first")
+    second = copy_media_without_sidecar(tmp_path / "second")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Same one-shot command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first_result = state.ingest_one_shot(
+            first,
+            tmp_path / "first-bundles",
+            transcriber_command=command,
+        )
+        first_queue = state.list_queue()[0]
+
+        with pytest.raises(AutomationError, match="duplicate-content multi-source"):
+            state.ingest_one_shot(
+                second,
+                tmp_path / "second-bundles",
+                transcriber_command=command,
+            )
+        queues = state.list_queue()
+        library = state.get_library_bundle(first_result.manifest.bundle_id)
+
+    duplicate_dir = tmp_path / "second-bundles" / first_result.manifest.bundle_id
+    failed = next(queue for queue in queues if queue.id != first_queue.id)
+
+    assert library.queue_item_id == first_queue.id
+    assert failed.state is QueueState.FAILED
+    assert not duplicate_dir.exists()
 
 
 def test_queue_ingest_rejects_existing_unindexed_bundle_directory(tmp_path: Path) -> None:
@@ -387,3 +701,11 @@ def test_local_folder_scan_does_not_open_network_socket(
         delta = state.scan_source(source.id)
 
     assert len(delta.added) == 1
+
+
+def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:
+    path.write_text(
+        f"import sys\nsys.stdout.write({stdout!r})\nraise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    return path
