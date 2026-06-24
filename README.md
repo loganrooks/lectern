@@ -7,9 +7,40 @@
 **Turn talks into thought.** Lectern ingests recorded talks and produces local,
 inspectable knowledge bundles for humans and agents.
 
-Lectern is currently pre-release. The design is documented, the core bundle
-schema and CLI scaffold exist, and the project is building toward a local-first
-media pipeline.
+Lectern is pre-release software. The current public preview surface is a
+CLI-first local workflow: ingest local media, record provenance in a bundle, and
+inspect the local source, queue, and library state. There is no package-registry
+release yet.
+
+## Quickstart
+
+Prerequisites:
+
+- Python 3.12 or newer
+- `uv`
+- `ffmpeg`
+
+Check that Lectern can be installed from the public repository:
+
+```bash
+uv tool run --from git+https://github.com/loganrooks/lectern.git lectern --version
+```
+
+Run the local fixture workflow from a checkout:
+
+```bash
+set -e
+LECTERN_TMP="$(mktemp -d)"
+git clone https://github.com/loganrooks/lectern.git "$LECTERN_TMP/lectern"
+cd "$LECTERN_TMP/lectern"
+make sync
+uv run lectern doctor
+uv run lectern ingest tests/fixtures/synthetic_talk.wav --output "$LECTERN_TMP/bundles" --state "$LECTERN_TMP/state.sqlite"
+uv run lectern library list --state "$LECTERN_TMP/state.sqlite"
+```
+
+The fixture uses synthetic audio and a committed transcript sidecar so the
+workflow is redistributable and does not download an ASR model.
 
 ## Design Shape
 
@@ -35,7 +66,7 @@ make verify
 `make verify` is the local and CI verification entrypoint. It runs linting,
 format checks, type checks, tests, and the public repository safety check.
 
-## Current local support
+## Current Preview Support
 
 The current `lectern ingest` path supports the synthetic fixture workflow:
 
@@ -79,6 +110,20 @@ Use `--json` on source, queue, and library commands for machine-readable output.
 The state database is local run state under `.lectern/` by default and should not
 be committed.
 
+## Current Limits
+
+- YouTube and other external source discovery are not implemented yet.
+- Lectern does not download media from external services.
+- MCP/API access, richer search, visual evidence, OCR, reference resolution, and
+  citation-gated synthesis are later roadmap items.
+- The local command transcriber path is an integration point, not a bundled ASR
+  engine or transcript-quality guarantee.
+- Local bundles can contain sensitive media-derived artifacts. Keep them out of
+  commits and issue reports.
+- Bundle manifest compatibility is tied to the manifest `schema_version`. The
+  current manifest schema version is `0.1.0`; pre-release compatibility policy
+  is described in [SUPPORT.md](SUPPORT.md).
+
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security
 and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 
@@ -86,6 +131,10 @@ and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 
 - [Design](docs/DESIGN.md)
 - [Grey Areas](docs/GREY_AREAS.md)
+- [Privacy](PRIVACY.md)
+- [Roadmap](ROADMAP.md)
+- [Support and compatibility](SUPPORT.md)
+- [Changelog](CHANGELOG.md)
 - [Architecture decisions](docs/adr/)
 - [Automated contributor guidance](AGENTS.md)
 
