@@ -580,13 +580,15 @@ class AutomationState:
                 completed_result = self._completed_bundle_result(completed_bundle_id)
                 if completed_result is not None:
                     return completed_result
-            self._record_failed_queue_item(queue_item.id, str(exc))
+            if queue_item.state is not QueueState.COMPLETED:
+                self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         try:
             self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
         except AutomationError as exc:
             shutil.rmtree(result.bundle_dir, ignore_errors=True)
-            self._record_failed_queue_item(queue_item.id, str(exc))
+            if queue_item.state is not QueueState.COMPLETED:
+                self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
         attach_provenance_to_bundle(

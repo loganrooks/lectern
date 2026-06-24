@@ -450,6 +450,27 @@ def test_one_shot_command_reingest_same_output_returns_existing_bundle(
     assert queue_item.last_error is None
 
 
+def test_one_shot_command_rerun_failure_preserves_completed_queue(
+    tmp_path: Path,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = tmp_path / "transcriber.py"
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        _write_transcriber_script(transcriber, json.dumps({"text": "Completed transcript."}))
+        first = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+
+        _write_transcriber_script(transcriber, "rerun failed", exit_code=9)
+        with pytest.raises(IngestError, match="local transcriber command failed"):
+            state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        queue_item = state.list_queue()[0]
+
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.bundle_id == first.manifest.bundle_id
+    assert queue_item.last_error is None
+
+
 def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_path: Path) -> None:
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
