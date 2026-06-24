@@ -429,6 +429,27 @@ def test_one_shot_command_reingest_reruns_transcriber(tmp_path: Path) -> None:
     assert queue_item.bundle_id == second.manifest.bundle_id
 
 
+def test_one_shot_command_reingest_same_output_returns_existing_bundle(
+    tmp_path: Path,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        second = state.ingest_one_shot(source, tmp_path / "bundles", transcriber_command=command)
+        queue_item = state.list_queue()[0]
+
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert second.bundle_dir == first.bundle_dir
+    assert queue_item.state is QueueState.COMPLETED
+    assert queue_item.last_error is None
+
+
 def test_duplicate_content_different_sources_do_not_overwrite_provenance(tmp_path: Path) -> None:
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
@@ -492,6 +513,42 @@ def test_command_duplicate_content_different_sources_do_not_overwrite_provenance
     duplicate_dir = tmp_path / "second-bundles" / first_result.manifest.bundle_id
 
     assert source_json["provenance"]["queue_item_id"] == first_queue.id
+    assert library.queue_item_id == first_queue.id
+    assert failed.state is QueueState.FAILED
+    assert not duplicate_dir.exists()
+
+
+def test_one_shot_command_duplicate_content_different_sources_does_not_complete_duplicate(
+    tmp_path: Path,
+) -> None:
+    first = copy_media_without_sidecar(tmp_path / "first")
+    second = copy_media_without_sidecar(tmp_path / "second")
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Same one-shot command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first_result = state.ingest_one_shot(
+            first,
+            tmp_path / "first-bundles",
+            transcriber_command=command,
+        )
+        first_queue = state.list_queue()[0]
+
+        with pytest.raises(AutomationError, match="duplicate-content multi-source"):
+            state.ingest_one_shot(
+                second,
+                tmp_path / "second-bundles",
+                transcriber_command=command,
+            )
+        queues = state.list_queue()
+        library = state.get_library_bundle(first_result.manifest.bundle_id)
+
+    duplicate_dir = tmp_path / "second-bundles" / first_result.manifest.bundle_id
+    failed = next(queue for queue in queues if queue.id != first_queue.id)
+
     assert library.queue_item_id == first_queue.id
     assert failed.state is QueueState.FAILED
     assert not duplicate_dir.exists()

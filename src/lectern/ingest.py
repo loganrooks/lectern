@@ -96,7 +96,9 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
     source_digest = _sha256(source)
     command = _explicit_transcriber_command(transcriber_command)
     if command is not None:
-        component = _command_identity_component(command)
+        raise IngestError(
+            "bundle id for --transcriber-command cannot be planned before transcription"
+        )
     elif source.with_suffix(".transcript.txt").is_file():
         sidecar = _read_transcript_sidecar(source)
         component = sidecar.identity_component
@@ -293,8 +295,8 @@ def _transcribe_with_local_command(
             f"local transcriber command timed out after {DEFAULT_TRANSCRIBER_TIMEOUT_S}s"
         ) from exc
     stdout = _decode_transcriber_pipe(result.stdout, "stdout")
-    stderr = _decode_transcriber_pipe(result.stderr, "stderr")
     if result.returncode != 0:
+        stderr = _decode_transcriber_pipe(result.stderr, "stderr")
         message = stderr.strip() or stdout.strip() or "no diagnostic output"
         raise IngestError(f"local transcriber command failed ({result.returncode}): {message}")
 

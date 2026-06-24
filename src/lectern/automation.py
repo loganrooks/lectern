@@ -556,13 +556,9 @@ class AutomationState:
             and completed_bundle_id is not None
             and completed_bundle_id == planned_bundle_id
         ):
-            library_bundle = self.get_library_bundle(completed_bundle_id)
-            bundle_dir = Path(library_bundle.bundle_path)
-            if bundle_dir.is_dir():
-                return IngestResult(
-                    bundle_dir=bundle_dir,
-                    manifest=Manifest.load(bundle_dir),
-                )
+            completed_result = self._completed_bundle_result(completed_bundle_id)
+            if completed_result is not None:
+                return completed_result
         try:
             if planned_bundle_id is not None:
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
@@ -576,6 +572,20 @@ class AutomationState:
                 transcriber_command=transcriber_command,
             )
         except (IngestError, OSError) as exc:
+            if (
+                isinstance(exc, IngestError)
+                and completed_bundle_id is not None
+                and _bundle_exists_error_matches(exc, completed_bundle_id)
+            ):
+                completed_result = self._completed_bundle_result(completed_bundle_id)
+                if completed_result is not None:
+                    return completed_result
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
+        try:
+            self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
+        except AutomationError as exc:
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
@@ -963,6 +973,19 @@ class AutomationState:
             return None
         return _library_bundle_from_row(existing)
 
+    def _completed_bundle_result(self, bundle_id: str) -> IngestResult | None:
+        try:
+            library_bundle = self.get_library_bundle(bundle_id)
+        except AutomationError:
+            return None
+        bundle_dir = Path(library_bundle.bundle_path)
+        if not bundle_dir.is_dir():
+            return None
+        return IngestResult(
+            bundle_dir=bundle_dir,
+            manifest=Manifest.load(bundle_dir),
+        )
+
 
 def open_state(path: Path = DEFAULT_STATE_PATH) -> AutomationState:
     try:
@@ -1131,6 +1154,12 @@ def _library_bundle_from_row(row: sqlite3.Row) -> LibraryBundle:
         queue_item_id=cast(str, row["queue_item_id"]),
         created_at=cast(str, row["created_at"]),
     )
+
+
+def _bundle_exists_error_matches(exc: IngestError, bundle_id: str) -> bool:
+    prefix = "bundle already exists: "
+    message = str(exc)
+    return message.startswith(prefix) and Path(message.removeprefix(prefix)).name == bundle_id
 
 
 def _now() -> str:

@@ -325,6 +325,28 @@ def test_local_command_transcriber_rejects_non_utf8_stdout(tmp_path: Path) -> No
         )
 
 
+def test_local_command_transcriber_allows_non_utf8_success_stderr(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "import sys\n"
+        'sys.stdout.write(\'{"text": "Valid stdout transcript."}\')\n'
+        "sys.stderr.buffer.write(b'\\xffprogress')\n",
+        encoding="utf-8",
+    )
+
+    result = ingest_local(
+        source,
+        tmp_path / "bundles",
+        transcriber_command=f"{sys.executable} {transcriber}",
+    )
+
+    assert (result.bundle_dir / "transcript" / "transcript.md").read_text(
+        encoding="utf-8"
+    ) == "Valid stdout transcript.\n"
+
+
 def test_local_command_transcriber_rejects_negative_timestamps(tmp_path: Path) -> None:
     source = tmp_path / "talk.wav"
     _write_test_wav(source, 1.0)
@@ -411,6 +433,14 @@ def test_local_command_identical_output_keeps_bundle_identity_stable(tmp_path: P
         ingest_local(source, output_root, transcriber_command=command)
 
     assert first.bundle_dir.is_dir()
+
+
+def test_plan_local_bundle_id_rejects_command_identity_guess(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+
+    with pytest.raises(IngestError, match="cannot be planned before transcription"):
+        ingest_module.plan_local_bundle_id(source, f"{sys.executable} transcriber.py")
 
 
 def test_local_command_transcriber_uses_argv_without_shell_interpretation(
