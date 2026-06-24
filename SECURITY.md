@@ -22,9 +22,12 @@ Useful reports include:
 ## Supported Versions
 
 Lectern is pre-release. Security fixes target the current `main` branch until
-versioned releases exist.
+versioned releases exist. See [SUPPORT.md](SUPPORT.md) for the current support
+and compatibility policy.
 
 ## Sensitive Data
 
 Do not include real credentials, private recordings, private transcripts, or
 non-redistributable media in issues, pull requests, tests, or fixtures.
+
+See [PRIVACY.md](PRIVACY.md) for the local-source privacy boundary.
