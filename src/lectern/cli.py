@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -11,12 +12,16 @@ from typing import Any
 from lectern import __version__
 from lectern.automation import (
     DEFAULT_STATE_PATH,
+    DEFAULT_YOUTUBE_API_KEY_ENV,
     AutomationError,
     QueueState,
+    SourceKind,
     SourcePolicy,
+    YouTubePlaylistAdapter,
     open_state,
     preflight_local_folder,
     preflight_state_store,
+    preflight_youtube_playlist,
 )
 from lectern.bundle import export_json_schema
 from lectern.ingest import IngestError
@@ -51,6 +56,12 @@ def _doctor() -> int:
         detail = state.error or "state path is not writable"
         print(f"state: ERROR ({detail})")
         ok = False
+    youtube_status = (
+        f"configured via {DEFAULT_YOUTUBE_API_KEY_ENV}"
+        if os.environ.get(DEFAULT_YOUTUBE_API_KEY_ENV)
+        else f"not configured; set {DEFAULT_YOUTUBE_API_KEY_ENV} for YouTube discovery"
+    )
+    print(f"youtube: OPTIONAL ({youtube_status})")
     return 0 if ok else 1
 
 
@@ -146,12 +157,16 @@ def _sources(args: Sequence[str]) -> int:
     try:
         if command == "add-folder":
             return _sources_add_folder(rest, state_path, json_output)
+        if command == "add-youtube-playlist":
+            return _sources_add_youtube_playlist(rest, state_path, json_output)
         if command == "list":
             return _sources_list(rest, state_path, json_output)
         if command == "scan":
             return _sources_scan(rest, state_path, json_output)
         if command == "preflight":
             return _sources_preflight(rest, json_output)
+        if command == "preflight-youtube":
+            return _sources_preflight_youtube(rest, json_output)
     except AutomationError as exc:
         print(f"sources: {exc}", file=sys.stderr)
         return 3
@@ -187,6 +202,31 @@ def _sources_add_folder(args: Sequence[str], state_path: Path, json_output: bool
     return 0
 
 
+def _sources_add_youtube_playlist(args: Sequence[str], state_path: Path, json_output: bool) -> int:
+    if len(args) not in (2, 4):
+        _sources_usage()
+        return 2
+    name = args[0]
+    playlist = args[1]
+    policy = SourcePolicy.REVIEW
+    if len(args) == 4:
+        if args[2] != "--policy":
+            _sources_usage()
+            return 2
+        try:
+            policy = SourcePolicy(args[3])
+        except ValueError:
+            print("sources: policy must be disabled, scan-only, or review", file=sys.stderr)
+            return 2
+    with open_state(state_path) as state:
+        source = state.add_youtube_playlist_source(name, playlist, policy)
+    if json_output:
+        _print_json(source.to_dict())
+    else:
+        print(f"{source.id}\t{source.policy.value}\t{source.root_path}")
+    return 0
+
+
 def _sources_list(args: Sequence[str], state_path: Path, json_output: bool) -> int:
     if args:
         _sources_usage()
@@ -202,11 +242,23 @@ def _sources_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
 
 
 def _sources_scan(args: Sequence[str], state_path: Path, json_output: bool) -> int:
-    if len(args) != 1:
+    if len(args) not in (1, 3):
         _sources_usage()
         return 2
+    api_key_env = DEFAULT_YOUTUBE_API_KEY_ENV
+    if len(args) == 3:
+        if args[1] != "--api-key-env":
+            _sources_usage()
+            return 2
+        api_key_env = args[2]
     with open_state(state_path) as state:
-        delta = state.scan_source(args[0])
+        source = state.get_source(args[0])
+        adapter = (
+            YouTubePlaylistAdapter.from_environment(api_key_env=api_key_env)
+            if source.kind is SourceKind.YOUTUBE_PLAYLIST
+            else None
+        )
+        delta = state.scan_source(args[0], adapter=adapter)
     payload = delta.to_dict()
     if json_output:
         _print_json(payload)
@@ -229,6 +281,26 @@ def _sources_preflight(args: Sequence[str], json_output: bool) -> int:
     else:
         status = "OK" if preflight.ok else "FAIL"
         print(f"{status}\tmedia_files={preflight.media_files}\t{preflight.path}")
+    return 0 if preflight.ok else 1
+
+
+def _sources_preflight_youtube(args: Sequence[str], json_output: bool) -> int:
+    if len(args) not in (1, 3):
+        _sources_usage()
+        return 2
+    api_key_env = DEFAULT_YOUTUBE_API_KEY_ENV
+    if len(args) == 3:
+        if args[1] != "--api-key-env":
+            _sources_usage()
+            return 2
+        api_key_env = args[2]
+    preflight = preflight_youtube_playlist(args[0], api_key_env=api_key_env)
+    if json_output:
+        _print_json(preflight.to_dict())
+    else:
+        status = "OK" if preflight.ok else "FAIL"
+        detail = preflight.error or f"estimated_units_consumed={preflight.estimated_units_consumed}"
+        print(f"{status}\tplaylist={preflight.playlist_id}\t{detail}")
     return 0 if preflight.ok else 1
 
 
@@ -442,7 +514,10 @@ def _print_json(payload: dict[str, Any]) -> None:
 def _sources_usage() -> None:
     print(
         "usage: lectern sources "
-        "{add-folder NAME PATH [--policy POLICY]|list|scan SOURCE|preflight PATH} "
+        "{add-folder NAME PATH [--policy POLICY]|"
+        "add-youtube-playlist NAME PLAYLIST [--policy POLICY]|list|"
+        "scan SOURCE [--api-key-env ENV]|preflight PATH|"
+        "preflight-youtube PLAYLIST [--api-key-env ENV]} "
         "[--state PATH] [--json]",
         file=sys.stderr,
     )
