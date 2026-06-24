@@ -112,6 +112,21 @@ def test_source_scan_excludes_local_state_and_bundle_output_dirs(tmp_path: Path)
     assert second.queued == []
 
 
+def test_local_folder_scan_ignores_in_progress_ingest_temp_dirs(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    temp_media = source_dir / "bundles" / ".lectern-ingest.review" / "media" / "audio.wav"
+    temp_media.parent.mkdir(parents=True)
+    temp_media.write_bytes(SYNTHETIC_TALK.read_bytes())
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    assert [item.relative_path for item in delta.added] == ["synthetic_talk.wav"]
+    assert len(delta.queued) == 1
+
+
 def test_source_scan_does_not_skip_user_directory_named_bundles(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     copy_fixture(source_dir / "archive" / "bundles")

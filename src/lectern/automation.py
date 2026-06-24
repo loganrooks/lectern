@@ -34,6 +34,7 @@ MEDIA_EXTENSIONS = frozenset(
     {".aac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".wav", ".webm"}
 )
 EXCLUDED_SCAN_DIR_NAMES = frozenset({".lectern"})
+EXCLUDED_SCAN_DIR_PREFIXES = (".lectern-ingest.",)
 
 
 class AutomationError(RuntimeError):
@@ -251,9 +252,12 @@ class LocalFolderAdapter:
         root_resolved = root.resolve()
         items: list[SourceItem] = []
         for path in sorted(root.rglob("*")):
-            relative_parts = path.relative_to(root).parts
+            relative_parts = path.parent.relative_to(root).parts
             is_excluded_dir = any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts)
-            if is_excluded_dir or _is_bundle_output_path(root, path):
+            is_excluded_temp_dir = any(
+                part.startswith(EXCLUDED_SCAN_DIR_PREFIXES) for part in relative_parts
+            )
+            if is_excluded_dir or is_excluded_temp_dir or _is_bundle_output_path(root, path):
                 continue
             if (
                 path.is_symlink()
