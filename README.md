@@ -110,10 +110,30 @@ Use `--json` on source, queue, and library commands for machine-readable output.
 The state database is local run state under `.lectern/` by default and should not
 be committed.
 
+Lectern can also discover public YouTube playlist metadata through the YouTube
+Data API. This is metadata-only discovery: it records playlist/video metadata in
+the local source registry and review queue, but it does not download YouTube
+media, captions, or transcripts and cannot yet ingest a YouTube queue item into
+a bundle.
+
+```bash
+export YOUTUBE_API_KEY=...
+uv run lectern sources preflight-youtube "PL..."
+uv run lectern sources add-youtube-playlist lectures "PL..."
+uv run lectern sources scan lectures
+uv run lectern queue list --json
+```
+
+The API key is read from the environment and is not stored in Lectern state or
+bundle artifacts. Each playlist page request consumes an estimated 1 YouTube
+Data API quota unit; scan JSON reports estimated units consumed for the scan.
+
 ## Current Limits
 
-- YouTube and other external source discovery are not implemented yet.
-- Lectern does not download media from external services.
+- YouTube support is limited to public-playlist metadata discovery through an
+  API key. OAuth/private playlist access is not implemented.
+- Lectern does not download media, captions, or transcripts from external
+  services.
 - MCP/API access, richer search, visual evidence, OCR, reference resolution, and
   citation-gated synthesis are later roadmap items.
 - The local command transcriber path is an integration point, not a bundled ASR

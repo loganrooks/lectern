@@ -12,6 +12,22 @@ The current local ingest and automation paths do not call remote transcription
 providers. Tests also exercise the local-source privacy boundary by failing if
 Lectern opens a network socket during the local command transcription path.
 
+## YouTube Discovery
+
+YouTube playlist discovery is an external metadata lookup. When the user runs a
+YouTube preflight or scan command, Lectern contacts Google's YouTube Data API
+with the configured API key and playlist ID, then stores public playlist/video
+metadata in the local SQLite state store and review queue.
+
+This path does not send local-source media, transcripts, generated bundles, or
+other local media-derived artifacts to Google. It does not download YouTube
+media, captions, or transcripts. The API key is read from the environment and is
+not stored in the state database or bundle artifacts.
+
+Because the retrieved playlist metadata is local run state, treat it like other
+state artifacts: do not commit it or attach it to public issues unless you
+intentionally choose to share it.
+
 ## User-Supplied Commands
 
 Lectern can run a user-configured local JSON transcriber command. That command
