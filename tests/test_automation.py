@@ -254,6 +254,29 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
 
 
+def test_retried_completed_queue_ingest_returns_existing_bundle(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+
+        retried = state.retry_queue_item(approved.id)
+        reapproved = state.approve_queue_item(retried.id)
+        second = state.ingest_queue_item(reapproved.id, output_root)
+        completed = state.get_queue_item(reapproved.id)
+
+    assert second.bundle_dir == first.bundle_dir
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert completed.state is QueueState.COMPLETED
+    assert completed.bundle_id == first.manifest.bundle_id
+    assert completed.last_error is None
+
+
 def test_queue_ingest_uses_local_transcriber_for_no_sidecar_source(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     copy_media_without_sidecar(source_dir)
@@ -301,6 +324,40 @@ def test_queue_ingest_uses_local_transcriber_for_no_sidecar_source(tmp_path: Pat
     )
     assert metadata["remote_services"]["lectern_invoked"] is False
     assert "[t=00:04] Queue command transcript." in summary
+
+
+def test_retried_command_queue_ingest_same_output_returns_existing_bundle(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py",
+        json.dumps({"text": "Stable queue command transcript."}),
+    )
+    command = f"{sys.executable} {transcriber}"
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root, transcriber_command=command)
+
+        retried = state.retry_queue_item(approved.id)
+        reapproved = state.approve_queue_item(retried.id)
+        second = state.ingest_queue_item(
+            reapproved.id,
+            output_root,
+            transcriber_command=command,
+        )
+        completed = state.get_queue_item(reapproved.id)
+
+    assert second.bundle_dir == first.bundle_dir
+    assert second.manifest.bundle_id == first.manifest.bundle_id
+    assert completed.state is QueueState.COMPLETED
+    assert completed.bundle_id == first.manifest.bundle_id
+    assert completed.last_error is None
 
 
 def test_queue_ingest_records_failed_local_transcriber(tmp_path: Path) -> None:

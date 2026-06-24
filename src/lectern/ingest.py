@@ -127,6 +127,7 @@ def ingest_local(
     source = source_path.expanduser()
     if not source.is_file():
         raise IngestError(f"source file does not exist: {source}")
+    source_digest, source_size = _digest_and_size(source)
 
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -144,7 +145,10 @@ def ingest_local(
             transcriber_command=transcriber_command,
         )
 
-        source_digest, source_size = _digest_and_size(source)
+        current_source_digest, current_source_size = _digest_and_size(source)
+        if (current_source_digest, current_source_size) != (source_digest, source_size):
+            raise IngestError("source file changed during ingest; retry after changes settle")
+
         bundle_digest = _combined_digest(source_digest, transcript.identity_component)
         bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
         bundle_dir = output_root / bundle_id

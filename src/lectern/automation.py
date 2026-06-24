@@ -495,9 +495,20 @@ class AutomationState:
             message = "source file changed since queue approval; rescan before ingest"
             self._record_failed_queue_item(queue_item.id, message)
             raise AutomationError(message)
+        planned_bundle_id: str | None = None
         try:
             if can_plan_local_bundle_id(source_path, transcriber_command):
                 planned_bundle_id = plan_local_bundle_id(source_path, transcriber_command)
+                if planned_bundle_id == queue_item.bundle_id:
+                    completed_result = self._queue_owned_bundle_result(queue_item)
+                    if completed_result is not None:
+                        self._set_queue_state(
+                            queue_item.id,
+                            QueueState.COMPLETED,
+                            bundle_id=planned_bundle_id,
+                            clear_error=True,
+                        )
+                        return completed_result
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             result = ingest_local(
                 source_path,
@@ -513,6 +524,20 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         except (IngestError, OSError) as exc:
+            if (
+                isinstance(exc, IngestError)
+                and queue_item.bundle_id is not None
+                and _bundle_exists_error_matches(exc, queue_item.bundle_id)
+            ):
+                completed_result = self._queue_owned_bundle_result(queue_item)
+                if completed_result is not None:
+                    self._set_queue_state(
+                        queue_item.id,
+                        QueueState.COMPLETED,
+                        bundle_id=queue_item.bundle_id,
+                        clear_error=True,
+                    )
+                    return completed_result
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
@@ -983,6 +1008,23 @@ class AutomationState:
         try:
             library_bundle = self.get_library_bundle(bundle_id)
         except AutomationError:
+            return None
+        bundle_dir = Path(library_bundle.bundle_path)
+        if not bundle_dir.is_dir():
+            return None
+        return IngestResult(
+            bundle_dir=bundle_dir,
+            manifest=Manifest.load(bundle_dir),
+        )
+
+    def _queue_owned_bundle_result(self, queue_item: QueueItem) -> IngestResult | None:
+        if queue_item.bundle_id is None:
+            return None
+        try:
+            library_bundle = self.get_library_bundle(queue_item.bundle_id)
+        except AutomationError:
+            return None
+        if library_bundle.queue_item_id != queue_item.id:
             return None
         bundle_dir = Path(library_bundle.bundle_path)
         if not bundle_dir.is_dir():

@@ -435,6 +435,31 @@ def test_local_command_identical_output_keeps_bundle_identity_stable(tmp_path: P
     assert first.bundle_dir.is_dir()
 
 
+def test_local_command_ingest_rejects_source_changed_during_transcription(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    transcriber = tmp_path / "transcriber.py"
+    transcriber.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(source)!r}).write_bytes(b'changed during transcription')\n"
+        'sys.stdout.write(\'{"text": "Transcript before source mutation."}\')\n',
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "bundles"
+
+    with pytest.raises(IngestError, match="source file changed during ingest"):
+        ingest_local(
+            source,
+            output_root,
+            transcriber_command=f"{sys.executable} {transcriber}",
+        )
+
+    assert list(output_root.iterdir()) == []
+
+
 def test_plan_local_bundle_id_rejects_command_identity_guess(tmp_path: Path) -> None:
     source = tmp_path / "talk.wav"
     _write_test_wav(source, 1.0)
