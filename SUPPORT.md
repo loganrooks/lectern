@@ -37,8 +37,9 @@ bundles, or local state databases in public reports.
 The current preview does not support:
 
 - package-registry installation;
-- external source discovery;
 - external media acquisition;
+- external source discovery beyond the documented metadata-only YouTube
+  playlist workflow;
 - MCP/API access;
 - OCR or visual evidence extraction;
 - remote model stages;

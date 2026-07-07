@@ -24,6 +24,10 @@ other local media-derived artifacts to Google. It does not download YouTube
 media, captions, or transcripts. The API key is read from the environment and is
 not stored in the state database or bundle artifacts.
 
+Google can still observe the Data API request, including the API-key project and
+the queried public playlist ID. Do not use this path for playlist lookups you do
+not want exposed to Google.
+
 Because the retrieved playlist metadata is local run state, treat it like other
 state artifacts: do not commit it or attach it to public issues unless you
 intentionally choose to share it.
