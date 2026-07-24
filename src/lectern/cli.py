@@ -242,23 +242,57 @@ def _sources_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
 
 
 def _sources_scan(args: Sequence[str], state_path: Path, json_output: bool) -> int:
-    if len(args) not in (1, 3):
+    if not args:
         _sources_usage()
         return 2
-    api_key_env = DEFAULT_YOUTUBE_API_KEY_ENV
-    if len(args) == 3:
-        if args[1] != "--api-key-env":
+    source_name = args[0]
+    api_key_env: str | None = None
+    max_pages: int | None = None
+    rest = list(args[1:])
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--api-key-env" and index + 1 < len(rest):
+            api_key_env = rest[index + 1]
+            index += 2
+        elif token == "--max-pages" and index + 1 < len(rest):
+            max_pages = _positive_int(rest[index + 1])
+            if max_pages is None:
+                print("sources: --max-pages must be a positive integer", file=sys.stderr)
+                return 2
+            index += 2
+        else:
             _sources_usage()
             return 2
-        api_key_env = args[2]
+
     with open_state(state_path) as state:
-        source = state.get_source(args[0])
-        adapter = (
-            YouTubePlaylistAdapter.from_environment(api_key_env=api_key_env)
-            if source.kind is SourceKind.YOUTUBE_PLAYLIST
-            else None
-        )
-        delta = state.scan_source(args[0], adapter=adapter)
+        source = state.get_source(source_name)
+        adapter: YouTubePlaylistAdapter | None = None
+        if source.kind is SourceKind.YOUTUBE_PLAYLIST:
+            adapter = YouTubePlaylistAdapter.from_environment(
+                api_key_env=api_key_env or DEFAULT_YOUTUBE_API_KEY_ENV,
+                max_pages=max_pages,
+            )
+        else:
+            rejected = next(
+                (
+                    flag
+                    for flag, value in (
+                        ("--api-key-env", api_key_env),
+                        ("--max-pages", max_pages),
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if rejected is not None:
+                print(
+                    f"sources: {rejected} is only supported for "
+                    f"{SourceKind.YOUTUBE_PLAYLIST.value} sources",
+                    file=sys.stderr,
+                )
+                return 2
+        delta = state.scan_source(source_name, adapter=adapter)
     payload = delta.to_dict()
     if json_output:
         _print_json(payload)
@@ -507,6 +541,14 @@ def _parse_common(args: Sequence[str]) -> tuple[list[str], Path, bool]:
     return rest, state_path, json_output
 
 
+def _positive_int(value: str) -> int | None:
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 1 else None
+
+
 def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -516,7 +558,7 @@ def _sources_usage() -> None:
         "usage: lectern sources "
         "{add-folder NAME PATH [--policy POLICY]|"
         "add-youtube-playlist NAME PLAYLIST [--policy POLICY]|list|"
-        "scan SOURCE [--api-key-env ENV]|preflight PATH|"
+        "scan SOURCE [--api-key-env ENV] [--max-pages N]|preflight PATH|"
         "preflight-youtube PLAYLIST [--api-key-env ENV]} "
         "[--state PATH] [--json]",
         file=sys.stderr,

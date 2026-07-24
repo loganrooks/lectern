@@ -99,13 +99,8 @@ def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = No
         raise IngestError(
             "bundle id for --transcriber-command cannot be planned before transcription"
         )
-    elif source.with_suffix(".transcript.txt").is_file():
-        sidecar = _read_transcript_sidecar(source)
-        component = sidecar.identity_component
-    else:
-        sidecar = _read_transcript_sidecar(source)
-        component = sidecar.identity_component
-    bundle_digest = _combined_digest(source_digest, component)
+    sidecar = _read_transcript_sidecar(source)
+    bundle_digest = _combined_digest(source_digest, sidecar.identity_component)
     return f"{_slug(source.stem)}-{bundle_digest[:12]}"
 
 

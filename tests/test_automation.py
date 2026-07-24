@@ -10,12 +10,15 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
+from lectern import automation
 from lectern.automation import (
     STATE_SCHEMA_VERSION,
     AutomationError,
     QueueState,
     SourcePolicy,
+    attach_provenance_to_bundle,
     open_state,
+    preflight_local_folder,
 )
 from lectern.bundle import Manifest, StageName
 from lectern.ingest import IngestError
@@ -249,6 +252,7 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert provenance["source_item_id"] == queue_item.source_item_id
     assert provenance["queue_item_id"] == queue_item.id
     assert provenance["consent"] == "explicit_queue_approval"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
     assert provenance["remote_services"]["allowed"] is False
     assert manifest.stages[StageName.ACQUIRE].outputs[0].path == "source.json"
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
@@ -701,6 +705,110 @@ def test_local_folder_scan_does_not_open_network_socket(
         delta = state.scan_source(source.id)
 
     assert len(delta.added) == 1
+
+
+def test_preflight_media_count_matches_scan_discovery(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    copy_fixture(source_dir / ".lectern", "state-audio.wav")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        first = state.scan_source(source.id)
+        approved = state.approve_queue_item(first.queued[0].id)
+        state.ingest_queue_item(approved.id, source_dir / "bundles")
+
+    preflight = preflight_local_folder(source_dir)
+
+    assert (source_dir / "bundles").is_dir()
+    assert [item.relative_path for item in first.added] == ["synthetic_talk.wav"]
+    assert preflight.ok
+    assert preflight.media_files == len(first.added)
+
+
+def test_preflight_media_count_skips_symlinks_that_escape_source_root(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    outside_media = copy_fixture(tmp_path / "outside")
+    source_dir.mkdir()
+    symlink = source_dir / "linked.wav"
+    try:
+        symlink.symlink_to(outside_media)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not supported here: {exc}")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    preflight = preflight_local_folder(source_dir)
+
+    assert delta.added == []
+    assert preflight.media_files == 0
+
+
+def test_provenance_records_actual_queue_state_and_bundle_remote_services(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    remote_services = {
+        "allowed": True,
+        "scope": "synthetic_probe_scope",
+        "lectern_invoked": True,
+        "requires_explicit_per_item_consent": False,
+        "transcriber_network_posture": "synthetic_probe_posture",
+    }
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        source_path = result.bundle_dir / "source.json"
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+        payload["transcript"]["remote_services"] = remote_services
+        source_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        skipped = state.skip_queue_item(completed.id)
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=skipped,
+            consent="explicit_queue_approval",
+        )
+
+    provenance = json.loads(source_path.read_text(encoding="utf-8"))["provenance"]
+
+    assert completed.state is QueueState.COMPLETED
+    assert provenance["queue_state"] == QueueState.SKIPPED.value
+    assert provenance["remote_services"] == remote_services
+
+
+def test_queue_ingest_records_failed_when_provenance_attachment_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        failed = state.get_queue_item(approved.id)
+
+    assert failed.state is QueueState.FAILED
+    assert failed.last_error is not None
+    assert "synthetic provenance write failure" in failed.last_error
 
 
 def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:

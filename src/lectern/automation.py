@@ -16,7 +16,7 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -43,6 +43,7 @@ YOUTUBE_REQUEST_TIMEOUT_S = 20.0
 YOUTUBE_METADATA_ONLY_ERROR = (
     "YouTube media acquisition is not implemented; M4 supports metadata-only discovery"
 )
+YOUTUBE_PLACEHOLDER_TITLES = frozenset({"Private video", "Deleted video"})
 MEDIA_EXTENSIONS = frozenset(
     {".aac", ".avi", ".flac", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".wav", ".webm"}
 )
@@ -87,6 +88,10 @@ class QueueState(StrEnum):
     SKIPPED = "skipped"
     FAILED = "failed"
     COMPLETED = "completed"
+    UNSUPPORTED = "unsupported"
+
+
+TERMINAL_QUEUE_STATES = frozenset({QueueState.UNSUPPORTED})
 
 
 class SourceKind(StrEnum):
@@ -317,6 +322,32 @@ class ScanMetadataProvider(Protocol):
         ...
 
 
+def iter_local_media_files(root: Path) -> Iterator[Path]:
+    """Yield, in scan order, the media files a local-folder scan will discover.
+
+    `LocalFolderAdapter.discover` and `preflight_local_folder` share this helper so a
+    preflight count reports what a scan of the same tree actually discovers, rather
+    than every media-suffixed file including Lectern's own bundle output.
+    """
+
+    root_resolved = root.resolve()
+    for path in sorted(root.rglob("*")):
+        relative_parts = path.parent.relative_to(root).parts
+        is_excluded_dir = any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts)
+        is_excluded_temp_dir = any(
+            part.startswith(EXCLUDED_SCAN_DIR_PREFIXES) for part in relative_parts
+        )
+        if is_excluded_dir or is_excluded_temp_dir or _is_bundle_output_path(root, path):
+            continue
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        try:
+            path.resolve().relative_to(root_resolved)
+        except ValueError:
+            continue
+        yield path
+
+
 class LocalFolderAdapter:
     """Discover media files under a local directory without network access."""
 
@@ -327,25 +358,8 @@ class LocalFolderAdapter:
 
         root_resolved = root.resolve()
         items: list[SourceItem] = []
-        for path in sorted(root.rglob("*")):
-            relative_parts = path.parent.relative_to(root).parts
-            is_excluded_dir = any(part in EXCLUDED_SCAN_DIR_NAMES for part in relative_parts)
-            is_excluded_temp_dir = any(
-                part.startswith(EXCLUDED_SCAN_DIR_PREFIXES) for part in relative_parts
-            )
-            if is_excluded_dir or is_excluded_temp_dir or _is_bundle_output_path(root, path):
-                continue
-            if (
-                path.is_symlink()
-                or not path.is_file()
-                or path.suffix.lower() not in MEDIA_EXTENSIONS
-            ):
-                continue
+        for path in iter_local_media_files(root):
             absolute = path.resolve()
-            try:
-                absolute.relative_to(root_resolved)
-            except ValueError:
-                continue
             relative = path.relative_to(root).as_posix()
             try:
                 digest, size = _approval_digest_and_media_size(path, root=root_resolved)
@@ -624,8 +638,11 @@ class AutomationState:
             )
 
         adapter_for_scan = adapter or _default_source_adapter(source)
-        current_items = list(adapter_for_scan.discover(source))
+        current_items = _dedupe_by_relative_path(adapter_for_scan.discover(source))
         scan_metadata = _scan_metadata_from_adapter(adapter_for_scan)
+        truncated = _scan_reports_truncation(scan_metadata)
+        if truncated:
+            scan_metadata = {**scan_metadata, "removals_skipped_due_to_truncation": True}
         previous = {
             item.relative_path: item
             for item in self._list_source_items(source.id, present_only=False)
@@ -655,7 +672,10 @@ class AutomationState:
                 if queue_item is not None:
                     queued.append(queue_item)
 
-        for old in previous.values():
+        # A truncated discovery is a partial view of the source: absence from it is not
+        # evidence of removal, so removals are skipped entirely rather than persisted.
+        removal_candidates: list[SourceItem] = [] if truncated else list(previous.values())
+        for old in removal_candidates:
             if old.present and old.relative_path not in current_by_relative:
                 removed_item = SourceItem(
                     id=old.id,
@@ -706,13 +726,23 @@ class AutomationState:
         return _queue_from_row(row)
 
     def approve_queue_item(self, queue_item_id: str) -> QueueItem:
+        self._reject_terminal_transition(queue_item_id, "approve")
         return self._set_queue_state(queue_item_id, QueueState.APPROVED, clear_error=True)
 
     def skip_queue_item(self, queue_item_id: str) -> QueueItem:
         return self._set_queue_state(queue_item_id, QueueState.SKIPPED, clear_error=True)
 
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
+        self._reject_terminal_transition(queue_item_id, "retry")
         return self._set_queue_state(queue_item_id, QueueState.DISCOVERED, clear_error=True)
+
+    def _reject_terminal_transition(self, queue_item_id: str, action: str) -> None:
+        queue_item = self.get_queue_item(queue_item_id)
+        if queue_item.state in TERMINAL_QUEUE_STATES:
+            raise AutomationError(
+                f"queue item {queue_item.id} is in terminal state "
+                f"{queue_item.state.value}; {action} is not a legal transition"
+            )
 
     def ingest_queue_item(
         self,
@@ -727,7 +757,7 @@ class AutomationState:
         source = self.get_source(queue_item.source_id)
         source_item = self.get_source_item(queue_item.source_item_id)
         if source.kind is SourceKind.YOUTUBE_PLAYLIST:
-            self._record_failed_queue_item(queue_item.id, YOUTUBE_METADATA_ONLY_ERROR)
+            self._record_unsupported_queue_item(queue_item.id, YOUTUBE_METADATA_ONLY_ERROR)
             raise AutomationError(YOUTUBE_METADATA_ONLY_ERROR)
         source_path = Path(source_item.absolute_path)
         root = Path(source.root_path).resolve() if source.kind is SourceKind.LOCAL_FOLDER else None
@@ -789,19 +819,25 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
-        attach_provenance_to_bundle(
-            result.bundle_dir,
-            source=source,
-            source_item=source_item,
-            queue_item=queue_item,
-            consent="explicit_queue_approval",
-        )
+        # Record the completed state first so provenance can report the queue state the
+        # store actually holds instead of asserting a literal.
         completed = self._set_queue_state(
             queue_item.id,
             QueueState.COMPLETED,
             bundle_id=result.manifest.bundle_id,
             clear_error=True,
         )
+        try:
+            attach_provenance_to_bundle(
+                result.bundle_dir,
+                source=source,
+                source_item=source_item,
+                queue_item=completed,
+                consent="explicit_queue_approval",
+            )
+        except Exception as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
         self._record_library_bundle(result.bundle_dir, source, source_item, completed)
         return IngestResult(
             bundle_dir=result.bundle_dir,
@@ -868,19 +904,23 @@ class AutomationState:
                 self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
-        attach_provenance_to_bundle(
-            result.bundle_dir,
-            source=source,
-            source_item=source_item,
-            queue_item=queue_item,
-            consent="explicit_cli_invocation",
-        )
         completed = self._set_queue_state(
             queue_item.id,
             QueueState.COMPLETED,
             bundle_id=result.manifest.bundle_id,
             clear_error=True,
         )
+        try:
+            attach_provenance_to_bundle(
+                result.bundle_dir,
+                source=source,
+                source_item=source_item,
+                queue_item=completed,
+                consent="explicit_cli_invocation",
+            )
+        except Exception as exc:
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
         self._record_library_bundle(result.bundle_dir, source, source_item, completed)
         return IngestResult(
             bundle_dir=result.bundle_dir,
@@ -988,16 +1028,31 @@ class AutomationState:
         self._connection.commit()
 
     def _migrate_v1_to_v2(self) -> None:
-        self._connection.executescript(
-            """
-            ALTER TABLE source_items
-                ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
-            ALTER TABLE queue_items
-                ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
-            PRAGMA user_version = 2;
-            """
-        )
+        # `ALTER TABLE` and `PRAGMA user_version` do not share a transaction, so a
+        # process killed mid-migration leaves columns present at user_version 1. Each
+        # step is therefore guarded and re-runnable, and the v1 file is copied aside
+        # first so the pre-migration bytes survive a failed upgrade.
+        self._backup_v1_store()
+        for table in ("source_items", "queue_items"):
+            if self._table_has_column(table, "metadata_json"):
+                continue
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{{}}'"
+            )
+        self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
         self._connection.commit()
+
+    def _table_has_column(self, table: str, column: str) -> bool:
+        rows = self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(cast(str, row["name"]) == column for row in rows)
+
+    def _backup_v1_store(self) -> None:
+        if not self.path.is_file():
+            return
+        backup = self.path.with_name(f"{self.path.name}.v1.bak")
+        if backup.exists():
+            return
+        shutil.copy2(self.path, backup)
 
     def _list_source_items(self, source_id: str, *, present_only: bool) -> list[SourceItem]:
         if present_only:
@@ -1046,6 +1101,8 @@ class AutomationState:
 
     def _enqueue_if_review(self, source: SourceRecord, item: SourceItem) -> QueueItem | None:
         if source.policy is not SourcePolicy.REVIEW:
+            return None
+        if _is_placeholder_item(item):
             return None
         queue_item_id = _queue_item_id(item.id, item.sha256)
         now = _now()
@@ -1106,6 +1163,25 @@ class AutomationState:
             (
                 QueueState.FAILED.value,
                 queue_item.attempts + 1,
+                message,
+                _now(),
+                queue_item.id,
+            ),
+        )
+        self._connection.commit()
+
+    def _record_unsupported_queue_item(self, queue_item_id: str, message: str) -> None:
+        """Record a terminal unsupported-by-design outcome without spending an attempt."""
+
+        queue_item = self.get_queue_item(queue_item_id)
+        self._connection.execute(
+            """
+            UPDATE queue_items
+            SET state = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                QueueState.UNSUPPORTED.value,
                 message,
                 _now(),
                 queue_item.id,
@@ -1327,11 +1403,7 @@ def preflight_local_folder(path: Path) -> SourcePreflight:
     media_files = 0
     if is_dir:
         try:
-            media_files = sum(
-                1
-                for child in resolved.rglob("*")
-                if child.is_file() and child.suffix.lower() in MEDIA_EXTENSIONS
-            )
+            media_files = sum(1 for _ in iter_local_media_files(resolved))
             readable = True
         except OSError:
             readable = False
@@ -1465,18 +1537,10 @@ def attach_provenance_to_bundle(
         "source_name": source.name,
         "source_item_id": source_item.id,
         "queue_item_id": queue_item.id,
-        "queue_state": QueueState.COMPLETED.value,
+        "queue_state": queue_item.state.value,
         "policy": queue_item.policy.value,
         "consent": consent,
-        "remote_services": {
-            "allowed": False,
-            "scope": "lectern_core",
-            "lectern_invoked": False,
-            "requires_explicit_per_item_consent": True,
-            "transcriber_network_posture": source_payload.get("transcript", {})
-            .get("remote_services", {})
-            .get("transcriber_network_posture", "not_recorded"),
-        },
+        "remote_services": _bundle_remote_services(source_payload),
     }
     source_path.write_text(json.dumps(source_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -1491,6 +1555,26 @@ def attach_provenance_to_bundle(
             updated_outputs.append(output)
     acquire.outputs = updated_outputs
     manifest.save(bundle_dir)
+
+
+def _bundle_remote_services(source_payload: dict[str, Any]) -> dict[str, Any]:
+    """Record the bundle's own remote-services metadata instead of fresh literals."""
+
+    recorded: dict[str, Any] = {}
+    transcript = source_payload.get("transcript")
+    if isinstance(transcript, dict):
+        candidate = cast(dict[str, Any], transcript).get("remote_services")
+        if isinstance(candidate, dict):
+            recorded = cast(dict[str, Any], candidate)
+    return {
+        "allowed": recorded.get("allowed", False),
+        "scope": recorded.get("scope", "lectern_core"),
+        "lectern_invoked": recorded.get("lectern_invoked", False),
+        "requires_explicit_per_item_consent": recorded.get(
+            "requires_explicit_per_item_consent", True
+        ),
+        "transcriber_network_posture": recorded.get("transcriber_network_posture", "not_recorded"),
+    }
 
 
 def state_summary(path: Path) -> dict[str, Any]:
@@ -1590,6 +1674,33 @@ def _scan_metadata_from_adapter(adapter: SourceAdapter) -> dict[str, Any]:
     return {}
 
 
+def _scan_reports_truncation(scan_metadata: dict[str, Any]) -> bool:
+    quota = scan_metadata.get("quota")
+    if isinstance(quota, dict) and cast(dict[str, Any], quota).get("truncated_by_max_pages"):
+        return True
+    return bool(scan_metadata.get("truncated_by_max_pages"))
+
+
+def _dedupe_by_relative_path(items: Iterable[SourceItem]) -> list[SourceItem]:
+    """Collapse repeats of one identity within a single discovery; first occurrence wins."""
+
+    seen: set[str] = set()
+    deduped: list[SourceItem] = []
+    for item in items:
+        if item.relative_path in seen:
+            continue
+        seen.add(item.relative_path)
+        deduped.append(item)
+    return deduped
+
+
+def _is_placeholder_item(item: SourceItem) -> bool:
+    video = item.metadata.get("video")
+    if not isinstance(video, dict):
+        return False
+    return bool(cast(dict[str, Any], video).get("placeholder"))
+
+
 def _youtube_source_item(
     source: SourceRecord,
     playlist_id: str,
@@ -1609,8 +1720,9 @@ def _youtube_source_item(
         video_id = _optional_string(resource_id.get("videoId"))
     if video_id is None:
         raise AutomationError("YouTube playlist item missing video ID")
-    identity = playlist_item_id or video_id
-    relative_path = f"{playlist_id}/{identity}"
+    # Identity is the video, not the playlist slot: playlist-item IDs change on
+    # remove-and-re-add and repeat when one video is listed twice in a playlist.
+    relative_path = f"{playlist_id}/{video_id}"
     playlist_url = f"https://www.youtube.com/playlist?list={urllib.parse.quote(playlist_id)}"
     video_url = (
         "https://www.youtube.com/watch?"
@@ -1620,17 +1732,22 @@ def _youtube_source_item(
     channel_id = _optional_string(snippet.get("channelId"))
     channel_title = _optional_string(snippet.get("channelTitle"))
     published_at = _optional_string(snippet.get("publishedAt"))
-    video_owner_channel_id = _optional_string(content_details.get("videoOwnerChannelId"))
-    video_owner_channel_title = _optional_string(content_details.get("videoOwnerChannelTitle"))
+    # videoOwnerChannel* are snippet properties; contentDetails carries videoPublishedAt.
+    video_owner_channel_id = _optional_string(snippet.get("videoOwnerChannelId"))
+    video_owner_channel_title = _optional_string(snippet.get("videoOwnerChannelTitle"))
+    video_published_at = _optional_string(content_details.get("videoPublishedAt"))
     position = _optional_int(snippet.get("position"))
+    placeholder = title in YOUTUBE_PLACEHOLDER_TITLES
+    # Digest holds content-meaningful fields only. Playlist item ID, position,
+    # and timestamps are positional/curation noise excluded per accepted design
+    # constraint H1: including them turns reorders and remove-and-re-adds into
+    # spurious re-enqueues.
     digest_payload = {
         "playlist_id": playlist_id,
-        "playlist_item_id": playlist_item_id,
         "video_id": video_id,
         "title": title,
         "channel_id": channel_id,
         "channel_title": channel_title,
-        "published_at": published_at,
         "video_owner_channel_id": video_owner_channel_id,
         "video_owner_channel_title": video_owner_channel_title,
     }
@@ -1657,6 +1774,8 @@ def _youtube_source_item(
             "channel_title": channel_title,
             "video_owner_channel_id": video_owner_channel_id,
             "video_owner_channel_title": video_owner_channel_title,
+            "published_at": video_published_at,
+            "placeholder": placeholder,
         },
         "discovery": {
             "adapter": "youtube-playlist",

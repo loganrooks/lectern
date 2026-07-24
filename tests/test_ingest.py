@@ -468,6 +468,27 @@ def test_plan_local_bundle_id_rejects_command_identity_guess(tmp_path: Path) -> 
         ingest_module.plan_local_bundle_id(source, f"{sys.executable} transcriber.py")
 
 
+def test_plan_local_bundle_id_requires_a_transcript_sidecar(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+
+    assert ingest_module.can_plan_local_bundle_id(source) is False
+    with pytest.raises(IngestError, match="no local transcription backend"):
+        ingest_module.plan_local_bundle_id(source)
+
+
+def test_plan_local_bundle_id_matches_ingest_bundle_id_with_sidecar(tmp_path: Path) -> None:
+    source = tmp_path / "talk.wav"
+    _write_test_wav(source, 1.0)
+    source.with_suffix(".transcript.txt").write_text("Planned transcript.\n", encoding="utf-8")
+
+    planned = ingest_module.plan_local_bundle_id(source)
+    result = ingest_local(source, tmp_path / "bundles")
+
+    assert ingest_module.can_plan_local_bundle_id(source) is True
+    assert planned == result.manifest.bundle_id
+
+
 def test_local_command_transcriber_uses_argv_without_shell_interpretation(
     tmp_path: Path,
 ) -> None:

@@ -21,12 +21,38 @@ def test_youtube_public_playlist_scan_repeats_without_duplicates(tmp_path: Path)
         second = state.scan_source(source.id)
         queue_items = state.list_queue()
 
+    ingestible = [item for item in first.added if not item.metadata["video"]["placeholder"]]
+
     assert len(first.added) > 0
-    assert len(first.queued) == len(first.added)
+    assert len(ingestible) > 0
+    # Placeholder (private/deleted) entries are recorded but never enqueued.
+    assert len(first.queued) == len(ingestible)
     assert second.added == []
     assert second.changed == []
+    assert second.removed == []
     assert second.queued == []
     assert len(queue_items) == len(first.queued)
-    assert queue_items[0].metadata["playlist"]["id"] == playlist_id
-    assert queue_items[0].metadata["video"]["id"]
-    assert queue_items[0].metadata["discovery"]["method"] == "playlistItems.list"
+
+    video_ids = [item.metadata["video"]["id"] for item in queue_items]
+    relative_paths = [item.relative_path for item in first.added]
+    assert len(video_ids) == len(set(video_ids))
+    assert len(relative_paths) == len(set(relative_paths))
+
+    metadata = queue_items[0].metadata
+    assert metadata["playlist"]["id"] == playlist_id
+    assert metadata["discovery"]["method"] == "playlistItems.list"
+    assert metadata["video"]["placeholder"] is False
+    assert metadata["video"]["id"]
+    assert metadata["video"]["title"]
+    assert metadata["video"]["channel_id"]
+    assert metadata["video"]["channel_title"]
+    # snippet.videoOwnerChannel* — asserted unconditionally on purpose: reading them
+    # from contentDetails instead of snippet made them permanently null, and only a
+    # live assertion can disconfirm that. Do not relax without a recorded reason.
+    assert metadata["video"]["video_owner_channel_id"]
+    assert metadata["video"]["video_owner_channel_title"]
+    # contentDetails.videoPublishedAt, not the playlist-insertion timestamp.
+    assert metadata["video"]["published_at"]
+    assert metadata["video"]["url"] == (
+        f"https://www.youtube.com/watch?v={metadata['video']['id']}&list={playlist_id}"
+    )

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pytest import CaptureFixture, MonkeyPatch
 
-from lectern import cli
+from lectern import automation, cli
 from lectern.automation import (
     STATE_SCHEMA_VERSION,
     YOUTUBE_METADATA_ONLY_ERROR,
@@ -234,10 +234,72 @@ def test_youtube_queue_ingest_is_metadata_only(tmp_path: Path) -> None:
 
         with pytest.raises(AutomationError, match="metadata-only discovery"):
             state.ingest_queue_item(approved.id, tmp_path / "bundles")
-        failed = state.get_queue_item(approved.id)
+        unsupported = state.get_queue_item(approved.id)
 
-    assert failed.state is QueueState.FAILED
-    assert failed.last_error == YOUTUBE_METADATA_ONLY_ERROR
+    assert unsupported.state is QueueState.UNSUPPORTED
+    assert unsupported.last_error == YOUTUBE_METADATA_ONLY_ERROR
+    assert unsupported.attempts == 0
+
+
+def test_unsupported_queue_item_rejects_retry_and_approve(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        queue_item = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        ).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match="metadata-only discovery"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+        with pytest.raises(AutomationError, match="terminal state"):
+            state.retry_queue_item(approved.id)
+        with pytest.raises(AutomationError, match="terminal state"):
+            state.approve_queue_item(approved.id)
+        after = state.get_queue_item(approved.id)
+
+    assert after.state is QueueState.UNSUPPORTED
+    assert after.attempts == 0
+
+
+def test_cli_queue_list_accepts_unsupported_state_filter(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        queue_item = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        ).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match="metadata-only discovery"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+    assert (
+        cli.main(
+            [
+                "queue",
+                "list",
+                "--queue-state",
+                "unsupported",
+                "--state",
+                str(state_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["queue"]] == [queue_item.id]
+    assert payload["queue"][0]["state"] == "unsupported"
 
 
 def test_youtube_api_key_is_not_persisted(tmp_path: Path) -> None:
@@ -316,6 +378,366 @@ def test_youtube_scan_only_policy_discovers_without_queueing(tmp_path: Path) -> 
     assert delta.queued == []
 
 
+def test_youtube_metadata_records_every_documented_field(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        delta = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        )
+
+    assert len(delta.added) == 1
+    item = delta.added[0]
+    assert item.relative_path == "PL_SYNTH/vid_alpha"
+    assert item.absolute_path == "https://www.youtube.com/watch?v=vid_alpha&list=PL_SYNTH"
+    assert item.metadata == {
+        "source": {
+            "kind": "youtube-playlist",
+            "source_id": source.id,
+            "source_name": "yt",
+        },
+        "playlist": {
+            "id": "PL_SYNTH",
+            "url": "https://www.youtube.com/playlist?list=PL_SYNTH",
+        },
+        "playlist_item": {
+            "id": "pli_alpha",
+            "position": 0,
+            "published_at": "2026-06-01T00:00:00Z",
+        },
+        "video": {
+            "id": "vid_alpha",
+            "url": "https://www.youtube.com/watch?v=vid_alpha&list=PL_SYNTH",
+            "title": "Synthetic Alpha Talk",
+            "channel_id": "chan_alpha",
+            "channel_title": "Synthetic Alpha Channel",
+            "video_owner_channel_id": "owner_chan_alpha",
+            "video_owner_channel_title": "Synthetic Alpha Owner Channel",
+            "published_at": "2026-05-30T12:00:00Z",
+            "placeholder": False,
+        },
+        "discovery": {
+            "adapter": "youtube-playlist",
+            "api": "youtube-data-api-v3",
+            "method": "playlistItems.list",
+            "part": "snippet,contentDetails",
+            "page_index": 0,
+            "units_per_page": 1,
+        },
+    }
+
+
+def test_same_video_under_two_playlist_items_yields_one_item(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        delta = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page(
+                            [
+                                _alpha_item(position=0, playlist_item_id="pli_first"),
+                                _alpha_item(position=1, playlist_item_id="pli_second"),
+                            ]
+                        )
+                    ]
+                ),
+            ),
+        )
+        queue_items = state.list_queue()
+
+    assert [item.relative_path for item in delta.added] == ["PL_SYNTH/vid_alpha"]
+    assert len(delta.queued) == 1
+    assert len(queue_items) == 1
+    # First occurrence wins.
+    assert delta.added[0].metadata["playlist_item"]["id"] == "pli_first"
+
+
+def test_remove_and_readd_with_new_playlist_item_id_does_not_requeue(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        first = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        )
+        readded = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [_playlist_page([_alpha_item(playlist_item_id="pli_alpha_readded")])]
+                ),
+            ),
+        )
+        queue_items = state.list_queue()
+
+    assert len(first.queued) == 1
+    assert readded.added == []
+    assert readded.changed == []
+    assert readded.removed == []
+    assert [item.relative_path for item in readded.unchanged] == ["PL_SYNTH/vid_alpha"]
+    assert readded.queued == []
+    assert len(queue_items) == 1
+
+
+def test_readd_that_changes_playlist_insertion_timestamp_does_not_requeue(
+    tmp_path: Path,
+) -> None:
+    """A real remove-and-re-add rewrites `snippet.publishedAt` (playlist-insertion
+    time). The digest excludes positional/curation noise — playlist item ID,
+    position, and timestamps (accepted design constraint H1) — so the re-added
+    video must stay one source item and must not be re-queued."""
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        )
+        readded = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page(
+                            [
+                                _alpha_item(
+                                    playlist_item_id="pli_alpha_readded",
+                                    published_at="2026-07-24T00:00:00Z",
+                                )
+                            ]
+                        )
+                    ]
+                ),
+            ),
+        )
+        queue_items = state.list_queue()
+
+    assert readded.added == []
+    assert readded.removed == []
+    assert readded.changed == []
+    assert readded.queued == []
+    assert len(queue_items) == 1
+    assert {item.metadata["video"]["id"] for item in queue_items} == {"vid_alpha"}
+
+
+def test_truncated_scan_skips_removals_and_flags_scan_metadata(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        full = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page([_alpha_item()], next_page_token="NEXT"),
+                        _playlist_page([_beta_item()]),
+                    ]
+                ),
+            ),
+        )
+        truncated = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()], next_page_token="NEXT")]),
+                max_pages=1,
+            ),
+        )
+        stored = [state.get_source_item(item.id) for item in full.added]
+
+    assert [item.relative_path for item in full.added] == [
+        "PL_SYNTH/vid_alpha",
+        "PL_SYNTH/vid_beta",
+    ]
+    assert truncated.removed == []
+    assert truncated.metadata["quota"]["truncated_by_max_pages"] is True
+    assert truncated.metadata["removals_skipped_due_to_truncation"] is True
+    assert [item.present for item in stored] == [True, True]
+
+
+def test_untruncated_scan_does_not_flag_skipped_removals(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        first = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item(), _beta_item()])]),
+            ),
+        )
+        shrunk = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+                max_pages=2,
+            ),
+        )
+
+    assert len(first.added) == 2
+    assert [item.relative_path for item in shrunk.removed] == ["PL_SYNTH/vid_beta"]
+    assert "removals_skipped_due_to_truncation" not in shrunk.metadata
+
+
+def test_placeholder_entries_are_flagged_and_not_queued(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        delta = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page(
+                            [
+                                _alpha_item(),
+                                _placeholder_item(),
+                                _placeholder_item(
+                                    playlist_item_id="pli_deleted",
+                                    video_id="vid_deleted",
+                                    title="Deleted video",
+                                    position=3,
+                                ),
+                            ]
+                        )
+                    ]
+                ),
+            ),
+        )
+        queue_items = state.list_queue()
+
+    assert [item.relative_path for item in delta.added] == [
+        "PL_SYNTH/vid_alpha",
+        "PL_SYNTH/vid_private",
+        "PL_SYNTH/vid_deleted",
+    ]
+    assert [item.metadata["video"]["placeholder"] for item in delta.added] == [False, True, True]
+    assert [item.metadata["video"]["id"] for item in delta.queued] == ["vid_alpha"]
+    assert [item.metadata["video"]["id"] for item in queue_items] == ["vid_alpha"]
+
+
+def test_half_migrated_v1_state_opens_and_reaches_v2(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "ALTER TABLE source_items ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    with open_state(state_path) as state:
+        item = state.get_source_item("item_legacy")
+        queue = state.get_queue_item("queue_legacy")
+
+    with sqlite3.connect(state_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        queue_metadata = connection.execute(
+            "SELECT metadata_json FROM queue_items WHERE id = 'queue_legacy'"
+        ).fetchone()[0]
+
+    assert version == STATE_SCHEMA_VERSION
+    assert item.metadata == {}
+    assert queue.metadata == {}
+    assert queue_metadata == "{}"
+
+
+def test_v1_file_store_migration_writes_backup_with_pre_migration_bytes(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    before = state_path.read_bytes()
+
+    with open_state(state_path):
+        pass
+
+    backup = tmp_path / "state.sqlite.v1.bak"
+    assert backup.is_file()
+    assert backup.read_bytes() == before
+
+    with sqlite3.connect(backup) as connection:
+        backup_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert backup_version == 1
+
+
+def test_cli_sources_scan_max_pages_limits_pages_and_skips_removals(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page([_alpha_item()], next_page_token="NEXT"),
+                        _playlist_page([_beta_item()]),
+                    ]
+                ),
+            ),
+        )
+
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake-secret")
+    # FakeTransport raises if a second page is requested, so an unbounded scan fails here.
+    monkeypatch.setattr(
+        automation,
+        "_urllib_get",
+        FakeTransport([_playlist_page([_alpha_item()], next_page_token="NEXT")]),
+    )
+
+    assert (
+        cli.main(
+            [
+                "sources",
+                "scan",
+                "yt",
+                "--max-pages",
+                "1",
+                "--state",
+                str(state_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["counts"]["removed"] == 0
+    assert payload["metadata"]["quota"]["pages_fetched"] == 1
+    assert payload["metadata"]["removals_skipped_due_to_truncation"] is True
+
+
+def test_cli_sources_scan_rejects_non_positive_max_pages(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.add_youtube_playlist_source("yt", "PL_SYNTH")
+
+    assert cli.main(["sources", "scan", "yt", "--max-pages", "0", "--state", str(state_path)]) == 2
+    assert "--max-pages" in capsys.readouterr().err
+    assert (
+        cli.main(["sources", "scan", "yt", "--max-pages", "many", "--state", str(state_path)]) == 2
+    )
+    assert "--max-pages" in capsys.readouterr().err
+
+
 def _playlist_page(items: list[dict[str, object]], *, next_page_token: str | None = None) -> bytes:
     payload: dict[str, object] = {
         "kind": "youtube#playlistItemListResponse",
@@ -328,24 +750,34 @@ def _playlist_page(items: list[dict[str, object]], *, next_page_token: str | Non
     return json.dumps(payload).encode("utf-8")
 
 
-def _alpha_item(*, position: int = 0) -> dict[str, object]:
+def _alpha_item(
+    *,
+    position: int = 0,
+    playlist_item_id: str = "pli_alpha",
+    published_at: str = "2026-06-01T00:00:00Z",
+) -> dict[str, object]:
     return _playlist_item(
-        playlist_item_id="pli_alpha",
+        playlist_item_id=playlist_item_id,
         video_id="vid_alpha",
         title="Synthetic Alpha Talk",
         channel_id="chan_alpha",
         channel_title="Synthetic Alpha Channel",
+        video_owner_channel_id="owner_chan_alpha",
+        video_owner_channel_title="Synthetic Alpha Owner Channel",
         position=position,
+        published_at=published_at,
     )
 
 
-def _beta_item(*, position: int = 1) -> dict[str, object]:
+def _beta_item(*, position: int = 1, playlist_item_id: str = "pli_beta") -> dict[str, object]:
     return _playlist_item(
-        playlist_item_id="pli_beta",
+        playlist_item_id=playlist_item_id,
         video_id="vid_beta",
         title="Synthetic Beta Talk",
         channel_id="chan_beta",
         channel_title="Synthetic Beta Channel",
+        video_owner_channel_id="owner_chan_beta",
+        video_owner_channel_title="Synthetic Beta Owner Channel",
         position=position,
     )
 
@@ -357,17 +789,38 @@ def _playlist_item(
     title: str,
     channel_id: str,
     channel_title: str,
+    video_owner_channel_id: str,
+    video_owner_channel_title: str,
     position: int,
+    published_at: str = "2026-06-01T00:00:00Z",
+    video_published_at: str = "2026-05-30T12:00:00Z",
 ) -> dict[str, object]:
+    """Full-shape playlist item: every documented snippet/contentDetails field.
+
+    Field locations follow the ``playlistItems`` resource reference: the
+    ``videoOwnerChannel*`` pair lives in ``snippet``, ``videoPublishedAt`` in
+    ``contentDetails``.
+    """
+
     return {
         "kind": "youtube#playlistItem",
         "etag": f"synthetic-{playlist_item_id}",
         "id": playlist_item_id,
         "snippet": {
-            "publishedAt": "2026-06-01T00:00:00Z",
+            "publishedAt": published_at,
             "channelId": channel_id,
             "title": title,
+            "description": f"Synthetic description for {video_id}.",
+            "thumbnails": {
+                "default": {
+                    "url": f"https://i.ytimg.com/vi/{video_id}/default.jpg",
+                    "width": 120,
+                    "height": 90,
+                }
+            },
             "channelTitle": channel_title,
+            "videoOwnerChannelId": video_owner_channel_id,
+            "videoOwnerChannelTitle": video_owner_channel_title,
             "playlistId": "PL_SYNTH",
             "position": position,
             "resourceId": {
@@ -377,7 +830,39 @@ def _playlist_item(
         },
         "contentDetails": {
             "videoId": video_id,
-            "videoPublishedAt": "2026-06-01T00:00:00Z",
+            "videoPublishedAt": video_published_at,
+        },
+    }
+
+
+def _placeholder_item(
+    *,
+    playlist_item_id: str = "pli_private",
+    video_id: str = "vid_private",
+    title: str = "Private video",
+    position: int = 2,
+) -> dict[str, object]:
+    """Tombstone entry shape: no owner channel fields, no videoPublishedAt."""
+
+    return {
+        "kind": "youtube#playlistItem",
+        "etag": f"synthetic-{playlist_item_id}",
+        "id": playlist_item_id,
+        "snippet": {
+            "publishedAt": "2026-06-01T00:00:00Z",
+            "channelId": "chan_alpha",
+            "title": title,
+            "description": "This video is unavailable.",
+            "channelTitle": "Synthetic Alpha Channel",
+            "playlistId": "PL_SYNTH",
+            "position": position,
+            "resourceId": {
+                "kind": "youtube#video",
+                "videoId": video_id,
+            },
+        },
+        "contentDetails": {
+            "videoId": video_id,
         },
     }
 
