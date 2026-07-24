@@ -786,12 +786,13 @@ def test_provenance_records_actual_queue_state_and_bundle_remote_services(tmp_pa
     assert provenance["remote_services"] == remote_services
 
 
-def test_queue_ingest_records_failed_when_provenance_attachment_fails(
+def test_queue_ingest_provenance_failure_cleans_up_and_retry_recovers(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     source_dir = tmp_path / "source"
     copy_fixture(source_dir)
+    real_attach = automation.attach_provenance_to_bundle
 
     def fail_attach(*args: object, **kwargs: object) -> None:
         raise OSError("synthetic provenance write failure")
@@ -806,9 +807,24 @@ def test_queue_ingest_records_failed_when_provenance_attachment_fails(
             state.ingest_queue_item(approved.id, tmp_path / "bundles")
         failed = state.get_queue_item(approved.id)
 
-    assert failed.state is QueueState.FAILED
-    assert failed.last_error is not None
-    assert "synthetic provenance write failure" in failed.last_error
+        assert failed.state is QueueState.FAILED
+        assert failed.last_error is not None
+        assert "synthetic provenance write failure" in failed.last_error
+        # The half-written bundle must not survive: leaving it on disk makes the
+        # advertised retry path unrecoverable (the planned bundle id collides
+        # with an unrecorded directory).
+        bundles_root = tmp_path / "bundles"
+        leftover = list(bundles_root.iterdir()) if bundles_root.exists() else []
+        assert leftover == []
+
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", real_attach)
+        retried = state.retry_queue_item(failed.id)
+        state.approve_queue_item(retried.id)
+        result = state.ingest_queue_item(retried.id, tmp_path / "bundles")
+        recovered = state.get_queue_item(retried.id)
+
+    assert recovered.state is QueueState.COMPLETED
+    assert result.bundle_dir.is_dir()
 
 
 def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:

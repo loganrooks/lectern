@@ -269,10 +269,13 @@ def _sources_scan(args: Sequence[str], state_path: Path, json_output: bool) -> i
         source = state.get_source(source_name)
         adapter: YouTubePlaylistAdapter | None = None
         if source.kind is SourceKind.YOUTUBE_PLAYLIST:
-            adapter = YouTubePlaylistAdapter.from_environment(
-                api_key_env=api_key_env or DEFAULT_YOUTUBE_API_KEY_ENV,
-                max_pages=max_pages,
-            )
+            # Disabled sources scan as a state-layer no-op; requiring an API key
+            # to construct an adapter that will never be called would break that.
+            if source.policy is not SourcePolicy.DISABLED:
+                adapter = YouTubePlaylistAdapter.from_environment(
+                    api_key_env=api_key_env or DEFAULT_YOUTUBE_API_KEY_ENV,
+                    max_pages=max_pages,
+                )
         else:
             rejected = next(
                 (

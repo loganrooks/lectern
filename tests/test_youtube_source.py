@@ -654,21 +654,92 @@ def test_half_migrated_v1_state_opens_and_reaches_v2(tmp_path: Path) -> None:
     assert queue_metadata == "{}"
 
 
-def test_v1_file_store_migration_writes_backup_with_pre_migration_bytes(tmp_path: Path) -> None:
+def _assert_backup_is_pre_migration(backup: Path) -> None:
+    assert backup.is_file()
+    connection = sqlite3.connect(backup)
+    try:
+        backup_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(source_items)").fetchall()
+        }
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+    assert backup_version == 1
+    assert "metadata_json" not in columns
+    assert {"sources", "source_items", "queue_items"} <= table_names
+
+
+def test_v1_file_store_migration_writes_pre_migration_backup(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     _create_v1_state(state_path, tmp_path)
-    before = state_path.read_bytes()
 
     with open_state(state_path):
         pass
 
-    backup = tmp_path / "state.sqlite.v1.bak"
-    assert backup.is_file()
-    assert backup.read_bytes() == before
+    _assert_backup_is_pre_migration(tmp_path / "state.sqlite.v1.bak")
 
-    with sqlite3.connect(backup) as connection:
-        backup_version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert backup_version == 1
+
+def test_v1_wal_mode_store_backup_captures_committed_state(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    connection = sqlite3.connect(state_path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with open_state(state_path):
+        pass
+
+    _assert_backup_is_pre_migration(tmp_path / "state.sqlite.v1.bak")
+
+
+def test_adapter_rejects_nonpositive_max_pages() -> None:
+    for bad in (0, -1):
+        with pytest.raises(AutomationError, match="max_pages"):
+            YouTubePlaylistAdapter("fake-secret", max_pages=bad)
+
+
+def test_youtube_response_invalid_utf8_raises_automation_error(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        with pytest.raises(AutomationError, match="was not valid"):
+            state.scan_source(
+                source.id,
+                adapter=YouTubePlaylistAdapter(
+                    "fake-secret",
+                    transport=FakeTransport([b"\xff\xfe\xfd not utf-8"]),
+                ),
+            )
+
+
+def test_cli_scan_of_disabled_youtube_source_requires_no_api_key(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.add_youtube_playlist_source("yt", "PL_SYNTH", policy=SourcePolicy.DISABLED)
+
+    monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+
+    assert cli.main(["sources", "scan", "yt", "--state", str(state_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"] == {
+        "added": 0,
+        "changed": 0,
+        "removed": 0,
+        "unchanged": 0,
+        "queued": 0,
+    }
 
 
 def test_cli_sources_scan_max_pages_limits_pages_and_skips_removals(

@@ -401,6 +401,11 @@ class YouTubePlaylistAdapter:
             raise AutomationError(f"missing YouTube API key; set {api_key_env}")
         if not 1 <= max_results <= YOUTUBE_PLAYLIST_PAGE_SIZE:
             raise AutomationError("YouTube playlist page size must be between 1 and 50")
+        if max_pages is not None and max_pages < 1:
+            # A nonpositive cap would return an empty page-zero result that carries
+            # no truncation marker, which scan_source would treat as a complete
+            # scan and mark every stored item removed.
+            raise AutomationError("max_pages must be a positive integer")
         self._api_key = api_key
         self._api_key_env = api_key_env
         self._transport = transport or _urllib_get
@@ -503,8 +508,8 @@ class YouTubePlaylistAdapter:
         body = self._transport(url, self._timeout_s)
         try:
             payload = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise AutomationError("YouTube API response was not valid JSON") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AutomationError("YouTube API response was not valid UTF-8 JSON") from exc
         if not isinstance(payload, dict):
             raise AutomationError("YouTube API response was not a JSON object")
         return cast(dict[str, Any], payload)
@@ -836,6 +841,9 @@ class AutomationState:
                 consent="explicit_queue_approval",
             )
         except Exception as exc:
+            # Remove the half-written bundle: leaving it on disk with no library
+            # record makes the retry path collide with an unrecorded directory.
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         self._record_library_bundle(result.bundle_dir, source, source_item, completed)
@@ -919,6 +927,9 @@ class AutomationState:
                 consent="explicit_cli_invocation",
             )
         except Exception as exc:
+            # Mirror of the queue-ingest failure path: never leave a half-written
+            # bundle that a later run would reject as an unrecorded directory.
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
         self._record_library_bundle(result.bundle_dir, source, source_item, completed)
@@ -1052,7 +1063,14 @@ class AutomationState:
         backup = self.path.with_name(f"{self.path.name}.v1.bak")
         if backup.exists():
             return
-        shutil.copy2(self.path, backup)
+        # SQLite's backup API captures the committed database regardless of
+        # journal mode; a plain file copy can miss changes still living in an
+        # adjacent -wal file — the exact case where the backup matters.
+        destination = sqlite3.connect(backup)
+        try:
+            self._connection.backup(destination)
+        finally:
+            destination.close()
 
     def _list_source_items(self, source_id: str, *, present_only: bool) -> list[SourceItem]:
         if present_only:
