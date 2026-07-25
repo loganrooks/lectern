@@ -32,5 +32,5 @@ def test_support_tracks_automation_state_schema_version() -> None:
 
     # SUPPORT.md documents the state schema version as a third versioned surface;
     # this assertion is what keeps the documented number from drifting away from
-    # the code (the RM remediation design, decision 5).
+    # the code.
     assert f"The current automation state schema version is `{STATE_SCHEMA_VERSION}`." in support

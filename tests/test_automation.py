@@ -271,8 +271,8 @@ def test_retried_completed_queue_ingest_returns_existing_bundle(tmp_path: Path) 
         approved = state.approve_queue_item(queue_item.id)
         first = state.ingest_queue_item(approved.id, output_root)
 
-        # Re-approval, not retry: retry from COMPLETED is illegal under the queue
-        # FSM table pinned by the RM remediation design, decision 1.
+        # Re-approval, not retry: retry is legal from FAILED only, so a rerun of
+        # a completed item goes through approve.
         reapproved = state.approve_queue_item(approved.id)
         second = state.ingest_queue_item(reapproved.id, output_root)
         completed = state.get_queue_item(reapproved.id)
@@ -351,8 +351,8 @@ def test_retried_command_queue_ingest_same_output_returns_existing_bundle(
         approved = state.approve_queue_item(queue_item.id)
         first = state.ingest_queue_item(approved.id, output_root, transcriber_command=command)
 
-        # Re-approval, not retry: retry from COMPLETED is illegal under the queue
-        # FSM table pinned by the RM remediation design, decision 1.
+        # Re-approval, not retry: retry is legal from FAILED only, so a rerun of
+        # a completed item goes through approve.
         reapproved = state.approve_queue_item(approved.id)
         second = state.ingest_queue_item(
             reapproved.id,
@@ -686,9 +686,8 @@ def test_queue_skip_and_reapproval_are_inspectable(tmp_path: Path) -> None:
         source = state.add_local_folder_source("talks", source_dir)
         queue_item = state.scan_source(source.id).queued[0]
         skipped = state.skip_queue_item(queue_item.id)
-        # Retry no longer reopens a skipped item: under the FSM table pinned by
-        # the RM remediation design, decision 1 retry is legal from
-        # FAILED only, and approve is the verb that un-skips.
+        # Retry no longer reopens a skipped item: retry is legal from FAILED
+        # only, and approve is the verb that un-skips.
         with pytest.raises(AutomationError, match="retry is only legal from state failed"):
             state.retry_queue_item(queue_item.id)
         approved = state.approve_queue_item(queue_item.id)
@@ -1315,9 +1314,12 @@ def test_queue_same_command_rerun_into_new_root_provenance_failure_restores_comp
 
 # --- Queue FSM legal-transition matrix -------------------------------------
 #
-# The legal-source table is pinned by the RM remediation design
-# decision 1: approve and skip stay legal from every non-terminal state, retry
-# is legal from FAILED only, and UNSUPPORTED remains terminal for all verbs.
+# The legal-source table: approve and skip stay legal from every non-terminal
+# state (idempotent self-transitions included, so operator commands can be
+# repeated safely); retry is legal from FAILED only, because retrying a
+# discovered, approved, skipped, or completed item either loops a state it is
+# already in or silently discards a recorded outcome; UNSUPPORTED remains
+# terminal for all verbs.
 
 QUEUE_VERBS = ("approve", "skip", "retry")
 

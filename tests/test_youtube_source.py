@@ -459,8 +459,8 @@ def test_terminal_guard_holds_when_precheck_reads_a_stale_state(
         if stale_reads[0] > 0:
             stale_reads[0] -= 1
             # FAILED is a legal source for approve, skip, and retry alike under the
-            # FSM table pinned by the RM remediation design, decision 1,
-            # so every verb clears its pre-check and reaches the guarded UPDATE.
+            # queue legal-transition table, so every verb clears its pre-check
+            # and reaches the guarded UPDATE.
             return replace(queue_item, state=QueueState.FAILED)
         return queue_item
 
