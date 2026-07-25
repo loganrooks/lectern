@@ -20,7 +20,7 @@ from lectern.automation import (
     open_state,
     preflight_local_folder,
 )
-from lectern.bundle import Manifest, StageName
+from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
 from lectern.ingest import IngestError
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -936,6 +936,151 @@ def test_one_shot_command_rerun_provenance_failure_preserves_completed_bundle(
     assert library_ids == [first.manifest.bundle_id]
     assert replay.bundle_dir == first.bundle_dir
     assert replay.manifest.bundle_id == first.manifest.bundle_id
+
+
+def test_attach_provenance_to_bundle_is_idempotent_for_identical_inputs(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        first_source_json = (result.bundle_dir / "source.json").read_bytes()
+        first_manifest = (result.bundle_dir / MANIFEST_NAME).read_bytes()
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=completed,
+            consent="explicit_queue_approval",
+        )
+
+    # Re-attaching the same provenance must be a byte-for-byte no-op, or the
+    # replay repair path would rewrite bundles on every completed replay.
+    assert (result.bundle_dir / "source.json").read_bytes() == first_source_json
+    assert (result.bundle_dir / MANIFEST_NAME).read_bytes() == first_manifest
+
+
+def test_one_shot_replay_repairs_missing_provenance(tmp_path: Path) -> None:
+    source = copy_fixture(tmp_path / "source")
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _strip_provenance(source_json)
+
+        replay = state.ingest_one_shot(source, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_cli_invocation"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_one_shot_replay_repairs_stale_manifest_source_digest(tmp_path: Path) -> None:
+    source = copy_fixture(tmp_path / "source")
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _staleify_manifest_source_digest(first.bundle_dir)
+
+        replay = state.ingest_one_shot(source, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_cli_invocation"
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_queue_replay_repairs_missing_provenance(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _strip_provenance(source_json)
+
+        reapproved = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(reapproved.id, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_queue_approval"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_queue_replay_repairs_stale_manifest_source_digest(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _staleify_manifest_source_digest(first.bundle_dir)
+
+        reapproved = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(reapproved.id, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_queue_approval"
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def _strip_provenance(source_json: Path) -> None:
+    """Simulate a crash before provenance was attached to a committed bundle."""
+
+    payload = json.loads(source_json.read_text(encoding="utf-8"))
+    payload.pop("provenance", None)
+    source_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _staleify_manifest_source_digest(bundle_dir: Path) -> None:
+    """Simulate a crash between the source.json rewrite and the manifest patch."""
+
+    manifest = Manifest.load(bundle_dir)
+    acquire = manifest.stages[StageName.ACQUIRE]
+    acquire.outputs = [
+        ArtifactRef(path=output.path, sha256="0" * 64, bytes=output.bytes)
+        if output.path == "source.json"
+        else output
+        for output in acquire.outputs
+    ]
+    manifest.save(bundle_dir)
+
+
+def _manifest_source_digest(manifest: Manifest) -> str:
+    for output in manifest.stages[StageName.ACQUIRE].outputs:
+        if output.path == "source.json":
+            return output.sha256
+    raise AssertionError("manifest acquire stage does not record source.json")
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:

@@ -94,6 +94,23 @@ class QueueState(StrEnum):
 
 TERMINAL_QUEUE_STATES = frozenset({QueueState.UNSUPPORTED})
 
+# Keys attach_provenance_to_bundle writes into source.json["provenance"]; a
+# completed bundle missing any of them predates a finished provenance attach.
+PROVENANCE_KEYS = frozenset(
+    {
+        "state_schema_version",
+        "source_id",
+        "source_kind",
+        "source_name",
+        "source_item_id",
+        "queue_item_id",
+        "queue_state",
+        "policy",
+        "consent",
+        "remote_services",
+    }
+)
+
 
 class SourceKind(StrEnum):
     LOCAL_FOLDER = "local-folder"
@@ -414,6 +431,7 @@ class YouTubePlaylistAdapter:
         self._max_results = max_results
         self._timeout_s = timeout_s
         self._scan_metadata: dict[str, Any] = {}
+        self._pages_attempted = 0
 
     @classmethod
     def from_environment(
@@ -438,11 +456,25 @@ class YouTubePlaylistAdapter:
     def scan_metadata(self) -> dict[str, Any]:
         return dict(self._scan_metadata)
 
+    @property
+    def pages_attempted(self) -> int:
+        """Page requests issued during the last discover, including failed ones."""
+
+        return self._pages_attempted
+
+    @property
+    def attempted_quota_units(self) -> int:
+        """Quota units the last discover attempted, whether or not it succeeded."""
+
+        return self._pages_attempted * YOUTUBE_PLAYLIST_QUOTA_UNITS_PER_PAGE
+
     def discover(self, source: SourceRecord) -> list[SourceItem]:
         if source.kind is not SourceKind.YOUTUBE_PLAYLIST:
             raise AutomationError(
                 f"YouTube playlist adapter cannot scan source kind: {source.kind.value}"
             )
+        self._scan_metadata = {}
+        self._pages_attempted = 0
         playlist_id = normalize_youtube_playlist_id(source.root_path)
         page_token: str | None = None
         pages_fetched = 0
@@ -506,6 +538,9 @@ class YouTubePlaylistAdapter:
         if page_token is not None:
             params["pageToken"] = page_token
         url = f"{YOUTUBE_PLAYLIST_ITEMS_ENDPOINT}?{urllib.parse.urlencode(params)}"
+        # Count the page before the call: the quota unit is spent as soon as the
+        # request is issued, so a post-request failure still consumed it.
+        self._pages_attempted += 1
         body = self._transport(url, self._timeout_s)
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -793,7 +828,13 @@ class AutomationState:
                             bundle_id=planned_bundle_id,
                             clear_error=True,
                         )
-                        return completed_result
+                        return self._repaired_replay_result(
+                            completed_result,
+                            source=source,
+                            source_item=source_item,
+                            queue_item_id=queue_item.id,
+                            consent="explicit_queue_approval",
+                        )
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             result = ingest_local(
                 source_path,
@@ -822,7 +863,13 @@ class AutomationState:
                         bundle_id=queue_item.bundle_id,
                         clear_error=True,
                     )
-                    return completed_result
+                    return self._repaired_replay_result(
+                        completed_result,
+                        source=source,
+                        source_item=source_item,
+                        queue_item_id=queue_item.id,
+                        consent="explicit_queue_approval",
+                    )
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
@@ -900,7 +947,13 @@ class AutomationState:
         ):
             completed_result = self._completed_bundle_result(completed_bundle_id)
             if completed_result is not None:
-                return completed_result
+                return self._repaired_replay_result(
+                    completed_result,
+                    source=source,
+                    source_item=source_item,
+                    queue_item_id=queue_item.id,
+                    consent="explicit_cli_invocation",
+                )
         try:
             if planned_bundle_id is not None:
                 self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
@@ -921,7 +974,13 @@ class AutomationState:
             ):
                 completed_result = self._completed_bundle_result(completed_bundle_id)
                 if completed_result is not None:
-                    return completed_result
+                    return self._repaired_replay_result(
+                        completed_result,
+                        source=source,
+                        source_item=source_item,
+                        queue_item_id=queue_item.id,
+                        consent="explicit_cli_invocation",
+                    )
             if queue_item.state is not QueueState.COMPLETED:
                 self._record_failed_queue_item(queue_item.id, str(exc))
             raise
@@ -1503,6 +1562,37 @@ class AutomationState:
             manifest=Manifest.load(bundle_dir),
         )
 
+    def _repaired_replay_result(
+        self,
+        result: IngestResult,
+        *,
+        source: SourceRecord,
+        source_item: SourceItem,
+        queue_item_id: str,
+        consent: str,
+    ) -> IngestResult:
+        """Re-attach provenance to a replayed bundle left stale by a crash.
+
+        Completion commits before provenance is attached, so a replay can find a
+        completed, library-recorded bundle whose provenance never landed. Re-attach
+        is idempotent (identical inputs rewrite identical bytes), so a healthy
+        bundle is returned untouched.
+        """
+
+        if not _bundle_provenance_needs_repair(result.bundle_dir):
+            return result
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=self.get_queue_item(queue_item_id),
+            consent=consent,
+        )
+        return IngestResult(
+            bundle_dir=result.bundle_dir,
+            manifest=Manifest.load(result.bundle_dir),
+        )
+
     def _queue_owned_bundle_result(self, queue_item: QueueItem) -> IngestResult | None:
         if queue_item.bundle_id is None:
             return None
@@ -1633,13 +1723,15 @@ def preflight_youtube_playlist(
     try:
         adapter.discover(source)
     except AutomationError as exc:
+        # A page request that failed after it was issued still spent its quota
+        # unit; reporting zero would understate what the preflight consumed.
         return YouTubePreflight(
             playlist_id=playlist_id,
             api_key_env=api_key_env,
             credential_present=True,
             reachable=False,
-            pages_checked=0,
-            estimated_units_consumed=0,
+            pages_checked=adapter.pages_attempted,
+            estimated_units_consumed=adapter.attempted_quota_units,
             error=str(exc),
         )
     metadata = adapter.scan_metadata
@@ -1692,6 +1784,48 @@ def attach_provenance_to_bundle(
             updated_outputs.append(output)
     acquire.outputs = updated_outputs
     manifest.save(bundle_dir)
+
+
+def _bundle_provenance_needs_repair(bundle_dir: Path) -> bool:
+    """Report whether a completed bundle's automation provenance is out of date.
+
+    Completion and the library row commit before provenance is attached, so a
+    crash in that window can leave a completed, library-recorded bundle whose
+    source.json lacks provenance, or whose manifest still records the
+    pre-provenance source.json digest. Both are repairable by re-attaching.
+    """
+
+    source_path = bundle_dir / "source.json"
+    try:
+        payload_obj = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # Nothing re-attaching could fix; leave the bundle exactly as found.
+        return False
+    if not isinstance(payload_obj, dict):
+        return False
+    payload = cast(dict[str, Any], payload_obj)
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        return True
+    if not set(cast(dict[str, Any], provenance)) >= PROVENANCE_KEYS:
+        return True
+
+    try:
+        manifest = Manifest.load(bundle_dir)
+        acquire = manifest.stages[StageName.ACQUIRE]
+    except (OSError, KeyError, ValueError):
+        return False
+    recorded = next(
+        (output.sha256 for output in acquire.outputs if output.path == "source.json"),
+        None,
+    )
+    if recorded is None:
+        return False
+    try:
+        digest, _ = _digest_and_size(source_path)
+    except OSError:
+        return False
+    return recorded != digest
 
 
 def _bundle_remote_services(source_payload: dict[str, Any]) -> dict[str, Any]:

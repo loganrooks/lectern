@@ -17,7 +17,9 @@ from lectern.automation import (
     YOUTUBE_METADATA_ONLY_ERROR,
     AutomationError,
     QueueState,
+    SourceKind,
     SourcePolicy,
+    SourceRecord,
     YouTubeAPIError,
     YouTubePlaylistAdapter,
     open_state,
@@ -221,6 +223,78 @@ def test_youtube_preflight_reports_missing_key_and_quota_failure() -> None:
     assert not quota.ok
     assert quota.credential_present is True
     assert "quotaExceeded" in str(quota.error)
+
+
+def test_youtube_preflight_reports_attempted_units_on_api_error() -> None:
+    failed = preflight_youtube_playlist(
+        "PL_SYNTH",
+        api_key="fake-secret",
+        transport=FakeTransport(
+            [
+                YouTubeAPIError(
+                    "YouTube Data API error (403 quotaExceeded): quota exceeded",
+                    status_code=403,
+                    reason="quotaExceeded",
+                )
+            ]
+        ),
+    )
+
+    # The page request was issued before the endpoint failed, so its quota unit
+    # was spent; reporting zero would contradict the documented accounting.
+    assert not failed.ok
+    assert failed.pages_checked == 1
+    assert failed.estimated_units_consumed == 1
+
+
+def test_youtube_preflight_reports_attempted_units_on_malformed_response() -> None:
+    malformed = preflight_youtube_playlist(
+        "PL_SYNTH",
+        api_key="fake-secret",
+        transport=FakeTransport([b'{"items": ']),
+    )
+
+    assert not malformed.ok
+    assert "was not valid" in str(malformed.error)
+    assert malformed.pages_checked == 1
+    assert malformed.estimated_units_consumed == 1
+
+
+def test_youtube_preflight_reports_no_units_for_prerequest_failures() -> None:
+    missing_key = preflight_youtube_playlist("PL_SYNTH", environ={})
+    bad_playlist = preflight_youtube_playlist("not a playlist", api_key="fake-secret")
+
+    assert missing_key.pages_checked == 0
+    assert missing_key.estimated_units_consumed == 0
+    assert bad_playlist.pages_checked == 0
+    assert bad_playlist.estimated_units_consumed == 0
+
+
+def test_youtube_preflight_success_reports_single_unit() -> None:
+    reachable = preflight_youtube_playlist(
+        "PL_SYNTH",
+        api_key="fake-secret",
+        transport=FakeTransport([_playlist_page([_alpha_item()])]),
+    )
+
+    assert reachable.ok
+    assert reachable.pages_checked == 1
+    assert reachable.estimated_units_consumed == 1
+
+
+def test_youtube_adapter_reports_attempted_units_after_failed_page() -> None:
+    adapter = YouTubePlaylistAdapter(
+        "fake-secret",
+        transport=FakeTransport([b'{"items": ']),
+        max_pages=1,
+    )
+    source = _youtube_source_record("PL_SYNTH")
+
+    with pytest.raises(AutomationError, match="was not valid"):
+        adapter.discover(source)
+
+    assert adapter.pages_attempted == 1
+    assert adapter.attempted_quota_units == 1
 
 
 def test_youtube_queue_ingest_is_metadata_only(tmp_path: Path) -> None:
@@ -912,6 +986,18 @@ def test_cli_sources_scan_rejects_non_positive_max_pages(
         cli.main(["sources", "scan", "yt", "--max-pages", "many", "--state", str(state_path)]) == 2
     )
     assert "--max-pages" in capsys.readouterr().err
+
+
+def _youtube_source_record(playlist_id: str) -> SourceRecord:
+    return SourceRecord(
+        id="src_synthetic_youtube",
+        kind=SourceKind.YOUTUBE_PLAYLIST,
+        name="yt",
+        root_path=playlist_id,
+        policy=SourcePolicy.SCAN_ONLY,
+        created_at="2026-07-24T00:00:00+00:00",
+        updated_at="2026-07-24T00:00:00+00:00",
+    )
 
 
 def _playlist_page(items: list[dict[str, object]], *, next_page_token: str | None = None) -> bytes:
