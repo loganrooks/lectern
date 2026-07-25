@@ -86,6 +86,16 @@ jobs:
       - name: Sync dependencies
         run: make sync
 
+      - name: Require live-calibration credentials
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          LECTERN_YOUTUBE_PLAYLIST_ID: ${{ secrets.LECTERN_YOUTUBE_PLAYLIST_ID }}
+        run: |
+          if [ -z "$YOUTUBE_API_KEY" ] || [ -z "$LECTERN_YOUTUBE_PLAYLIST_ID" ]; then
+            echo "integration evidence requires YOUTUBE_API_KEY and LECTERN_YOUTUBE_PLAYLIST_ID secrets; a skipped run is not evidence" >&2
+            exit 1
+          fi
+
       - name: Run integration evidence suite
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}

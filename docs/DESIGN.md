@@ -33,7 +33,7 @@ this document plans but does not yet implement.
 | visual | planned, not implemented | video | `visual/frames/`, `visual/slides.json` | Frame sampling, OCR, and visual descriptions. |
 | enrich | planned, not implemented | transcript + visuals | `refs/references.json` | Extracted names, titles, URLs, and identifiers. |
 | situate | planned, not implemented | transcript + references | contextual notes for synthesis | Positions the source in relation to resolved references and prior bundle context. |
-| synthesize | implemented | bundle artifacts | `analysis/summary.md`, `analysis/claims.md`, `analysis/questions.md` | Timestamp-grounded analysis. |
+| synthesize | partially implemented | bundle artifacts | `analysis/summary.md` (implemented); `analysis/claims.md`, `analysis/questions.md` (planned) | Timestamp-grounded analysis. The current summary is extractive, not a faithfulness claim. |
 
 The bundle layout below shows the full planned layout, including the paths the
 unimplemented stages would write; the current preview produces only the
