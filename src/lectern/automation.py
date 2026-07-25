@@ -9,6 +9,7 @@ unless a future stage adds explicit per-item consent.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -735,6 +736,7 @@ class AutomationState:
         return self._set_queue_state(queue_item_id, QueueState.APPROVED, clear_error=True)
 
     def skip_queue_item(self, queue_item_id: str) -> QueueItem:
+        self._reject_terminal_transition(queue_item_id, "skip")
         return self._set_queue_state(queue_item_id, QueueState.SKIPPED, clear_error=True)
 
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
@@ -824,14 +826,28 @@ class AutomationState:
             self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
-        # Record the completed state first so provenance can report the queue state the
-        # store actually holds instead of asserting a literal.
-        completed = self._set_queue_state(
-            queue_item.id,
-            QueueState.COMPLETED,
-            bundle_id=result.manifest.bundle_id,
-            clear_error=True,
-        )
+        # Commit the completed state and the library record together so a crash can
+        # never leave a COMPLETED queue row without the library row that makes the
+        # bundle findable (and the on-disk bundle a retry blocker). Provenance is
+        # attached afterwards so it can report the queue state the store actually
+        # holds instead of asserting a literal.
+        try:
+            self._apply_queue_state(
+                queue_item.id,
+                QueueState.COMPLETED,
+                bundle_id=result.manifest.bundle_id,
+                clear_error=True,
+            )
+            library_row_inserted = self._record_library_bundle(
+                result.bundle_dir, source, source_item, queue_item
+            )
+            self._connection.commit()
+        except Exception as exc:
+            self._connection.rollback()
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
+            self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
+        completed = self.get_queue_item(queue_item.id)
         try:
             attach_provenance_to_bundle(
                 result.bundle_dir,
@@ -844,9 +860,14 @@ class AutomationState:
             # Remove the half-written bundle: leaving it on disk with no library
             # record makes the retry path collide with an unrecorded directory.
             shutil.rmtree(result.bundle_dir, ignore_errors=True)
-            self._record_failed_queue_item(queue_item.id, str(exc))
+            self._undo_completed_ingest(
+                queue_item.id,
+                result.manifest.bundle_id,
+                str(exc),
+                remove_library_row=library_row_inserted,
+                restore_bundle_id=None,
+            )
             raise
-        self._record_library_bundle(result.bundle_dir, source, source_item, completed)
         return IngestResult(
             bundle_dir=result.bundle_dir,
             manifest=Manifest.load(result.bundle_dir),
@@ -912,12 +933,26 @@ class AutomationState:
                 self._record_failed_queue_item(queue_item.id, str(exc))
             raise
 
-        completed = self._set_queue_state(
-            queue_item.id,
-            QueueState.COMPLETED,
-            bundle_id=result.manifest.bundle_id,
-            clear_error=True,
-        )
+        # Mirror of the queue-ingest path: completion and its library record share one
+        # transaction, and provenance runs against the committed state afterwards.
+        try:
+            self._apply_queue_state(
+                queue_item.id,
+                QueueState.COMPLETED,
+                bundle_id=result.manifest.bundle_id,
+                clear_error=True,
+            )
+            library_row_inserted = self._record_library_bundle(
+                result.bundle_dir, source, source_item, queue_item
+            )
+            self._connection.commit()
+        except Exception as exc:
+            self._connection.rollback()
+            shutil.rmtree(result.bundle_dir, ignore_errors=True)
+            if queue_item.state is not QueueState.COMPLETED:
+                self._record_failed_queue_item(queue_item.id, str(exc))
+            raise
+        completed = self.get_queue_item(queue_item.id)
         try:
             attach_provenance_to_bundle(
                 result.bundle_dir,
@@ -930,9 +965,22 @@ class AutomationState:
             # Mirror of the queue-ingest failure path: never leave a half-written
             # bundle that a later run would reject as an unrecorded directory.
             shutil.rmtree(result.bundle_dir, ignore_errors=True)
-            self._record_failed_queue_item(queue_item.id, str(exc))
+            # A rerun of an already-completed item must not lose the earlier success:
+            # restore the prior COMPLETED bundle id rather than recording FAILED with
+            # the new (now deleted) bundle on the row.
+            restore_bundle_id = (
+                completed_bundle_id
+                if queue_item.state is QueueState.COMPLETED and completed_bundle_id is not None
+                else None
+            )
+            self._undo_completed_ingest(
+                queue_item.id,
+                result.manifest.bundle_id,
+                str(exc),
+                remove_library_row=library_row_inserted,
+                restore_bundle_id=restore_bundle_id,
+            )
             raise
-        self._record_library_bundle(result.bundle_dir, source, source_item, completed)
         return IngestResult(
             bundle_dir=result.bundle_dir,
             manifest=Manifest.load(result.bundle_dir),
@@ -1066,11 +1114,25 @@ class AutomationState:
         # SQLite's backup API captures the committed database regardless of
         # journal mode; a plain file copy can miss changes still living in an
         # adjacent -wal file — the exact case where the backup matters.
-        destination = sqlite3.connect(backup)
+        #
+        # The backup is written to a temporary name and published with os.replace so
+        # an interrupted run cannot leave a partial file that the existence check
+        # above would later trust as a complete pre-migration copy.
+        temporary = self.path.with_name(f"{backup.name}.tmp")
+        temporary.unlink(missing_ok=True)
         try:
-            self._connection.backup(destination)
-        finally:
-            destination.close()
+            destination = sqlite3.connect(temporary)
+            try:
+                self._connection.backup(destination)
+            finally:
+                destination.close()
+            # sqlite3.connect creates the file under the process umask; the
+            # pre-migration bytes deserve the source database's own permissions.
+            os.chmod(temporary, self.path.stat().st_mode & 0o777)
+            os.replace(temporary, backup)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def _list_source_items(self, source_id: str, *, present_only: bool) -> list[SourceItem]:
         if present_only:
@@ -1156,6 +1218,22 @@ class AutomationState:
         bundle_id: str | None = None,
         clear_error: bool = False,
     ) -> QueueItem:
+        queue_item = self._apply_queue_state(
+            queue_item_id, state, bundle_id=bundle_id, clear_error=clear_error
+        )
+        self._connection.commit()
+        return self.get_queue_item(queue_item.id)
+
+    def _apply_queue_state(
+        self,
+        queue_item_id: str,
+        state: QueueState,
+        *,
+        bundle_id: str | None = None,
+        clear_error: bool = False,
+    ) -> QueueItem:
+        """Stage a queue-state transition without committing; the caller commits."""
+
         existing = self.get_queue_item(queue_item_id)
         self._connection.execute(
             """
@@ -1167,10 +1245,42 @@ class AutomationState:
             """,
             (state.value, bundle_id, 1 if clear_error else 0, _now(), existing.id),
         )
+        return existing
+
+    def _undo_completed_ingest(
+        self,
+        queue_item_id: str,
+        bundle_id: str,
+        message: str,
+        *,
+        remove_library_row: bool,
+        restore_bundle_id: str | None,
+    ) -> None:
+        """Reverse a committed completion in one transaction after provenance failed."""
+
+        if remove_library_row:
+            self._connection.execute(
+                "DELETE FROM library_bundles WHERE bundle_id = ? AND queue_item_id = ?",
+                (bundle_id, queue_item_id),
+            )
+        if restore_bundle_id is None:
+            self._apply_failed_queue_item(queue_item_id, message)
+        else:
+            self._apply_queue_state(
+                queue_item_id,
+                QueueState.COMPLETED,
+                bundle_id=restore_bundle_id,
+                clear_error=True,
+            )
         self._connection.commit()
-        return self.get_queue_item(existing.id)
 
     def _record_failed_queue_item(self, queue_item_id: str, message: str) -> None:
+        self._apply_failed_queue_item(queue_item_id, message)
+        self._connection.commit()
+
+    def _apply_failed_queue_item(self, queue_item_id: str, message: str) -> None:
+        """Stage a failure transition without committing; the caller commits."""
+
         queue_item = self.get_queue_item(queue_item_id)
         self._connection.execute(
             """
@@ -1300,7 +1410,12 @@ class AutomationState:
         source: SourceRecord,
         source_item: SourceItem,
         queue_item: QueueItem,
-    ) -> None:
+    ) -> bool:
+        """Stage the library record without committing; returns True when a row was inserted.
+
+        The caller commits, so completion state and library record land together.
+        """
+
         manifest = Manifest.load(bundle_dir)
         existing = self._existing_library_bundle(manifest.bundle_id)
         values = (
@@ -1323,7 +1438,8 @@ class AutomationState:
                     _now(),
                 ),
             )
-        elif existing.queue_item_id == queue_item.id:
+            return True
+        if existing.queue_item_id == queue_item.id:
             self._connection.execute(
                 """
                 UPDATE library_bundles
@@ -1332,12 +1448,11 @@ class AutomationState:
                 """,
                 (*values, manifest.bundle_id),
             )
-        else:
-            raise AutomationError(
-                "bundle id already exists for different source provenance; "
-                "duplicate-content multi-source provenance is not implemented"
-            )
-        self._connection.commit()
+            return False
+        raise AutomationError(
+            "bundle id already exists for different source provenance; "
+            "duplicate-content multi-source provenance is not implemented"
+        )
 
     def _ensure_bundle_id_available(
         self, bundle_id: str, queue_item: QueueItem, output_root: Path
@@ -1421,7 +1536,11 @@ def preflight_local_folder(path: Path) -> SourcePreflight:
     media_files = 0
     if is_dir:
         try:
-            media_files = sum(1 for _ in iter_local_media_files(resolved))
+            media_files = sum(
+                1
+                for media in iter_local_media_files(resolved)
+                if not _transcript_sidecar_escapes_root(media, resolved)
+            )
             readable = True
         except OSError:
             readable = False
@@ -1828,7 +1947,10 @@ def _urllib_get(url: str, timeout_s: float) -> bytes:
     except urllib.error.HTTPError as exc:
         body = exc.read()
         raise _youtube_error_from_response(exc.code, body) from exc
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        # http.client raises HTTPException (IncompleteRead and friends) outside the
+        # URLError/OSError hierarchy, so a truncated response would otherwise escape
+        # as a raw protocol error instead of an AutomationError.
         detail = getattr(exc, "reason", exc)
         raise AutomationError(f"YouTube Data API request failed: {detail}") from exc
 
@@ -1928,13 +2050,8 @@ def _approval_digest_and_media_size(path: Path, *, root: Path | None = None) -> 
     digest.update(media_digest.encode("ascii"))
     digest.update(b"\0")
     if sidecar.is_file():
-        if root is not None:
-            if sidecar.is_symlink():
-                raise AutomationError("transcript sidecar must be inside the source root")
-            try:
-                sidecar.resolve().relative_to(root)
-            except ValueError as exc:
-                raise AutomationError("transcript sidecar must be inside the source root") from exc
+        if root is not None and _transcript_sidecar_escapes_root(path, root):
+            raise AutomationError("transcript sidecar must be inside the source root")
         sidecar_digest, _ = _digest_and_size(sidecar)
         digest.update(b"transcript-sidecar")
         digest.update(b"\0")
@@ -1942,6 +2059,26 @@ def _approval_digest_and_media_size(path: Path, *, root: Path | None = None) -> 
     else:
         digest.update(b"transcript-sidecar-absent")
     return digest.hexdigest(), media_size
+
+
+def _transcript_sidecar_escapes_root(path: Path, root: Path) -> bool:
+    """Report whether a media file's transcript sidecar resolves outside `root`.
+
+    `LocalFolderAdapter.discover` drops such media (the sidecar is content the
+    approval digest would cover, so it must stay inside the source), and
+    `preflight_local_folder` applies the same rule so its count matches discovery.
+    """
+
+    sidecar = path.with_suffix(".transcript.txt")
+    if not sidecar.is_file():
+        return False
+    if sidecar.is_symlink():
+        return True
+    try:
+        sidecar.resolve().relative_to(root)
+    except ValueError:
+        return True
+    return False
 
 
 def _is_bundle_output_path(root: Path, path: Path) -> bool:

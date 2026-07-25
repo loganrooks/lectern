@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import json
 import sqlite3
+import stat
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -259,6 +262,30 @@ def test_unsupported_queue_item_rejects_retry_and_approve(tmp_path: Path) -> Non
             state.retry_queue_item(approved.id)
         with pytest.raises(AutomationError, match="terminal state"):
             state.approve_queue_item(approved.id)
+        after = state.get_queue_item(approved.id)
+
+    assert after.state is QueueState.UNSUPPORTED
+    assert after.attempts == 0
+
+
+def test_unsupported_queue_item_rejects_skip(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        queue_item = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        ).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match="metadata-only discovery"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+        # Skip must be guarded like retry/approve: UNSUPPORTED -> SKIPPED -> APPROVED
+        # would otherwise walk the item straight back into the unsupported cycle.
+        with pytest.raises(AutomationError, match="terminal state"):
+            state.skip_queue_item(approved.id)
         after = state.get_queue_item(approved.id)
 
     assert after.state is QueueState.UNSUPPORTED
@@ -699,6 +726,84 @@ def test_v1_wal_mode_store_backup_captures_committed_state(tmp_path: Path) -> No
         pass
 
     _assert_backup_is_pre_migration(tmp_path / "state.sqlite.v1.bak")
+
+
+def test_v1_backup_inherits_source_database_permissions(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    state_path.chmod(0o600)
+
+    with open_state(state_path):
+        pass
+
+    backup = tmp_path / "state.sqlite.v1.bak"
+    _assert_backup_is_pre_migration(backup)
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_v1_backup_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+
+    with open_state(state_path):
+        pass
+
+    _assert_backup_is_pre_migration(tmp_path / "state.sqlite.v1.bak")
+    assert [path.name for path in tmp_path.iterdir() if path.name.endswith(".tmp")] == []
+
+
+def test_interrupted_v1_backup_does_not_publish_partial_file(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+
+    real_connect = sqlite3.connect
+
+    def flaky_connect(target: str | Path) -> sqlite3.Connection:
+        connection = real_connect(target)
+        if str(target).endswith(".v1.bak.tmp"):
+            # Leave partial bytes in the destination file and then fail inside
+            # backup(), the way a killed process would.
+            connection.execute("CREATE TABLE partial(x)")
+            connection.commit()
+            connection.close()
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", flaky_connect)
+
+    with pytest.raises(AutomationError, match="state database error"):
+        open_state(state_path)
+
+    monkeypatch.undo()
+
+    # The half-written copy must not survive under the final name: the existence
+    # check would otherwise treat it as a complete pre-migration backup.
+    assert not (tmp_path / "state.sqlite.v1.bak").exists()
+    assert [path.name for path in tmp_path.iterdir() if path.name.endswith(".tmp")] == []
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_youtube_incomplete_read_raises_automation_error(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fail_urlopen(*args: object, **kwargs: object) -> object:
+        raise http.client.IncompleteRead(b'{"items":', 128)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail_urlopen)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        with pytest.raises(AutomationError, match="YouTube Data API request failed"):
+            state.scan_source(source.id, adapter=YouTubePlaylistAdapter("fake-secret"))
+
+    preflight = preflight_youtube_playlist("PL_SYNTH", api_key="fake-secret")
+
+    assert not preflight.ok
+    assert "YouTube Data API request failed" in str(preflight.error)
 
 
 def test_adapter_rejects_nonpositive_max_pages() -> None:
