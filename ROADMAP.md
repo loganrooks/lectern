@@ -16,6 +16,8 @@ Completed public surface:
 - Optional local JSON transcriber command for media without a transcript
   sidecar.
 - Timestamped transcript artifacts, method metadata, and summary anchors.
+- Metadata-only public YouTube playlist discovery through the local source
+  registry and review queue.
 - Public safety checks and CI verification.
 
 ## Next Work
@@ -25,12 +27,13 @@ Completed public surface:
      quickstart aligned with the current local workflow.
    - Verify clean install from the public repository.
 
-2. External source discovery
-   - Add metadata-only YouTube playlist discovery through the source registry
-     and queue.
-   - Use public-playlist, no-OAuth discovery by default.
+2. External source follow-through
+   - Keep YouTube discovery metadata-only until media acquisition is explicitly
+     scoped.
+   - Keep public-playlist, no-OAuth discovery as the default posture.
    - Keep network-dependent checks marked as integration tests.
-   - Do not silently include external media acquisition.
+   - Decide separately whether external media or caption acquisition belongs in
+     a later milestone.
 
 3. Library retrieval and agent surface
    - Improve library list/show/search.
@@ -59,6 +62,6 @@ Completed public surface:
 - No launch-style public promotion.
 - No GUI.
 - No watch daemon.
-- No YouTube media download workflow.
+- No YouTube media, caption, or transcript download workflow.
 - No claim that transcripts are faithful for arbitrary media.
 - No guarantee that user-supplied transcriber commands are network-free.

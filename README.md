@@ -110,10 +110,51 @@ Use `--json` on source, queue, and library commands for machine-readable output.
 The state database is local run state under `.lectern/` by default and should not
 be committed.
 
+Lectern can also discover public YouTube playlist metadata through the YouTube
+Data API. This is metadata-only discovery: it records playlist/video metadata in
+the local source registry and review queue, but it does not download YouTube
+media, captions, or transcripts and cannot yet ingest a YouTube queue item into
+a bundle.
+
+```bash
+export YOUTUBE_API_KEY=...
+uv run lectern sources preflight-youtube "PL..."
+uv run lectern sources add-youtube-playlist lectures "PL..."
+uv run lectern sources scan lectures
+uv run lectern sources scan lectures --max-pages 2
+uv run lectern queue list --json
+```
+
+The API key is read from the environment and is not stored in Lectern state or
+bundle artifacts. Each playlist page request consumes an estimated 1 YouTube
+Data API quota unit; scan JSON reports estimated units consumed for the scan.
+`--max-pages N` caps how many playlist pages one scan requests. A capped scan is
+a partial view of the playlist, so it records new and changed items but skips
+removals entirely and reports `removals_skipped_due_to_truncation` in the scan
+metadata. `--max-pages` and `--api-key-env` apply to YouTube playlist sources
+only; passing either to a local-folder scan is rejected with exit code 2.
+
+A playlist entry is identified by its video ID, not by its playlist-item ID, so
+the same video listed twice in one playlist is recorded once, and reordering a
+playlist or re-adding a video under a new playlist-item ID does not create a
+second entry for it. Playlist-item IDs, playlist positions, and insertion
+timestamps are recorded as metadata but do not count as content changes, so a
+remove-and-re-add is not re-queued for review.
+Private and deleted playlist placeholders are recorded as source items flagged
+`video.placeholder` and are never added to the review queue.
+
+A YouTube queue item cannot be ingested into a bundle. Attempting it records the
+item in the terminal `unsupported` state with an explanatory error, and
+`queue retry` / `queue approve` on such an item are refused rather than looping
+through a failure that can never succeed. Use `queue list --queue-state
+unsupported` to inspect them.
+
 ## Current Limits
 
-- YouTube and other external source discovery are not implemented yet.
-- Lectern does not download media from external services.
+- YouTube support is limited to public-playlist metadata discovery through an
+  API key. OAuth/private playlist access is not implemented.
+- Lectern does not download media, captions, or transcripts from external
+  services.
 - MCP/API access, richer search, visual evidence, OCR, reference resolution, and
   citation-gated synthesis are later roadmap items.
 - The local command transcriber path is an integration point, not a bundled ASR

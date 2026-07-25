@@ -296,6 +296,44 @@ def test_cli_reports_usage_errors(capsys: CaptureFixture[str]) -> None:
     assert "usage: lectern sources" in captured.err
 
 
+def test_sources_scan_rejects_youtube_only_flags_for_local_folder(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    state = tmp_path / "state.sqlite"
+
+    assert (
+        cli.main(
+            [
+                "sources",
+                "add-folder",
+                "talks",
+                str(source_dir),
+                "--state",
+                str(state),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert cli.main(["sources", "scan", "talks", "--max-pages", "1", "--state", str(state)]) == 2
+    assert "--max-pages" in capsys.readouterr().err
+
+    assert (
+        cli.main(["sources", "scan", "talks", "--api-key-env", "OTHER_KEY", "--state", str(state)])
+        == 2
+    )
+    assert "--api-key-env" in capsys.readouterr().err
+
+    assert cli.main(["sources", "scan", "talks", "--state", str(state), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"]["added"] == 1
+
+
 def test_cli_reports_unknown_source_as_domain_error(
     tmp_path: Path,
     capsys: CaptureFixture[str],

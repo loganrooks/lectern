@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import sqlite3
 import sys
@@ -10,14 +11,17 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
+from lectern import automation
 from lectern.automation import (
     STATE_SCHEMA_VERSION,
     AutomationError,
     QueueState,
     SourcePolicy,
+    attach_provenance_to_bundle,
     open_state,
+    preflight_local_folder,
 )
-from lectern.bundle import Manifest, StageName
+from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
 from lectern.ingest import IngestError
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -249,6 +253,7 @@ def test_queue_approval_ingests_bundle_with_provenance_and_library_record(
     assert provenance["source_item_id"] == queue_item.source_item_id
     assert provenance["queue_item_id"] == queue_item.id
     assert provenance["consent"] == "explicit_queue_approval"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
     assert provenance["remote_services"]["allowed"] is False
     assert manifest.stages[StageName.ACQUIRE].outputs[0].path == "source.json"
     assert manifest.stages[StageName.ACQUIRE].outputs[0].sha256 == source_json_hash
@@ -703,9 +708,598 @@ def test_local_folder_scan_does_not_open_network_socket(
     assert len(delta.added) == 1
 
 
+def test_preflight_media_count_matches_scan_discovery(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    copy_fixture(source_dir / ".lectern", "state-audio.wav")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        first = state.scan_source(source.id)
+        approved = state.approve_queue_item(first.queued[0].id)
+        state.ingest_queue_item(approved.id, source_dir / "bundles")
+
+    preflight = preflight_local_folder(source_dir)
+
+    assert (source_dir / "bundles").is_dir()
+    assert [item.relative_path for item in first.added] == ["synthetic_talk.wav"]
+    assert preflight.ok
+    assert preflight.media_files == len(first.added)
+
+
+def test_preflight_media_count_skips_symlinks_that_escape_source_root(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    outside_media = copy_fixture(tmp_path / "outside")
+    source_dir.mkdir()
+    symlink = source_dir / "linked.wav"
+    try:
+        symlink.symlink_to(outside_media)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not supported here: {exc}")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    preflight = preflight_local_folder(source_dir)
+
+    assert delta.added == []
+    assert preflight.media_files == 0
+
+
+def test_preflight_media_count_skips_sidecars_that_escape_source_root(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    external_dir = tmp_path / "external"
+    source_dir.mkdir()
+    external_dir.mkdir()
+    media = source_dir / "synthetic_talk.wav"
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    external_sidecar = external_dir / "synthetic_talk.transcript.txt"
+    external_sidecar.write_text(SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    sidecar = source_dir / "synthetic_talk.transcript.txt"
+    try:
+        sidecar.symlink_to(external_sidecar)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not supported here: {exc}")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        delta = state.scan_source(source.id)
+
+    preflight = preflight_local_folder(source_dir)
+
+    assert delta.added == []
+    assert preflight.media_files == len(delta.added)
+
+
+def test_provenance_records_actual_queue_state_and_bundle_remote_services(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    remote_services = {
+        "allowed": True,
+        "scope": "synthetic_probe_scope",
+        "lectern_invoked": True,
+        "requires_explicit_per_item_consent": False,
+        "transcriber_network_posture": "synthetic_probe_posture",
+    }
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        source_path = result.bundle_dir / "source.json"
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+        payload["transcript"]["remote_services"] = remote_services
+        source_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        skipped = state.skip_queue_item(completed.id)
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=skipped,
+            consent="explicit_queue_approval",
+        )
+
+    provenance = json.loads(source_path.read_text(encoding="utf-8"))["provenance"]
+
+    assert completed.state is QueueState.COMPLETED
+    assert provenance["queue_state"] == QueueState.SKIPPED.value
+    assert provenance["remote_services"] == remote_services
+
+
+def test_queue_ingest_provenance_failure_cleans_up_and_retry_recovers(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    real_attach = automation.attach_provenance_to_bundle
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        failed = state.get_queue_item(approved.id)
+
+        assert failed.state is QueueState.FAILED
+        assert failed.last_error is not None
+        assert "synthetic provenance write failure" in failed.last_error
+        # The library row inserted alongside the completion must be reversed too,
+        # or the store would advertise a bundle that no longer exists on disk.
+        assert state.list_library() == []
+        # The half-written bundle must not survive: leaving it on disk makes the
+        # advertised retry path unrecoverable (the planned bundle id collides
+        # with an unrecorded directory).
+        bundles_root = tmp_path / "bundles"
+        leftover = list(bundles_root.iterdir()) if bundles_root.exists() else []
+        assert leftover == []
+
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", real_attach)
+        retried = state.retry_queue_item(failed.id)
+        state.approve_queue_item(retried.id)
+        result = state.ingest_queue_item(retried.id, tmp_path / "bundles")
+        recovered = state.get_queue_item(retried.id)
+
+    assert recovered.state is QueueState.COMPLETED
+    assert result.bundle_dir.is_dir()
+
+
+def test_queue_ingest_library_record_failure_does_not_claim_completion(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    def fail_record(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.OperationalError("synthetic library insert failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        monkeypatch.setattr(
+            automation.AutomationState, "_record_library_bundle", fail_record, raising=True
+        )
+
+        with pytest.raises(sqlite3.OperationalError, match="synthetic library insert failure"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+        monkeypatch.undo()
+        after = state.get_queue_item(approved.id)
+        library = state.list_library()
+
+    bundles_root = tmp_path / "bundles"
+    leftover = list(bundles_root.iterdir()) if bundles_root.exists() else []
+
+    # Completion and its library record share a transaction: a failed insert must
+    # leave no COMPLETED claim, no library row, and no retry-blocking bundle dir.
+    assert after.state is QueueState.FAILED
+    assert library == []
+    assert leftover == []
+
+
+def test_one_shot_command_rerun_provenance_failure_preserves_completed_bundle(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    first_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "first_transcriber.py",
+            json.dumps({"text": "First command transcript."}),
+        )
+    )
+    second_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "second_transcriber.py",
+            json.dumps({"text": "Second command transcript."}),
+        )
+    )
+    output_root = tmp_path / "bundles"
+    real_attach = automation.attach_provenance_to_bundle
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, output_root, transcriber_command=first_command)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_one_shot(source, output_root, transcriber_command=second_command)
+
+        preserved = state.list_queue()[0]
+        bundle_dirs = sorted(path.name for path in output_root.iterdir())
+        library_ids = [bundle.bundle_id for bundle in state.list_library()]
+
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", real_attach)
+        replay = state.ingest_one_shot(source, output_root, transcriber_command=first_command)
+
+    # A failed rerun must not demote an earlier success: the queue row keeps the
+    # original completed bundle id, and only the new bundle is removed.
+    assert preserved.state is QueueState.COMPLETED
+    assert preserved.bundle_id == first.manifest.bundle_id
+    assert preserved.last_error is None
+    assert bundle_dirs == [first.manifest.bundle_id]
+    assert library_ids == [first.manifest.bundle_id]
+    assert replay.bundle_dir == first.bundle_dir
+    assert replay.manifest.bundle_id == first.manifest.bundle_id
+
+
+def test_attach_provenance_to_bundle_is_idempotent_for_identical_inputs(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        first_source_json = (result.bundle_dir / "source.json").read_bytes()
+        first_manifest = (result.bundle_dir / MANIFEST_NAME).read_bytes()
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=completed,
+            consent="explicit_queue_approval",
+        )
+
+    # Re-attaching the same provenance must be a byte-for-byte no-op, or the
+    # replay repair path would rewrite bundles on every completed replay.
+    assert (result.bundle_dir / "source.json").read_bytes() == first_source_json
+    assert (result.bundle_dir / MANIFEST_NAME).read_bytes() == first_manifest
+
+
+def test_interrupted_provenance_attach_keeps_source_json_parseable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("synthetic provenance publish failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        source_json = result.bundle_dir / "source.json"
+        before = source_json.read_bytes()
+        _strip_provenance(source_json)
+        stripped = source_json.read_bytes()
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        with pytest.raises(OSError, match="synthetic provenance publish failure"):
+            attach_provenance_to_bundle(
+                result.bundle_dir,
+                source=source,
+                source_item=source_item,
+                queue_item=completed,
+                consent="explicit_queue_approval",
+            )
+
+        monkeypatch.undo()
+        leftover = sorted(path.name for path in result.bundle_dir.iterdir())
+
+        # The committed COMPLETED row already points at this bundle: a crash
+        # while republishing source.json must leave the prior file whole, not a
+        # truncated one that _bundle_provenance_needs_repair refuses to repair.
+        assert source_json.read_bytes() == stripped
+        assert json.loads(source_json.read_text(encoding="utf-8"))["transcript"]
+        assert all(not name.endswith(".tmp") for name in leftover)
+
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=completed,
+            consent="explicit_queue_approval",
+        )
+
+    assert source_json.read_bytes() == before
+    assert sorted(path.name for path in result.bundle_dir.iterdir()) == leftover
+
+
+def test_one_shot_replay_repairs_missing_provenance(tmp_path: Path) -> None:
+    source = copy_fixture(tmp_path / "source")
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _strip_provenance(source_json)
+
+        replay = state.ingest_one_shot(source, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_cli_invocation"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_one_shot_replay_repairs_stale_manifest_source_digest(tmp_path: Path) -> None:
+    source = copy_fixture(tmp_path / "source")
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _staleify_manifest_source_digest(first.bundle_dir)
+
+        replay = state.ingest_one_shot(source, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_cli_invocation"
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_queue_replay_repairs_missing_provenance(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _strip_provenance(source_json)
+
+        reapproved = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(reapproved.id, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_queue_approval"
+    assert provenance["queue_state"] == QueueState.COMPLETED.value
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_queue_replay_repairs_stale_manifest_source_digest(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+    output_root = tmp_path / "bundles"
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(approved.id, output_root)
+        source_json = first.bundle_dir / "source.json"
+        _staleify_manifest_source_digest(first.bundle_dir)
+
+        reapproved = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(reapproved.id, output_root)
+
+    provenance = json.loads(source_json.read_text(encoding="utf-8"))["provenance"]
+
+    assert replay.bundle_dir == first.bundle_dir
+    assert provenance["consent"] == "explicit_queue_approval"
+    assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
+
+
+def test_one_shot_rerun_into_new_output_root_provenance_failure_keeps_library_row(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "transcriber.py",
+            json.dumps({"text": "Stable one-shot command transcript."}),
+        )
+    )
+    first_root = tmp_path / "bundles"
+    second_root = tmp_path / "other-bundles"
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, first_root, transcriber_command=command)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_one_shot(source, second_root, transcriber_command=command)
+
+        preserved = state.list_queue()[0]
+        library = state.list_library()
+        shown = state.get_library_bundle(first.manifest.bundle_id)
+
+    # The rerun produced the same deterministic bundle id, so the library row was
+    # updated rather than inserted. Undoing the failed rerun must put the row back
+    # on the surviving original bundle instead of leaving it on the deleted copy.
+    assert preserved.state is QueueState.COMPLETED
+    assert preserved.bundle_id == first.manifest.bundle_id
+    assert preserved.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert not second_root.exists() or list(second_root.iterdir()) == []
+    assert [bundle.bundle_path for bundle in library] == [str(first.bundle_dir.resolve())]
+    assert Path(shown.bundle_path).is_dir()
+
+
+def test_queue_command_rerun_provenance_failure_preserves_completed_bundle(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    first_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "first_transcriber.py",
+            json.dumps({"text": "First queue command transcript."}),
+        )
+    )
+    second_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "second_transcriber.py",
+            json.dumps({"text": "Second queue command transcript."}),
+        )
+    )
+    output_root = tmp_path / "bundles"
+    real_attach = automation.attach_provenance_to_bundle
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(
+            approved.id,
+            output_root,
+            transcriber_command=first_command,
+        )
+
+        reapproved = state.approve_queue_item(approved.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(
+                reapproved.id,
+                output_root,
+                transcriber_command=second_command,
+            )
+
+        preserved = state.get_queue_item(approved.id)
+        bundle_dirs = sorted(path.name for path in output_root.iterdir())
+        library_paths = [bundle.bundle_path for bundle in state.list_library()]
+
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", real_attach)
+        replayed = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(
+            replayed.id,
+            output_root,
+            transcriber_command=first_command,
+        )
+
+    # A failed rerun of an already-completed queue item must not demote the earlier
+    # success: the row keeps the original bundle id, whose bundle (and library row)
+    # survives, and only the new bundle is removed.
+    assert preserved.state is QueueState.COMPLETED
+    assert preserved.bundle_id == first.manifest.bundle_id
+    assert preserved.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert bundle_dirs == [first.manifest.bundle_id]
+    assert library_paths == [str(first.bundle_dir.resolve())]
+    assert replay.bundle_dir == first.bundle_dir
+    assert replay.manifest.bundle_id == first.manifest.bundle_id
+
+
+def _strip_provenance(source_json: Path) -> None:
+    """Simulate a crash before provenance was attached to a committed bundle."""
+
+    payload = json.loads(source_json.read_text(encoding="utf-8"))
+    payload.pop("provenance", None)
+    source_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _staleify_manifest_source_digest(bundle_dir: Path) -> None:
+    """Simulate a crash between the source.json rewrite and the manifest patch."""
+
+    manifest = Manifest.load(bundle_dir)
+    acquire = manifest.stages[StageName.ACQUIRE]
+    acquire.outputs = [
+        ArtifactRef(path=output.path, sha256="0" * 64, bytes=output.bytes)
+        if output.path == "source.json"
+        else output
+        for output in acquire.outputs
+    ]
+    manifest.save(bundle_dir)
+
+
+def _manifest_source_digest(manifest: Manifest) -> str:
+    for output in manifest.stages[StageName.ACQUIRE].outputs:
+        if output.path == "source.json":
+            return output.sha256
+    raise AssertionError("manifest acquire stage does not record source.json")
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) -> Path:
     path.write_text(
         f"import sys\nsys.stdout.write({stdout!r})\nraise SystemExit({exit_code})\n",
         encoding="utf-8",
     )
     return path
+
+
+def test_queue_same_command_rerun_into_new_root_provenance_failure_restores_completion(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "transcriber.py",
+            json.dumps({"text": "Same-command rerun transcript."}),
+        )
+    )
+    first_root = tmp_path / "bundles"
+    second_root = tmp_path / "other-bundles"
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(
+            approved.id,
+            first_root,
+            transcriber_command=command,
+        )
+
+        reapproved = state.approve_queue_item(approved.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(
+                reapproved.id,
+                second_root,
+                transcriber_command=command,
+            )
+        restored = state.get_queue_item(reapproved.id)
+        library = state.get_library_bundle(first.manifest.bundle_id)
+
+    # Same deterministic bundle id, different output root: the library row was
+    # repointed to the new directory before provenance failed, so restoration
+    # must derive from the pre-update row, not the current one.
+    assert restored.state is QueueState.COMPLETED
+    assert restored.bundle_id == first.manifest.bundle_id
+    assert restored.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert not (second_root / first.bundle_dir.name).exists()
+    assert Path(library.bundle_path) == first.bundle_dir
