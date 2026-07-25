@@ -496,6 +496,7 @@ class YouTubePlaylistAdapter:
         pages_fetched = 0
         items: list[SourceItem] = []
         next_page_token_present = False
+        requested_page_tokens: set[str] = set()
 
         while True:
             if self._max_pages is not None and pages_fetched >= self._max_pages:
@@ -519,6 +520,11 @@ class YouTubePlaylistAdapter:
             if raw_next_page_token is not None and not isinstance(raw_next_page_token, str):
                 raise AutomationError("YouTube API returned a malformed nextPageToken")
             if isinstance(raw_next_page_token, str) and raw_next_page_token:
+                # A token equal to one already requested would page the same
+                # results forever, consuming quota without completing the scan.
+                if raw_next_page_token in requested_page_tokens:
+                    raise AutomationError("YouTube API returned a repeated nextPageToken")
+                requested_page_tokens.add(raw_next_page_token)
                 page_token = raw_next_page_token
                 next_page_token_present = True
                 continue
@@ -956,7 +962,9 @@ class AutomationState:
                 result.manifest.bundle_id,
                 str(exc),
                 library_record=library_record,
-                restore_bundle_id=self._restorable_queue_bundle_id(queue_item),
+                restore_bundle_id=self._restorable_queue_bundle_id(
+                    queue_item, library_record.previous
+                ),
             )
             raise
         return IngestResult(
@@ -1198,9 +1206,16 @@ class AutomationState:
         for table in ("source_items", "queue_items"):
             if self._table_has_column(table, "metadata_json"):
                 continue
-            self._connection.execute(
-                f"ALTER TABLE {table} ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{{}}'"
-            )
+            try:
+                self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{{}}'"
+                )
+            except sqlite3.OperationalError as exc:
+                # A concurrent migration can add the column between our check
+                # and this statement; that outcome is the migration's goal, so
+                # tolerate it rather than failing the second process.
+                if "duplicate column name" not in str(exc):
+                    raise
         self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
         self._connection.commit()
 
@@ -1689,16 +1704,28 @@ class AutomationState:
             manifest=Manifest.load(result.bundle_dir),
         )
 
-    def _restorable_queue_bundle_id(self, queue_item: QueueItem) -> str | None:
+    def _restorable_queue_bundle_id(
+        self,
+        queue_item: QueueItem,
+        previous_library_row: LibraryBundle | None = None,
+    ) -> str | None:
         """Report a pre-ingest bundle id whose bundle a failed rerun can fall back to.
 
-        Only an item's own still-recorded, still-on-disk bundle qualifies: if the
-        rerun produced the same bundle id, the directory just deleted is that bundle
-        and there is nothing left to restore.
+        Only an item's own still-recorded, still-on-disk bundle qualifies. When a
+        same-id rerun repointed the library row before failing, the current row
+        references the just-deleted directory, so the pre-update row is the one
+        that can prove the earlier bundle survived.
         """
 
         if queue_item.bundle_id is None:
             return None
+        if (
+            previous_library_row is not None
+            and previous_library_row.bundle_id == queue_item.bundle_id
+            and previous_library_row.queue_item_id == queue_item.id
+            and Path(previous_library_row.bundle_path).is_dir()
+        ):
+            return queue_item.bundle_id
         try:
             library_bundle = self.get_library_bundle(queue_item.bundle_id)
         except AutomationError:

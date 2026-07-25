@@ -1253,3 +1253,53 @@ def _write_transcriber_script(path: Path, stdout: str, *, exit_code: int = 0) ->
         encoding="utf-8",
     )
     return path
+
+
+def test_queue_same_command_rerun_into_new_root_provenance_failure_restores_completion(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "transcriber.py",
+            json.dumps({"text": "Same-command rerun transcript."}),
+        )
+    )
+    first_root = tmp_path / "bundles"
+    second_root = tmp_path / "other-bundles"
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(
+            approved.id,
+            first_root,
+            transcriber_command=command,
+        )
+
+        reapproved = state.approve_queue_item(approved.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(
+                reapproved.id,
+                second_root,
+                transcriber_command=command,
+            )
+        restored = state.get_queue_item(reapproved.id)
+        library = state.get_library_bundle(first.manifest.bundle_id)
+
+    # Same deterministic bundle id, different output root: the library row was
+    # repointed to the new directory before provenance failed, so restoration
+    # must derive from the pre-update row, not the current one.
+    assert restored.state is QueueState.COMPLETED
+    assert restored.bundle_id == first.manifest.bundle_id
+    assert restored.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert not (second_root / first.bundle_dir.name).exists()
+    assert Path(library.bundle_path) == first.bundle_dir

@@ -1,6 +1,7 @@
 """Bundle schema seed tests: round-trip and schema export (M0 acceptance basis)."""
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from lectern.bundle import (
     StageName,
     StageRecord,
     StageState,
+    atomic_write_text,
     export_json_schema,
 )
 
@@ -83,3 +85,29 @@ def test_json_schema_exports() -> None:
 def test_committed_json_schema_matches_model() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "schemas" / "manifest.schema.json"
     assert schema_path.read_text() == export_json_schema()
+
+
+def test_atomic_write_temporary_is_restricted_before_content(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    target = tmp_path / "manifest.json"
+    target.write_text("{}\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    previous_umask = os.umask(0o022)
+    observed: list[int] = []
+    real_fdopen = os.fdopen
+
+    def spy_fdopen(fd: int, *args: object, **kwargs: object) -> object:
+        # Sample the temp file's mode before any content bytes are written.
+        observed.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real_fdopen(fd, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "fdopen", spy_fdopen)
+    try:
+        atomic_write_text(target, '{"a": 1}\n')
+    finally:
+        os.umask(previous_umask)
+
+    assert observed == [0o600]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.read_text(encoding="utf-8") == '{"a": 1}\n'

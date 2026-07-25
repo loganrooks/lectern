@@ -1512,3 +1512,74 @@ def _create_v1_state(path: Path, tmp_path: Path) -> None:
             """,
             (str(tmp_path / "bundles" / "legacy-bundle"), "2026-06-24T00:00:00+00:00"),
         )
+
+
+def test_repeated_next_page_token_raises_without_mutating_state(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        first = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page([_alpha_item()], next_page_token="LOOP"),
+                        _playlist_page([_beta_item()]),
+                    ]
+                ),
+            ),
+        )
+
+        with pytest.raises(AutomationError, match="repeated nextPageToken"):
+            state.scan_source(
+                source.id,
+                adapter=YouTubePlaylistAdapter(
+                    "fake-secret",
+                    transport=FakeTransport(
+                        [
+                            _playlist_page([_alpha_item()], next_page_token="LOOP"),
+                            _playlist_page([_beta_item()], next_page_token="LOOP"),
+                        ]
+                    ),
+                ),
+            )
+
+        after_items = [state.get_source_item(item.id) for item in first.added]
+
+    assert [item.present for item in after_items] == [True, True]
+
+
+def test_stale_column_check_migration_race_is_tolerated(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    # Another process wins the race: columns already added, user_version still 1.
+    connection = sqlite3.connect(state_path)
+    try:
+        connection.execute(
+            "ALTER TABLE source_items ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
+        connection.execute(
+            "ALTER TABLE queue_items ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # This process's column check reads stale absence (TOCTOU across processes).
+    def stale_column_check(self: automation.AutomationState, table: str, column: str) -> bool:
+        del self, table, column
+        return False
+
+    monkeypatch.setattr(automation.AutomationState, "_table_has_column", stale_column_check)
+
+    with open_state(state_path) as state:
+        assert state.get_source("src_legacy").name == "legacy"
+
+    connection = sqlite3.connect(state_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+    assert version == STATE_SCHEMA_VERSION

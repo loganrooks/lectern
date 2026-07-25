@@ -32,15 +32,19 @@ def atomic_write_text(path: Path, text: str) -> Path:
     """
 
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    # Preserve the destination's permissions across the replace; a fresh file
-    # keeps the umask-derived mode a plain write would have produced.
+    # Preserve the destination's permissions across the replace, and restrict
+    # the temporary BEFORE any content bytes land in it: a restricted artifact
+    # must never transit through a umask-mode file another local user could
+    # read, and a killed process must not leave a broad-mode copy behind.
     mode = path.stat().st_mode & 0o777 if path.exists() else None
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    descriptor = os.open(
+        temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode if mode is not None else 0o666
+    )
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(text)
         if mode is not None:
             os.chmod(temporary, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
