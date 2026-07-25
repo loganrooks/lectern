@@ -1583,3 +1583,105 @@ def test_stale_column_check_migration_race_is_tolerated(
     finally:
         connection.close()
     assert version == STATE_SCHEMA_VERSION
+
+
+def test_concurrently_published_backup_is_not_replaced(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    backup = tmp_path / "state.sqlite.v1.bak"
+    marker = b"concurrent pristine backup"
+    real_connect = sqlite3.connect
+
+    def racing_connect(target: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        # Simulate another process publishing its backup after this process's
+        # existence check but before this process publishes its own copy.
+        if isinstance(target, (str, Path)) and str(target).endswith(".tmp") and not backup.exists():
+            backup.write_bytes(marker)
+        return real_connect(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", racing_connect)
+
+    with open_state(state_path):
+        pass
+
+    assert backup.read_bytes() == marker
+
+
+def test_rejected_guarded_transition_rolls_back_write_transaction(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        )
+        queue_item = state.list_queue()[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match=YOUTUBE_METADATA_ONLY_ERROR):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        unsupported = state.get_queue_item(approved.id)
+        assert unsupported.state is QueueState.UNSUPPORTED
+
+        # Force the guarded zero-row UPDATE to execute by making the pre-check
+        # read a stale nonterminal state, as a concurrent process would.
+        real_get = automation.AutomationState.get_queue_item
+        stale_reads = [approved]
+
+        def stale_get(self: automation.AutomationState, queue_item_id: str) -> automation.QueueItem:
+            if stale_reads:
+                return stale_reads.pop(0)
+            return real_get(self, queue_item_id)
+
+        monkeypatch.setattr(automation.AutomationState, "get_queue_item", stale_get)
+        with pytest.raises(AutomationError, match="terminal state"):
+            state.retry_queue_item(unsupported.id)
+        monkeypatch.setattr(automation.AutomationState, "get_queue_item", real_get)
+        # The zero-row guarded UPDATE must not leave the connection holding an
+        # open write transaction after the expected rejection is caught.
+        assert state._connection.in_transaction is False  # noqa: SLF001
+
+
+def test_unsupported_write_does_not_clobber_concurrent_skip(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        )
+        queue_item = state.list_queue()[0]
+        approved = state.approve_queue_item(queue_item.id)
+
+        real_get = automation.AutomationState.get_queue_item
+        stale_reads = [approved, approved]
+
+        def stale_get(self: automation.AutomationState, queue_item_id: str) -> automation.QueueItem:
+            if stale_reads:
+                return stale_reads.pop(0)
+            return real_get(self, queue_item_id)
+
+        # A concurrent operator skip commits between this process's approved
+        # read and its terminal write.
+        state._connection.execute(  # noqa: SLF001
+            "UPDATE queue_items SET state = ? WHERE id = ?",
+            (QueueState.SKIPPED.value, approved.id),
+        )
+        state._connection.commit()  # noqa: SLF001
+        monkeypatch.setattr(automation.AutomationState, "get_queue_item", stale_get)
+
+        with pytest.raises(AutomationError, match=YOUTUBE_METADATA_ONLY_ERROR):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        monkeypatch.setattr(automation.AutomationState, "get_queue_item", real_get)
+        final = state.get_queue_item(approved.id)
+
+    assert final.state is QueueState.SKIPPED

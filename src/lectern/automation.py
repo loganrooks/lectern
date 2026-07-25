@@ -8,6 +8,7 @@ unless a future stage adds explicit per-item consent.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -828,6 +829,10 @@ class AutomationState:
         same error the pre-check would have raised.
         """
 
+        # The zero-row UPDATE still opened an implicit write transaction; release
+        # it before raising so a caller that catches the expected rejection does
+        # not leave the connection holding a write lock.
+        self._connection.rollback()
         queue_item = self.get_queue_item(queue_item_id)
         self._reject_terminal_transition(queue_item_id, action)
         raise AutomationError(f"queue item {queue_item.id} could not be transitioned by {action}")
@@ -1254,7 +1259,13 @@ class AutomationState:
                 self._connection.backup(destination)
             finally:
                 destination.close()
-            os.replace(temporary, backup)
+            # Publish only if no backup exists yet: os.link fails on an
+            # existing destination, unlike os.replace, so a backup that a
+            # concurrent migration published after our existence check is
+            # never overwritten with a possibly post-migration snapshot.
+            with contextlib.suppress(FileExistsError):
+                os.link(temporary, backup)
+            temporary.unlink(missing_ok=True)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -1468,22 +1479,32 @@ class AutomationState:
         self._connection.commit()
 
     def _record_unsupported_queue_item(self, queue_item_id: str, message: str) -> None:
-        """Record a terminal unsupported-by-design outcome without spending an attempt."""
+        """Record a terminal unsupported-by-design outcome without spending an attempt.
+
+        The write is conditioned on the row still being APPROVED: a concurrent
+        skip or retry that committed after our approved read must not be
+        overwritten with an irreversible terminal state. On a zero-row match the
+        newer operator transition stands and no terminal state is recorded.
+        """
 
         queue_item = self.get_queue_item(queue_item_id)
-        self._connection.execute(
+        cursor = self._connection.execute(
             """
             UPDATE queue_items
             SET state = ?, last_error = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND state = ?
             """,
             (
                 QueueState.UNSUPPORTED.value,
                 message,
                 _now(),
                 queue_item.id,
+                QueueState.APPROVED.value,
             ),
         )
+        if cursor.rowcount == 0:
+            self._connection.rollback()
+            return
         self._connection.commit()
 
     def _ensure_one_shot_source(self, source_path: Path) -> SourceRecord:
