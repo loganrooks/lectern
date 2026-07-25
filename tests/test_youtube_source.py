@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pytest import CaptureFixture, MonkeyPatch
@@ -24,6 +25,7 @@ from lectern.automation import (
     SourceRecord,
     YouTubeAPIError,
     YouTubePlaylistAdapter,
+    normalize_youtube_playlist_id,
     open_state,
     preflight_state_store,
     preflight_youtube_playlist,
@@ -172,6 +174,78 @@ def test_youtube_partial_scan_failure_does_not_mutate_existing_state(tmp_path: P
     assert [item.present for item in after_items] == [True, True]
     assert len(queue_items) == 2
     assert [item.state for item in queue_items] == [QueueState.DISCOVERED, QueueState.DISCOVERED]
+
+
+def test_malformed_next_page_token_fails_scan_without_mutating_state(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        first = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page([_alpha_item()], next_page_token="NEXT"),
+                        _playlist_page([_beta_item()]),
+                    ]
+                ),
+            ),
+        )
+
+        # A non-null, non-string token is not an end-of-playlist signal: treating
+        # it as one would commit a partial scan as complete and mark the pages
+        # never fetched as removed.
+        with pytest.raises(AutomationError, match="malformed nextPageToken"):
+            state.scan_source(
+                source.id,
+                adapter=YouTubePlaylistAdapter(
+                    "fake-secret",
+                    transport=FakeTransport([_page_with_raw_next_page_token([_alpha_item()], 123)]),
+                ),
+            )
+
+        after_items = [state.get_source_item(item.id) for item in first.added]
+        queue_items = state.list_queue()
+
+    assert [item.present for item in after_items] == [True, True]
+    assert len(queue_items) == 2
+    assert [item.state for item in queue_items] == [QueueState.DISCOVERED, QueueState.DISCOVERED]
+
+
+def test_real_video_with_placeholder_title_is_queued(tmp_path: Path) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        delta = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport(
+                    [
+                        _playlist_page(
+                            [
+                                _playlist_item(
+                                    playlist_item_id="pli_titled",
+                                    video_id="vid_titled",
+                                    title="Private video",
+                                    channel_id="chan_alpha",
+                                    channel_title="Synthetic Alpha Channel",
+                                    video_owner_channel_id="owner_chan_alpha",
+                                    video_owner_channel_title="Synthetic Alpha Owner Channel",
+                                    position=0,
+                                ),
+                                _placeholder_item(),
+                            ]
+                        )
+                    ]
+                ),
+            ),
+        )
+        queue_items = state.list_queue()
+
+    # A real public video may legitimately be titled "Private video"; only the
+    # tombstone shape (no owner channel, no videoPublishedAt) is a placeholder.
+    assert [item.metadata["video"]["placeholder"] for item in delta.added] == [False, True]
+    assert [item.metadata["video"]["id"] for item in queue_items] == ["vid_titled"]
 
 
 def test_youtube_reorder_does_not_change_digest_or_requeue(tmp_path: Path) -> None:
@@ -935,6 +1009,20 @@ def test_youtube_preflight_keeps_credential_status_for_malformed_playlist() -> N
     assert without_key.credential_present is False
 
 
+def test_unparseable_playlist_url_is_a_domain_error() -> None:
+    # urllib.parse.urlparse raises ValueError on this input; callers only handle
+    # AutomationError, so an unconverted ValueError would escape the CLI.
+    with pytest.raises(AutomationError, match="playlist"):
+        normalize_youtube_playlist_id("http://[broken")
+
+    preflight = preflight_youtube_playlist("http://[broken", api_key="fake-secret")
+
+    assert not preflight.ok
+    assert "playlist" in str(preflight.error)
+    assert preflight.credential_present is True
+    assert preflight_youtube_playlist("http://[broken", environ={}).credential_present is False
+
+
 def test_v1_backup_temporary_file_is_restricted_before_backup(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1097,6 +1185,14 @@ def _playlist_page(items: list[dict[str, object]], *, next_page_token: str | Non
     }
     if next_page_token is not None:
         payload["nextPageToken"] = next_page_token
+    return json.dumps(payload).encode("utf-8")
+
+
+def _page_with_raw_next_page_token(items: list[dict[str, object]], token: object) -> bytes:
+    """A page whose nextPageToken is present but not a string (or null)."""
+
+    payload = cast(dict[str, object], json.loads(_playlist_page(items)))
+    payload["nextPageToken"] = token
     return json.dumps(payload).encode("utf-8")
 
 

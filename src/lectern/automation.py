@@ -24,7 +24,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, Self, cast, runtime_checkable
 
-from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName
+from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName, atomic_write_text
 from lectern.ingest import (
     IngestError,
     IngestResult,
@@ -510,6 +510,11 @@ class YouTubePlaylistAdapter:
                 for raw in raw_items
             )
             raw_next_page_token = payload.get("nextPageToken")
+            # A present-but-non-string token is not an end-of-playlist signal:
+            # treating it as one would commit a partial scan as a complete one
+            # and mark every unfetched item removed.
+            if raw_next_page_token is not None and not isinstance(raw_next_page_token, str):
+                raise AutomationError("YouTube API returned a malformed nextPageToken")
             if isinstance(raw_next_page_token, str) and raw_next_page_token:
                 page_token = raw_next_page_token
                 next_page_token_present = True
@@ -1811,7 +1816,11 @@ def attach_provenance_to_bundle(
         "consent": consent,
         "remote_services": _bundle_remote_services(source_payload),
     }
-    source_path.write_text(json.dumps(source_payload, indent=2) + "\n", encoding="utf-8")
+    # Publish atomically: the queue/library rows that point at this bundle are
+    # already committed, and _bundle_provenance_needs_repair deliberately gives
+    # up on unparseable base content, so a half-written source.json would be
+    # unrecoverable by the replay repair path.
+    atomic_write_text(source_path, json.dumps(source_payload, indent=2) + "\n")
 
     manifest = Manifest.load(bundle_dir)
     acquire = manifest.stages[StageName.ACQUIRE]
@@ -1959,7 +1968,12 @@ def normalize_youtube_playlist_id(playlist: str) -> str:
     value = playlist.strip()
     if not value:
         raise AutomationError("YouTube playlist ID is required")
-    parsed = urllib.parse.urlparse(value)
+    try:
+        parsed = urllib.parse.urlparse(value)
+    except ValueError as exc:
+        # urlparse raises on inputs like "http://[broken"; callers (CLI included)
+        # only handle AutomationError, so let the domain error carry it.
+        raise AutomationError("YouTube playlist ID or URL could not be parsed") from exc
     if parsed.scheme or parsed.netloc:
         query = urllib.parse.parse_qs(parsed.query)
         values = query.get("list", [])
@@ -2048,7 +2062,14 @@ def _youtube_source_item(
     video_owner_channel_title = _optional_string(snippet.get("videoOwnerChannelTitle"))
     video_published_at = _optional_string(content_details.get("videoPublishedAt"))
     position = _optional_int(snippet.get("position"))
-    placeholder = title in YOUTUBE_PLACEHOLDER_TITLES
+    # Title alone does not identify a tombstone: a real public video may be
+    # titled "Private video". API tombstones also drop the availability fields
+    # real entries carry, so require their absence before excluding the item.
+    placeholder = (
+        title in YOUTUBE_PLACEHOLDER_TITLES
+        and video_owner_channel_id is None
+        and video_published_at is None
+    )
     # Digest holds content-meaningful fields only. Playlist item ID, position,
     # and timestamps are positional/curation noise excluded per accepted design
     # constraint H1: including them turns reorders and remove-and-re-adds into

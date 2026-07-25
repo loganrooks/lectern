@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import sqlite3
 import sys
@@ -964,6 +965,61 @@ def test_attach_provenance_to_bundle_is_idempotent_for_identical_inputs(tmp_path
     # replay repair path would rewrite bundles on every completed replay.
     assert (result.bundle_dir / "source.json").read_bytes() == first_source_json
     assert (result.bundle_dir / MANIFEST_NAME).read_bytes() == first_manifest
+
+
+def test_interrupted_provenance_attach_keeps_source_json_parseable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("synthetic provenance publish failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        completed = state.get_queue_item(approved.id)
+        source_item = state.get_source_item(queue_item.source_item_id)
+
+        source_json = result.bundle_dir / "source.json"
+        before = source_json.read_bytes()
+        _strip_provenance(source_json)
+        stripped = source_json.read_bytes()
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        with pytest.raises(OSError, match="synthetic provenance publish failure"):
+            attach_provenance_to_bundle(
+                result.bundle_dir,
+                source=source,
+                source_item=source_item,
+                queue_item=completed,
+                consent="explicit_queue_approval",
+            )
+
+        monkeypatch.undo()
+        leftover = sorted(path.name for path in result.bundle_dir.iterdir())
+
+        # The committed COMPLETED row already points at this bundle: a crash
+        # while republishing source.json must leave the prior file whole, not a
+        # truncated one that _bundle_provenance_needs_repair refuses to repair.
+        assert source_json.read_bytes() == stripped
+        assert json.loads(source_json.read_text(encoding="utf-8"))["transcript"]
+        assert all(not name.endswith(".tmp") for name in leftover)
+
+        attach_provenance_to_bundle(
+            result.bundle_dir,
+            source=source,
+            source_item=source_item,
+            queue_item=completed,
+            consent="explicit_queue_approval",
+        )
+
+    assert source_json.read_bytes() == before
+    assert sorted(path.name for path in result.bundle_dir.iterdir()) == leftover
 
 
 def test_one_shot_replay_repairs_missing_provenance(tmp_path: Path) -> None:
