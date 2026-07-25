@@ -8,6 +8,7 @@ import stat
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -19,6 +20,7 @@ from lectern.automation import (
     STATE_SCHEMA_VERSION,
     YOUTUBE_METADATA_ONLY_ERROR,
     AutomationError,
+    QueueItem,
     QueueState,
     SourceKind,
     SourcePolicy,
@@ -442,6 +444,60 @@ def test_unsupported_queue_item_rejects_skip(tmp_path: Path) -> None:
     assert after.attempts == 0
 
 
+def test_terminal_guard_holds_when_precheck_reads_a_stale_state(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    real_get_queue_item = automation.AutomationState.get_queue_item
+    stale_reads = [0]
+
+    def stale_once_get_queue_item(
+        self: automation.AutomationState,
+        queue_item_id: str,
+    ) -> QueueItem:
+        queue_item = real_get_queue_item(self, queue_item_id)
+        if stale_reads[0] > 0:
+            stale_reads[0] -= 1
+            return replace(queue_item, state=QueueState.DISCOVERED)
+        return queue_item
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        queue_item = state.scan_source(
+            source.id,
+            adapter=YouTubePlaylistAdapter(
+                "fake-secret",
+                transport=FakeTransport([_playlist_page([_alpha_item()])]),
+            ),
+        ).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        with pytest.raises(AutomationError, match="metadata-only discovery"):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+        # Stand in for a concurrent writer that marks the row UNSUPPORTED after the
+        # guard's read and before its write: the pre-check sees a nonterminal state
+        # that the row no longer holds, so only a conditional update can refuse it.
+        monkeypatch.setattr(
+            automation.AutomationState,
+            "get_queue_item",
+            stale_once_get_queue_item,
+        )
+        for transition in (
+            state.approve_queue_item,
+            state.skip_queue_item,
+            state.retry_queue_item,
+        ):
+            stale_reads[0] = 1
+            with pytest.raises(AutomationError, match="terminal state"):
+                transition(approved.id)
+
+        monkeypatch.undo()
+        after = state.get_queue_item(approved.id)
+
+    assert after.state is QueueState.UNSUPPORTED
+    assert after.attempts == 0
+
+
 def test_cli_queue_list_accepts_unsupported_state_filter(
     tmp_path: Path,
     capsys: CaptureFixture[str],
@@ -831,6 +887,17 @@ def test_half_migrated_v1_state_opens_and_reaches_v2(tmp_path: Path) -> None:
     assert queue_metadata == "{}"
 
 
+def _is_backup_temporary(target: str | Path) -> bool:
+    """Report whether a sqlite3.connect target is a v1-backup temporary file.
+
+    The temporary carries a per-attempt unique component, so tests match the
+    surrounding name rather than a fixed suffix.
+    """
+
+    name = Path(target).name
+    return name.startswith(".state.sqlite.v1.bak.") and name.endswith(".tmp")
+
+
 def _assert_backup_is_pre_migration(backup: Path) -> None:
     assert backup.is_file()
     connection = sqlite3.connect(backup)
@@ -902,6 +969,39 @@ def test_v1_backup_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
     assert [path.name for path in tmp_path.iterdir() if path.name.endswith(".tmp")] == []
 
 
+def test_v1_backup_temporary_name_is_unique_per_attempt(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    real_connect = sqlite3.connect
+    observed: list[str] = []
+
+    def recording_connect(target: str | Path) -> sqlite3.Connection:
+        if _is_backup_temporary(target):
+            observed.append(Path(target).name)
+        return real_connect(target)
+
+    monkeypatch.setattr(sqlite3, "connect", recording_connect)
+
+    for directory in ("first", "second"):
+        state_path = tmp_path / directory / "state.sqlite"
+        state_path.parent.mkdir()
+        _create_v1_state(state_path, tmp_path)
+        with open_state(state_path):
+            pass
+
+    monkeypatch.undo()
+
+    # Two processes migrating the same v1 store must not share a temporary name:
+    # a fixed name lets one attempt's cleanup unlink the other's in-progress copy.
+    assert len(observed) == 2
+    assert observed[0] != observed[1]
+    for directory in ("first", "second"):
+        _assert_backup_is_pre_migration(tmp_path / directory / "state.sqlite.v1.bak")
+        leftovers = [path.name for path in (tmp_path / directory).iterdir()]
+        assert [name for name in leftovers if name.endswith(".tmp")] == []
+
+
 def test_interrupted_v1_backup_does_not_publish_partial_file(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -913,7 +1013,7 @@ def test_interrupted_v1_backup_does_not_publish_partial_file(
 
     def flaky_connect(target: str | Path) -> sqlite3.Connection:
         connection = real_connect(target)
-        if str(target).endswith(".v1.bak.tmp"):
+        if _is_backup_temporary(target):
             # Leave partial bytes in the destination file and then fail inside
             # backup(), the way a killed process would.
             connection.execute("CREATE TABLE partial(x)")
@@ -1036,7 +1136,7 @@ def test_v1_backup_temporary_file_is_restricted_before_backup(
 
     def recording_connect(target: str | Path) -> sqlite3.Connection:
         connection = real_connect(target)
-        if str(target).endswith(".v1.bak.tmp"):
+        if _is_backup_temporary(target):
             temporary = Path(target)
             observed.append(stat.S_IMODE(temporary.stat().st_mode) if temporary.exists() else None)
         return connection

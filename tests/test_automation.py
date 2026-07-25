@@ -1146,6 +1146,74 @@ def test_one_shot_rerun_into_new_output_root_provenance_failure_keeps_library_ro
     assert Path(shown.bundle_path).is_dir()
 
 
+def test_queue_command_rerun_provenance_failure_preserves_completed_bundle(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    copy_media_without_sidecar(source_dir)
+    first_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "first_transcriber.py",
+            json.dumps({"text": "First queue command transcript."}),
+        )
+    )
+    second_command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "second_transcriber.py",
+            json.dumps({"text": "Second queue command transcript."}),
+        )
+    )
+    output_root = tmp_path / "bundles"
+    real_attach = automation.attach_provenance_to_bundle
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", source_dir)
+        queue_item = state.scan_source(source.id).queued[0]
+        approved = state.approve_queue_item(queue_item.id)
+        first = state.ingest_queue_item(
+            approved.id,
+            output_root,
+            transcriber_command=first_command,
+        )
+
+        reapproved = state.approve_queue_item(approved.id)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_queue_item(
+                reapproved.id,
+                output_root,
+                transcriber_command=second_command,
+            )
+
+        preserved = state.get_queue_item(approved.id)
+        bundle_dirs = sorted(path.name for path in output_root.iterdir())
+        library_paths = [bundle.bundle_path for bundle in state.list_library()]
+
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", real_attach)
+        replayed = state.approve_queue_item(approved.id)
+        replay = state.ingest_queue_item(
+            replayed.id,
+            output_root,
+            transcriber_command=first_command,
+        )
+
+    # A failed rerun of an already-completed queue item must not demote the earlier
+    # success: the row keeps the original bundle id, whose bundle (and library row)
+    # survives, and only the new bundle is removed.
+    assert preserved.state is QueueState.COMPLETED
+    assert preserved.bundle_id == first.manifest.bundle_id
+    assert preserved.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert bundle_dirs == [first.manifest.bundle_id]
+    assert library_paths == [str(first.bundle_dir.resolve())]
+    assert replay.bundle_dir == first.bundle_dir
+    assert replay.manifest.bundle_id == first.manifest.bundle_id
+
+
 def _strip_provenance(source_json: Path) -> None:
     """Simulate a crash before provenance was attached to a committed bundle."""
 

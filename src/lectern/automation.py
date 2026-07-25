@@ -17,12 +17,13 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, Self, cast, runtime_checkable
+from typing import Any, NoReturn, Protocol, Self, cast, runtime_checkable
 
 from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName, atomic_write_text
 from lectern.ingest import (
@@ -93,6 +94,8 @@ class QueueState(StrEnum):
 
 
 TERMINAL_QUEUE_STATES = frozenset({QueueState.UNSUPPORTED})
+# Stable ordering so the guarded-UPDATE placeholders bind the same values every run.
+TERMINAL_QUEUE_STATE_VALUES = tuple(sorted(state.value for state in TERMINAL_QUEUE_STATES))
 
 # Keys attach_provenance_to_bundle writes into source.json["provenance"]; a
 # completed bundle missing any of them predates a finished provenance attach.
@@ -786,15 +789,21 @@ class AutomationState:
 
     def approve_queue_item(self, queue_item_id: str) -> QueueItem:
         self._reject_terminal_transition(queue_item_id, "approve")
-        return self._set_queue_state(queue_item_id, QueueState.APPROVED, clear_error=True)
+        return self._set_queue_state(
+            queue_item_id, QueueState.APPROVED, clear_error=True, guarded_action="approve"
+        )
 
     def skip_queue_item(self, queue_item_id: str) -> QueueItem:
         self._reject_terminal_transition(queue_item_id, "skip")
-        return self._set_queue_state(queue_item_id, QueueState.SKIPPED, clear_error=True)
+        return self._set_queue_state(
+            queue_item_id, QueueState.SKIPPED, clear_error=True, guarded_action="skip"
+        )
 
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
         self._reject_terminal_transition(queue_item_id, "retry")
-        return self._set_queue_state(queue_item_id, QueueState.DISCOVERED, clear_error=True)
+        return self._set_queue_state(
+            queue_item_id, QueueState.DISCOVERED, clear_error=True, guarded_action="retry"
+        )
 
     def _reject_terminal_transition(self, queue_item_id: str, action: str) -> None:
         queue_item = self.get_queue_item(queue_item_id)
@@ -803,6 +812,19 @@ class AutomationState:
                 f"queue item {queue_item.id} is in terminal state "
                 f"{queue_item.state.value}; {action} is not a legal transition"
             )
+
+    def _reject_guarded_transition_conflict(self, queue_item_id: str, action: str) -> NoReturn:
+        """Explain a guarded update that matched no row, from the row as it stands now.
+
+        The pre-check read and the update are separate statements, so another writer
+        can move the item into a terminal state in between; the update's own terminal
+        guard is what refuses that, and this re-read turns the empty result into the
+        same error the pre-check would have raised.
+        """
+
+        queue_item = self.get_queue_item(queue_item_id)
+        self._reject_terminal_transition(queue_item_id, action)
+        raise AutomationError(f"queue item {queue_item.id} could not be transitioned by {action}")
 
     def ingest_queue_item(
         self,
@@ -925,12 +947,16 @@ class AutomationState:
             # Remove the half-written bundle: leaving it on disk with no library
             # record makes the retry path collide with an unrecorded directory.
             shutil.rmtree(result.bundle_dir, ignore_errors=True)
+            # Mirror of the one-shot path: a re-approved item can be rerun under a
+            # different transcriber command, and a failed rerun must not demote the
+            # earlier success. Restore the pre-ingest bundle id when its bundle
+            # survived this deletion, so the replay path can still reach it.
             self._undo_completed_ingest(
                 queue_item.id,
                 result.manifest.bundle_id,
                 str(exc),
                 library_record=library_record,
-                restore_bundle_id=None,
+                restore_bundle_id=self._restorable_queue_bundle_id(queue_item),
             )
             raise
         return IngestResult(
@@ -1194,9 +1220,11 @@ class AutomationState:
         #
         # The backup is written to a temporary name and published with os.replace so
         # an interrupted run cannot leave a partial file that the existence check
-        # above would later trust as a complete pre-migration copy.
-        temporary = self.path.with_name(f"{backup.name}.tmp")
-        temporary.unlink(missing_ok=True)
+        # above would later trust as a complete pre-migration copy. The name carries
+        # a per-attempt unique component (as atomic_write_text does): a fixed name is
+        # shared by concurrent migrations of the same store, where one attempt's
+        # cleanup would unlink the other's in-progress copy.
+        temporary = self.path.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
         # sqlite3.connect would create the file under the process umask, so the
         # copy would hold the database's bytes under broader permissions for the
         # length of the backup (and past a SIGKILL). Create it with the source
@@ -1299,9 +1327,14 @@ class AutomationState:
         *,
         bundle_id: str | None = None,
         clear_error: bool = False,
+        guarded_action: str | None = None,
     ) -> QueueItem:
         queue_item = self._apply_queue_state(
-            queue_item_id, state, bundle_id=bundle_id, clear_error=clear_error
+            queue_item_id,
+            state,
+            bundle_id=bundle_id,
+            clear_error=clear_error,
+            guarded_action=guarded_action,
         )
         self._connection.commit()
         return self.get_queue_item(queue_item.id)
@@ -1313,20 +1346,41 @@ class AutomationState:
         *,
         bundle_id: str | None = None,
         clear_error: bool = False,
+        guarded_action: str | None = None,
     ) -> QueueItem:
-        """Stage a queue-state transition without committing; the caller commits."""
+        """Stage a queue-state transition without committing; the caller commits.
+
+        `guarded_action` names a user verb whose transition is illegal out of a
+        terminal state. The guard lives in the UPDATE's WHERE clause so the check and
+        the write are one statement: a read-then-write pair lets a concurrent writer
+        slip a terminal state in between and have it overwritten.
+        """
 
         existing = self.get_queue_item(queue_item_id)
-        self._connection.execute(
-            """
+        terminal_guard = ""
+        parameters: list[object] = [
+            state.value,
+            bundle_id,
+            1 if clear_error else 0,
+            _now(),
+            existing.id,
+        ]
+        if guarded_action is not None:
+            placeholders = ", ".join("?" for _ in TERMINAL_QUEUE_STATE_VALUES)
+            terminal_guard = f" AND state NOT IN ({placeholders})"
+            parameters.extend(TERMINAL_QUEUE_STATE_VALUES)
+        cursor = self._connection.execute(
+            f"""
             UPDATE queue_items
             SET state = ?, bundle_id = COALESCE(?, bundle_id),
                 last_error = CASE WHEN ? THEN NULL ELSE last_error END,
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ?{terminal_guard}
             """,
-            (state.value, bundle_id, 1 if clear_error else 0, _now(), existing.id),
+            parameters,
         )
+        if guarded_action is not None and cursor.rowcount == 0:
+            self._reject_guarded_transition_conflict(queue_item_id, guarded_action)
         return existing
 
     def _undo_completed_ingest(
@@ -1634,6 +1688,26 @@ class AutomationState:
             bundle_dir=result.bundle_dir,
             manifest=Manifest.load(result.bundle_dir),
         )
+
+    def _restorable_queue_bundle_id(self, queue_item: QueueItem) -> str | None:
+        """Report a pre-ingest bundle id whose bundle a failed rerun can fall back to.
+
+        Only an item's own still-recorded, still-on-disk bundle qualifies: if the
+        rerun produced the same bundle id, the directory just deleted is that bundle
+        and there is nothing left to restore.
+        """
+
+        if queue_item.bundle_id is None:
+            return None
+        try:
+            library_bundle = self.get_library_bundle(queue_item.bundle_id)
+        except AutomationError:
+            return None
+        if library_bundle.queue_item_id != queue_item.id:
+            return None
+        if not Path(library_bundle.bundle_path).is_dir():
+            return None
+        return queue_item.bundle_id
 
     def _queue_owned_bundle_result(self, queue_item: QueueItem) -> IngestResult | None:
         if queue_item.bundle_id is None:
