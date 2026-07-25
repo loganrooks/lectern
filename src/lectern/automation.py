@@ -223,6 +223,19 @@ class LibraryBundle:
 
 
 @dataclass(frozen=True)
+class _LibraryRecordOutcome:
+    """What a staged library record changed, so the undo path can reverse it.
+
+    A rerun into a different output root can produce the same deterministic bundle
+    id, in which case the row is updated rather than inserted; reversing that needs
+    the prior row, not just the knowledge that nothing was inserted.
+    """
+
+    inserted: bool
+    previous: LibraryBundle | None
+
+
+@dataclass(frozen=True)
 class SourcePreflight:
     path: str
     exists: bool
@@ -885,7 +898,7 @@ class AutomationState:
                 bundle_id=result.manifest.bundle_id,
                 clear_error=True,
             )
-            library_row_inserted = self._record_library_bundle(
+            library_record = self._record_library_bundle(
                 result.bundle_dir, source, source_item, queue_item
             )
             self._connection.commit()
@@ -911,7 +924,7 @@ class AutomationState:
                 queue_item.id,
                 result.manifest.bundle_id,
                 str(exc),
-                remove_library_row=library_row_inserted,
+                library_record=library_record,
                 restore_bundle_id=None,
             )
             raise
@@ -1001,7 +1014,7 @@ class AutomationState:
                 bundle_id=result.manifest.bundle_id,
                 clear_error=True,
             )
-            library_row_inserted = self._record_library_bundle(
+            library_record = self._record_library_bundle(
                 result.bundle_dir, source, source_item, queue_item
             )
             self._connection.commit()
@@ -1036,7 +1049,7 @@ class AutomationState:
                 queue_item.id,
                 result.manifest.bundle_id,
                 str(exc),
-                remove_library_row=library_row_inserted,
+                library_record=library_record,
                 restore_bundle_id=restore_bundle_id,
             )
             raise
@@ -1179,15 +1192,20 @@ class AutomationState:
         # above would later trust as a complete pre-migration copy.
         temporary = self.path.with_name(f"{backup.name}.tmp")
         temporary.unlink(missing_ok=True)
+        # sqlite3.connect would create the file under the process umask, so the
+        # copy would hold the database's bytes under broader permissions for the
+        # length of the backup (and past a SIGKILL). Create it with the source
+        # database's own mode first, before any bytes are written into it.
+        mode = self.path.stat().st_mode & 0o777
+        os.close(os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode))
         try:
+            # The umask also masks os.open's mode, so restate it explicitly.
+            os.chmod(temporary, mode)
             destination = sqlite3.connect(temporary)
             try:
                 self._connection.backup(destination)
             finally:
                 destination.close()
-            # sqlite3.connect creates the file under the process umask; the
-            # pre-migration bytes deserve the source database's own permissions.
-            os.chmod(temporary, self.path.stat().st_mode & 0o777)
             os.replace(temporary, backup)
         except BaseException:
             temporary.unlink(missing_ok=True)
@@ -1312,15 +1330,33 @@ class AutomationState:
         bundle_id: str,
         message: str,
         *,
-        remove_library_row: bool,
+        library_record: _LibraryRecordOutcome,
         restore_bundle_id: str | None,
     ) -> None:
         """Reverse a committed completion in one transaction after provenance failed."""
 
-        if remove_library_row:
+        if library_record.inserted:
             self._connection.execute(
                 "DELETE FROM library_bundles WHERE bundle_id = ? AND queue_item_id = ?",
                 (bundle_id, queue_item_id),
+            )
+        elif library_record.previous is not None:
+            # The row was updated onto the bundle that has just been deleted; the
+            # earlier bundle survives on disk, so the library must point back at it.
+            previous = library_record.previous
+            self._connection.execute(
+                """
+                UPDATE library_bundles
+                SET bundle_path = ?, source_id = ?, source_item_id = ?, queue_item_id = ?
+                WHERE bundle_id = ?
+                """,
+                (
+                    previous.bundle_path,
+                    previous.source_id,
+                    previous.source_item_id,
+                    previous.queue_item_id,
+                    previous.bundle_id,
+                ),
             )
         if restore_bundle_id is None:
             self._apply_failed_queue_item(queue_item_id, message)
@@ -1469,10 +1505,11 @@ class AutomationState:
         source: SourceRecord,
         source_item: SourceItem,
         queue_item: QueueItem,
-    ) -> bool:
-        """Stage the library record without committing; returns True when a row was inserted.
+    ) -> _LibraryRecordOutcome:
+        """Stage the library record without committing; reports what it changed.
 
-        The caller commits, so completion state and library record land together.
+        The caller commits, so completion state and library record land together,
+        and keeps the outcome so a later failure can restore the prior row.
         """
 
         manifest = Manifest.load(bundle_dir)
@@ -1497,7 +1534,7 @@ class AutomationState:
                     _now(),
                 ),
             )
-            return True
+            return _LibraryRecordOutcome(inserted=True, previous=None)
         if existing.queue_item_id == queue_item.id:
             self._connection.execute(
                 """
@@ -1507,7 +1544,7 @@ class AutomationState:
                 """,
                 (*values, manifest.bundle_id),
             )
-            return False
+            return _LibraryRecordOutcome(inserted=False, previous=existing)
         raise AutomationError(
             "bundle id already exists for different source provenance; "
             "duplicate-content multi-source provenance is not implemented"
@@ -1678,21 +1715,24 @@ def preflight_youtube_playlist(
     environ: Mapping[str, str] | None = None,
     transport: HttpGet | None = None,
 ) -> YouTubePreflight:
+    # Resolve the credential before normalization so an invalid playlist still
+    # reports whether a key was supplied; reporting "absent" would send the
+    # operator after a credential they already have.
+    env = environ if environ is not None else os.environ
+    resolved_api_key = api_key if api_key is not None else env.get(api_key_env, "")
     try:
         playlist_id = normalize_youtube_playlist_id(playlist)
     except AutomationError as exc:
         return YouTubePreflight(
             playlist_id=playlist,
             api_key_env=api_key_env,
-            credential_present=False,
+            credential_present=bool(resolved_api_key),
             reachable=False,
             pages_checked=0,
             estimated_units_consumed=0,
             error=str(exc),
         )
 
-    env = environ if environ is not None else os.environ
-    resolved_api_key = api_key if api_key is not None else env.get(api_key_env, "")
     if not resolved_api_key:
         return YouTubePreflight(
             playlist_id=playlist_id,
@@ -2079,7 +2119,13 @@ def _urllib_get(url: str, timeout_s: float) -> bytes:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             return cast(bytes, response.read())
     except urllib.error.HTTPError as exc:
-        body = exc.read()
+        try:
+            body = exc.read()
+        except (http.client.HTTPException, OSError):
+            # A truncated error body must not escape as a raw protocol error:
+            # exceptions raised inside this handler bypass the sibling handlers
+            # below, and the status code alone still makes a usable domain error.
+            body = b""
         raise _youtube_error_from_response(exc.code, body) from exc
     except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         # http.client raises HTTPException (IncompleteRead and friends) outside the

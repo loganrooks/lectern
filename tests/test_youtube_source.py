@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import email.message
 import http.client
 import json
 import sqlite3
 import stat
+import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
@@ -878,6 +880,92 @@ def test_youtube_incomplete_read_raises_automation_error(
 
     assert not preflight.ok
     assert "YouTube Data API request failed" in str(preflight.error)
+
+
+class _TruncatedBodyHTTPError(urllib.error.HTTPError):
+    """An HTTP error whose body read fails the way a truncated response does."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "https://youtube.invalid/playlistItems",
+            500,
+            "Internal Server Error",
+            email.message.Message(),
+            None,
+        )
+
+    def read(self, *args: object, **kwargs: object) -> bytes:
+        del args, kwargs
+        raise http.client.IncompleteRead(b'{"error":', 128)
+
+
+def test_youtube_truncated_error_body_raises_domain_error(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    def fail_urlopen(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise _TruncatedBodyHTTPError()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail_urlopen)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_youtube_playlist_source("yt", "PL_SYNTH")
+        with pytest.raises(YouTubeAPIError) as raised:
+            state.scan_source(source.id, adapter=YouTubePlaylistAdapter("fake-secret"))
+
+    preflight = preflight_youtube_playlist("PL_SYNTH", api_key="fake-secret")
+
+    # A body that cannot be read must not turn the domain error into a raw
+    # protocol error: the status code still has to reach the caller.
+    assert raised.value.status_code == 500
+    assert "YouTube Data API error (500" in str(raised.value)
+    assert not preflight.ok
+    assert "YouTube Data API error (500" in str(preflight.error)
+
+
+def test_youtube_preflight_keeps_credential_status_for_malformed_playlist() -> None:
+    with_key = preflight_youtube_playlist("not a playlist", api_key="fake-secret")
+    without_key = preflight_youtube_playlist("not a playlist", environ={})
+
+    assert not with_key.ok
+    assert "playlist" in str(with_key.error)
+    assert with_key.credential_present is True
+    assert not without_key.ok
+    assert without_key.credential_present is False
+
+
+def test_v1_backup_temporary_file_is_restricted_before_backup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    _create_v1_state(state_path, tmp_path)
+    state_path.chmod(0o600)
+
+    real_connect = sqlite3.connect
+    observed: list[int | None] = []
+
+    def recording_connect(target: str | Path) -> sqlite3.Connection:
+        connection = real_connect(target)
+        if str(target).endswith(".v1.bak.tmp"):
+            temporary = Path(target)
+            observed.append(stat.S_IMODE(temporary.stat().st_mode) if temporary.exists() else None)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", recording_connect)
+
+    with open_state(state_path):
+        pass
+
+    monkeypatch.undo()
+    backup = tmp_path / "state.sqlite.v1.bak"
+
+    # The temporary copy holds the same bytes as the source database, so it must
+    # never exist under broader permissions — not even for the backup's duration.
+    assert observed == [0o600]
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    _assert_backup_is_pre_migration(backup)
 
 
 def test_adapter_rejects_nonpositive_max_pages() -> None:

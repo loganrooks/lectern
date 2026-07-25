@@ -1050,6 +1050,46 @@ def test_queue_replay_repairs_stale_manifest_source_digest(tmp_path: Path) -> No
     assert _manifest_source_digest(replay.manifest) == _file_digest(source_json)
 
 
+def test_one_shot_rerun_into_new_output_root_provenance_failure_keeps_library_row(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = copy_media_without_sidecar(tmp_path / "source")
+    command = f"{sys.executable} " + str(
+        _write_transcriber_script(
+            tmp_path / "transcriber.py",
+            json.dumps({"text": "Stable one-shot command transcript."}),
+        )
+    )
+    first_root = tmp_path / "bundles"
+    second_root = tmp_path / "other-bundles"
+
+    def fail_attach(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic provenance write failure")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(source, first_root, transcriber_command=command)
+        monkeypatch.setattr(automation, "attach_provenance_to_bundle", fail_attach)
+
+        with pytest.raises(OSError, match="synthetic provenance write failure"):
+            state.ingest_one_shot(source, second_root, transcriber_command=command)
+
+        preserved = state.list_queue()[0]
+        library = state.list_library()
+        shown = state.get_library_bundle(first.manifest.bundle_id)
+
+    # The rerun produced the same deterministic bundle id, so the library row was
+    # updated rather than inserted. Undoing the failed rerun must put the row back
+    # on the surviving original bundle instead of leaving it on the deleted copy.
+    assert preserved.state is QueueState.COMPLETED
+    assert preserved.bundle_id == first.manifest.bundle_id
+    assert preserved.last_error is None
+    assert first.bundle_dir.is_dir()
+    assert not second_root.exists() or list(second_root.iterdir()) == []
+    assert [bundle.bundle_path for bundle in library] == [str(first.bundle_dir.resolve())]
+    assert Path(shown.bundle_path).is_dir()
+
+
 def _strip_provenance(source_json: Path) -> None:
     """Simulate a crash before provenance was attached to a committed bundle."""
 
