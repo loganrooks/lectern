@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   verify-matrix:
-    name: verify (${{ matrix.os }})
+    name: verify (${{ matrix.os }}, py${{ matrix.python-version }})
     if: ${{ github.event_name != 'issue_comment' }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -33,6 +33,10 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+        python-version:
+          - "3.12"
+          - "3.13"
+          - "3.14"
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -40,7 +44,7 @@ jobs:
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v8.2.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
 
       - name: Sync dependencies
@@ -61,6 +65,42 @@ jobs:
             echo "::error::verify matrix failed"
             exit 1
           fi
+
+  integration-evidence:
+    name: integration evidence
+    # Manual evidence lane, never a PR gate: it runs only on workflow_dispatch,
+    # carries repository secrets, and stays out of the aggregate `verify`
+    # needs-chain so a network flake can never block a pull request.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: make sync
+
+      - name: Require live-calibration credentials
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          LECTERN_YOUTUBE_PLAYLIST_ID: ${{ secrets.LECTERN_YOUTUBE_PLAYLIST_ID }}
+        run: |
+          if [ -z "$YOUTUBE_API_KEY" ] || [ -z "$LECTERN_YOUTUBE_PLAYLIST_ID" ]; then
+            echo "integration evidence requires YOUTUBE_API_KEY and LECTERN_YOUTUBE_PLAYLIST_ID secrets; a skipped run is not evidence" >&2
+            exit 1
+          fi
+
+      - name: Run integration evidence suite
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          LECTERN_YOUTUBE_PLAYLIST_ID: ${{ secrets.LECTERN_YOUTUBE_PLAYLIST_ID }}
+        run: uv run pytest -m integration -q
 
   codex-review:
     name: codex review

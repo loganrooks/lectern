@@ -21,16 +21,23 @@ bundle on disk, not through hidden process state. Each stage reads declared
 inputs, writes declared outputs, and records a small run log with tool versions,
 parameters, timing, and artifact hashes.
 
-| Stage | Input | Output | Notes |
-| --- | --- | --- | --- |
-| acquire | source reference | `media/`, `source.json` | Source metadata and media capture. |
-| normalize | media | `media/audio.wav` | Local ffmpeg normalization. |
-| transcribe | audio | `transcript/segments.json`, `transcript/transcript.md`, `transcript/metadata.json` | Timestamped speech segments plus method/provenance metadata. |
-| diarize | audio + transcript | `transcript/diarization.json` | Optional speaker structure. |
-| visual | video | `visual/frames/`, `visual/slides.json` | Frame sampling, OCR, and visual descriptions. |
-| enrich | transcript + visuals | `refs/references.json` | Extracted names, titles, URLs, and identifiers. |
-| situate | transcript + references | contextual notes for synthesis | Positions the source in relation to resolved references and prior bundle context. |
-| synthesize | bundle artifacts | `analysis/summary.md`, `analysis/claims.md`, `analysis/questions.md` | Timestamp-grounded analysis. |
+The `Status` column separates the stages the current preview runs from the ones
+this document plans but does not yet implement.
+
+| Stage | Status | Input | Output | Notes |
+| --- | --- | --- | --- | --- |
+| acquire | implemented | source reference | `media/`, `source.json` | Source metadata and media capture. |
+| normalize | implemented | media | `media/audio.wav` | Local ffmpeg normalization. |
+| transcribe | implemented | audio | `transcript/segments.json`, `transcript/transcript.md`, `transcript/metadata.json` | Timestamped speech segments plus method/provenance metadata. |
+| diarize | planned, not implemented | audio + transcript | `transcript/diarization.json` | Optional speaker structure. |
+| visual | planned, not implemented | video | `visual/frames/`, `visual/slides.json` | Frame sampling, OCR, and visual descriptions. |
+| enrich | planned, not implemented | transcript + visuals | `refs/references.json` | Extracted names, titles, URLs, and identifiers. |
+| situate | planned, not implemented | transcript + references | contextual notes for synthesis | Positions the source in relation to resolved references and prior bundle context. |
+| synthesize | partially implemented | bundle artifacts | `analysis/summary.md` (implemented); `analysis/claims.md`, `analysis/questions.md` (planned) | Timestamp-grounded analysis. The current summary is extractive, not a faithfulness claim. |
+
+The bundle layout below shows the full planned layout, including the paths the
+unimplemented stages would write; the current preview produces only the
+artifacts of the implemented stages.
 
 ## Bundle Layout
 
