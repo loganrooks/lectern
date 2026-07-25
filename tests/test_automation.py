@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -270,8 +271,9 @@ def test_retried_completed_queue_ingest_returns_existing_bundle(tmp_path: Path) 
         approved = state.approve_queue_item(queue_item.id)
         first = state.ingest_queue_item(approved.id, output_root)
 
-        retried = state.retry_queue_item(approved.id)
-        reapproved = state.approve_queue_item(retried.id)
+        # Re-approval, not retry: retry from COMPLETED is illegal under the queue
+        # FSM table pinned by the RM remediation design, decision 1.
+        reapproved = state.approve_queue_item(approved.id)
         second = state.ingest_queue_item(reapproved.id, output_root)
         completed = state.get_queue_item(reapproved.id)
 
@@ -349,8 +351,9 @@ def test_retried_command_queue_ingest_same_output_returns_existing_bundle(
         approved = state.approve_queue_item(queue_item.id)
         first = state.ingest_queue_item(approved.id, output_root, transcriber_command=command)
 
-        retried = state.retry_queue_item(approved.id)
-        reapproved = state.approve_queue_item(retried.id)
+        # Re-approval, not retry: retry from COMPLETED is illegal under the queue
+        # FSM table pinned by the RM remediation design, decision 1.
+        reapproved = state.approve_queue_item(approved.id)
         second = state.ingest_queue_item(
             reapproved.id,
             output_root,
@@ -675,7 +678,7 @@ def test_queue_ingest_rejects_existing_unindexed_bundle_directory(tmp_path: Path
     assert failed.state is QueueState.FAILED
 
 
-def test_queue_skip_and_retry_are_inspectable(tmp_path: Path) -> None:
+def test_queue_skip_and_reapproval_are_inspectable(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     copy_fixture(source_dir)
 
@@ -683,10 +686,15 @@ def test_queue_skip_and_retry_are_inspectable(tmp_path: Path) -> None:
         source = state.add_local_folder_source("talks", source_dir)
         queue_item = state.scan_source(source.id).queued[0]
         skipped = state.skip_queue_item(queue_item.id)
-        retried = state.retry_queue_item(queue_item.id)
+        # Retry no longer reopens a skipped item: under the FSM table pinned by
+        # the RM remediation design, decision 1 retry is legal from
+        # FAILED only, and approve is the verb that un-skips.
+        with pytest.raises(AutomationError, match="retry is only legal from state failed"):
+            state.retry_queue_item(queue_item.id)
+        approved = state.approve_queue_item(queue_item.id)
 
     assert skipped.state is QueueState.SKIPPED
-    assert retried.state is QueueState.DISCOVERED
+    assert approved.state is QueueState.APPROVED
 
 
 def test_local_folder_scan_does_not_open_network_socket(
@@ -1303,3 +1311,143 @@ def test_queue_same_command_rerun_into_new_root_provenance_failure_restores_comp
     assert first.bundle_dir.is_dir()
     assert not (second_root / first.bundle_dir.name).exists()
     assert Path(library.bundle_path) == first.bundle_dir
+
+
+# --- Queue FSM legal-transition matrix -------------------------------------
+#
+# The legal-source table is pinned by the RM remediation design
+# decision 1: approve and skip stay legal from every non-terminal state, retry
+# is legal from FAILED only, and UNSUPPORTED remains terminal for all verbs.
+
+QUEUE_VERBS = ("approve", "skip", "retry")
+
+EXPECTED_LEGAL_SOURCES: dict[str, frozenset[QueueState]] = {
+    "approve": frozenset(
+        {
+            QueueState.DISCOVERED,
+            QueueState.APPROVED,
+            QueueState.SKIPPED,
+            QueueState.FAILED,
+            QueueState.COMPLETED,
+        }
+    ),
+    "skip": frozenset(
+        {
+            QueueState.DISCOVERED,
+            QueueState.APPROVED,
+            QueueState.SKIPPED,
+            QueueState.FAILED,
+            QueueState.COMPLETED,
+        }
+    ),
+    "retry": frozenset({QueueState.FAILED}),
+}
+
+VERB_TARGETS: dict[str, QueueState] = {
+    "approve": QueueState.APPROVED,
+    "skip": QueueState.SKIPPED,
+    "retry": QueueState.DISCOVERED,
+}
+
+
+def _force_queue_state(
+    state: automation.AutomationState,
+    queue_item_id: str,
+    target: QueueState,
+) -> None:
+    """Park a queue item in `target` without going through a guarded verb."""
+
+    connection = getattr(state, "_connection")  # noqa: B009
+    connection.execute(
+        "UPDATE queue_items SET state = ? WHERE id = ?",
+        (target.value, queue_item_id),
+    )
+    connection.commit()
+
+
+def _queued_item_id(state: automation.AutomationState, source_dir: Path) -> str:
+    source = state.add_local_folder_source("talks", source_dir)
+    return state.scan_source(source.id).queued[0].id
+
+
+@pytest.mark.parametrize("verb", QUEUE_VERBS)
+@pytest.mark.parametrize("source_state", list(QueueState))
+def test_queue_transition_matrix(tmp_path: Path, verb: str, source_state: QueueState) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        queue_item_id = _queued_item_id(state, source_dir)
+        _force_queue_state(state, queue_item_id, source_state)
+        transition = getattr(state, f"{verb}_queue_item")
+
+        if source_state in EXPECTED_LEGAL_SOURCES[verb]:
+            item = transition(queue_item_id)
+            assert item.state is VERB_TARGETS[verb]
+            assert state.get_queue_item(queue_item_id).state is VERB_TARGETS[verb]
+        else:
+            with pytest.raises(AutomationError):
+                transition(queue_item_id)
+            assert state.get_queue_item(queue_item_id).state is source_state
+
+
+@pytest.mark.parametrize(
+    "source_state",
+    [QueueState.DISCOVERED, QueueState.APPROVED, QueueState.SKIPPED, QueueState.COMPLETED],
+)
+def test_retry_from_non_failed_state_is_rejected(tmp_path: Path, source_state: QueueState) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        queue_item_id = _queued_item_id(state, source_dir)
+        _force_queue_state(state, queue_item_id, source_state)
+
+        with pytest.raises(AutomationError, match="retry is only legal from state failed"):
+            state.retry_queue_item(queue_item_id)
+
+        assert state.get_queue_item(queue_item_id).state is source_state
+
+
+@pytest.mark.parametrize("verb", QUEUE_VERBS)
+def test_terminal_state_rejection_message_is_unchanged(tmp_path: Path, verb: str) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        queue_item_id = _queued_item_id(state, source_dir)
+        _force_queue_state(state, queue_item_id, QueueState.UNSUPPORTED)
+
+        with pytest.raises(
+            AutomationError,
+            match=f"terminal state unsupported; {verb} is not a legal transition",
+        ):
+            getattr(state, f"{verb}_queue_item")(queue_item_id)
+
+
+def test_illegal_retry_leaves_no_open_write_transaction(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    copy_fixture(source_dir)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        queue_item_id = _queued_item_id(state, source_dir)
+        _force_queue_state(state, queue_item_id, QueueState.COMPLETED)
+
+        # Force the guarded zero-row UPDATE to run by hiding the true state from
+        # the pre-check, as a concurrent writer would.
+        real_get = automation.AutomationState.get_queue_item
+        stale = [replace(real_get(state, queue_item_id), state=QueueState.FAILED)]
+
+        def stale_get(self: automation.AutomationState, item_id: str) -> automation.QueueItem:
+            if stale:
+                return stale.pop(0)
+            return real_get(self, item_id)
+
+        with MonkeyPatch.context() as patch:
+            patch.setattr(automation.AutomationState, "get_queue_item", stale_get)
+            with pytest.raises(AutomationError, match="retry is only legal from state failed"):
+                state.retry_queue_item(queue_item_id)
+
+        connection = getattr(state, "_connection")  # noqa: B009
+        assert connection.in_transaction is False
+        assert state.get_queue_item(queue_item_id).state is QueueState.COMPLETED

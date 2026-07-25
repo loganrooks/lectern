@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from lectern import __version__
+from lectern.automation import STATE_SCHEMA_VERSION
 from lectern.bundle import SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,3 +25,12 @@ def test_public_docs_track_package_and_manifest_versions() -> None:
     assert f"The current manifest schema version is `{SCHEMA_VERSION}`." in changelog
     assert f"The current package version is `{__version__}`." in support
     assert f"The current manifest schema version is `{SCHEMA_VERSION}`." in support
+
+
+def test_support_tracks_automation_state_schema_version() -> None:
+    support = normalized(read_doc("SUPPORT.md"))
+
+    # SUPPORT.md documents the state schema version as a third versioned surface;
+    # this assertion is what keeps the documented number from drifting away from
+    # the code (the RM remediation design, decision 5).
+    assert f"The current automation state schema version is `{STATE_SCHEMA_VERSION}`." in support

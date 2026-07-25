@@ -9,22 +9,46 @@ branch and the current documented preview workflow.
 - `uv` for environment and command execution.
 - `ffmpeg` for media normalization and `lectern doctor`.
 - macOS and Linux are expected development targets. CI currently runs the
-  verification matrix on `ubuntu-latest` and `macos-latest` with Python 3.12.
+  verification matrix on `ubuntu-latest` and `macos-latest` across Python 3.12,
+  3.13, and 3.14.
 
 ## Version Policy
 
-The package version and bundle manifest schema version are separate.
+The package version, the bundle manifest schema version, and the local
+automation state schema version are separate.
 
 - The package version describes the installed Lectern software.
 - The manifest `schema_version` describes the bundle manifest contract.
+- The automation state schema version describes the layout of the local SQLite
+  automation store (sources, discovery queue, and library index).
 
 The current package version is `0.0.1`. The current manifest schema version is
-`0.1.0`.
+`0.1.0`. The current automation state schema version is `2`.
 
 Before a stable release, CLI flags and command output may change. Bundle schema
 changes are treated more carefully: additive bundle manifest changes should
 raise the manifest schema minor version, and breaking changes require a major
 schema version plus migration notes.
+
+### Automation State Schema
+
+The automation state schema version is recorded in the store's SQLite
+`user_version` and reported by `lectern` as `state_schema_version` in bundle
+provenance. It is an internal storage contract, not part of the bundle
+contract, and it moves independently of the package and manifest versions.
+
+Current behavior when a store's version differs from the running code's:
+
+- A store at version 1 is migrated forward to the current version on open. The
+  pre-migration file is copied aside as `<state-file-name>.v1.bak` first, so the
+  original bytes survive a failed or interrupted upgrade.
+- An empty or uninitialized store is created at the current version.
+- A store written by a newer version than the running code supports is refused
+  with an error naming both versions; Lectern does not open it and does not
+  attempt to downgrade it.
+
+This section describes what the current preview does. It is not a
+forward-compatibility guarantee.
 
 ## Security Fixes
 

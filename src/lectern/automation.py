@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NoReturn, Protocol, Self, cast, runtime_checkable
 
 from lectern.bundle import MANIFEST_NAME, ArtifactRef, Manifest, StageName, atomic_write_text
@@ -97,6 +98,33 @@ class QueueState(StrEnum):
 TERMINAL_QUEUE_STATES = frozenset({QueueState.UNSUPPORTED})
 # Stable ordering so the guarded-UPDATE placeholders bind the same values every run.
 TERMINAL_QUEUE_STATE_VALUES = tuple(sorted(state.value for state in TERMINAL_QUEUE_STATES))
+
+# The queue FSM, as an explicit table: for each user verb, the states an item may
+# legally be transitioned *from*. Every guarded verb checks this table, so the
+# legality of a transition can be read here rather than inferred from call sites.
+#
+# - `approve` and `skip` stay legal from every non-terminal state; re-approving a
+#   COMPLETED item is what the rerun/replay/restore path depends on.
+# - `retry` is legal from FAILED only. Retry exists to re-arm a failed attempt;
+#   from COMPLETED it would silently discard a finished bundle's queue linkage,
+#   and from DISCOVERED/APPROVED/SKIPPED it is a no-op dressed as a state change.
+# - UNSUPPORTED appears in no set, so terminal items refuse every verb.
+LEGAL_QUEUE_TRANSITION_SOURCES: Mapping[str, frozenset[QueueState]] = MappingProxyType(
+    {
+        "approve": frozenset(QueueState) - TERMINAL_QUEUE_STATES,
+        "skip": frozenset(QueueState) - TERMINAL_QUEUE_STATES,
+        "retry": frozenset({QueueState.FAILED}),
+    }
+)
+
+# Stable ordering, as above, so each verb's guarded-UPDATE placeholders bind the
+# same values every run.
+LEGAL_QUEUE_TRANSITION_SOURCE_VALUES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        action: tuple(sorted(state.value for state in states))
+        for action, states in LEGAL_QUEUE_TRANSITION_SOURCES.items()
+    }
+)
 
 # Keys attach_provenance_to_bundle writes into source.json["provenance"]; a
 # completed bundle missing any of them predates a finished provenance attach.
@@ -795,46 +823,59 @@ class AutomationState:
         return _queue_from_row(row)
 
     def approve_queue_item(self, queue_item_id: str) -> QueueItem:
-        self._reject_terminal_transition(queue_item_id, "approve")
+        self._reject_illegal_transition(queue_item_id, "approve")
         return self._set_queue_state(
             queue_item_id, QueueState.APPROVED, clear_error=True, guarded_action="approve"
         )
 
     def skip_queue_item(self, queue_item_id: str) -> QueueItem:
-        self._reject_terminal_transition(queue_item_id, "skip")
+        self._reject_illegal_transition(queue_item_id, "skip")
         return self._set_queue_state(
             queue_item_id, QueueState.SKIPPED, clear_error=True, guarded_action="skip"
         )
 
     def retry_queue_item(self, queue_item_id: str) -> QueueItem:
-        self._reject_terminal_transition(queue_item_id, "retry")
+        self._reject_illegal_transition(queue_item_id, "retry")
         return self._set_queue_state(
             queue_item_id, QueueState.DISCOVERED, clear_error=True, guarded_action="retry"
         )
 
-    def _reject_terminal_transition(self, queue_item_id: str, action: str) -> None:
+    def _reject_illegal_transition(self, queue_item_id: str, action: str) -> None:
+        """Refuse a verb the FSM table does not allow out of the item's current state.
+
+        Terminal states keep their own wording; other illegal sources name the verb
+        and the states it is legal from. The item is read exactly once, so a caller
+        racing a concurrent writer decides against a single observed row.
+        """
+
         queue_item = self.get_queue_item(queue_item_id)
         if queue_item.state in TERMINAL_QUEUE_STATES:
             raise AutomationError(
                 f"queue item {queue_item.id} is in terminal state "
                 f"{queue_item.state.value}; {action} is not a legal transition"
             )
+        if queue_item.state not in LEGAL_QUEUE_TRANSITION_SOURCES[action]:
+            raise AutomationError(
+                f"queue item {queue_item.id} is in state {queue_item.state.value}; "
+                f"{action} is only legal from state "
+                f"{_join_states(LEGAL_QUEUE_TRANSITION_SOURCE_VALUES[action])}"
+            )
 
     def _reject_guarded_transition_conflict(self, queue_item_id: str, action: str) -> NoReturn:
         """Explain a guarded update that matched no row, from the row as it stands now.
 
         The pre-check read and the update are separate statements, so another writer
-        can move the item into a terminal state in between; the update's own terminal
-        guard is what refuses that, and this re-read turns the empty result into the
-        same error the pre-check would have raised.
+        can move the item into a state the verb is illegal from in between; the
+        update's own FSM guard is what refuses that, and this re-read turns the empty
+        result into the same error the pre-check would have raised.
         """
 
         # The zero-row UPDATE still opened an implicit write transaction; release
         # it before raising so a caller that catches the expected rejection does
         # not leave the connection holding a write lock.
         self._connection.rollback()
+        self._reject_illegal_transition(queue_item_id, action)
         queue_item = self.get_queue_item(queue_item_id)
-        self._reject_terminal_transition(queue_item_id, action)
         raise AutomationError(f"queue item {queue_item.id} could not be transitioned by {action}")
 
     def ingest_queue_item(
@@ -1376,14 +1417,14 @@ class AutomationState:
     ) -> QueueItem:
         """Stage a queue-state transition without committing; the caller commits.
 
-        `guarded_action` names a user verb whose transition is illegal out of a
-        terminal state. The guard lives in the UPDATE's WHERE clause so the check and
-        the write are one statement: a read-then-write pair lets a concurrent writer
-        slip a terminal state in between and have it overwritten.
+        `guarded_action` names a user verb whose legal source states the FSM table
+        pins. The guard lives in the UPDATE's WHERE clause so the check and the write
+        are one statement: a read-then-write pair lets a concurrent writer slip an
+        illegal source state in between and have it overwritten.
         """
 
         existing = self.get_queue_item(queue_item_id)
-        terminal_guard = ""
+        fsm_guard = ""
         parameters: list[object] = [
             state.value,
             bundle_id,
@@ -1392,16 +1433,17 @@ class AutomationState:
             existing.id,
         ]
         if guarded_action is not None:
-            placeholders = ", ".join("?" for _ in TERMINAL_QUEUE_STATE_VALUES)
-            terminal_guard = f" AND state NOT IN ({placeholders})"
-            parameters.extend(TERMINAL_QUEUE_STATE_VALUES)
+            legal_sources = LEGAL_QUEUE_TRANSITION_SOURCE_VALUES[guarded_action]
+            placeholders = ", ".join("?" for _ in legal_sources)
+            fsm_guard = f" AND state IN ({placeholders})"
+            parameters.extend(legal_sources)
         cursor = self._connection.execute(
             f"""
             UPDATE queue_items
             SET state = ?, bundle_id = COALESCE(?, bundle_id),
                 last_error = CASE WHEN ? THEN NULL ELSE last_error END,
                 updated_at = ?
-            WHERE id = ?{terminal_guard}
+            WHERE id = ?{fsm_guard}
             """,
             parameters,
         )
@@ -2352,6 +2394,16 @@ def _bundle_exists_error_matches(exc: IngestError, bundle_id: str) -> bool:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _join_states(values: Sequence[str]) -> str:
+    """Render a legal-source set for an error message: `failed`, `a or b`, `a, b, or c`."""
+
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} or {values[1]}"
+    return f"{', '.join(values[:-1])}, or {values[-1]}"
 
 
 def _digest_and_size(path: Path) -> tuple[str, int]:

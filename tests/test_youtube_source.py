@@ -458,7 +458,10 @@ def test_terminal_guard_holds_when_precheck_reads_a_stale_state(
         queue_item = real_get_queue_item(self, queue_item_id)
         if stale_reads[0] > 0:
             stale_reads[0] -= 1
-            return replace(queue_item, state=QueueState.DISCOVERED)
+            # FAILED is a legal source for approve, skip, and retry alike under the
+            # FSM table pinned by the RM remediation design, decision 1,
+            # so every verb clears its pre-check and reaches the guarded UPDATE.
+            return replace(queue_item, state=QueueState.FAILED)
         return queue_item
 
     with open_state(tmp_path / "state.sqlite") as state:
@@ -1631,7 +1634,11 @@ def test_rejected_guarded_transition_rolls_back_write_transaction(
         # Force the guarded zero-row UPDATE to execute by making the pre-check
         # read a stale nonterminal state, as a concurrent process would.
         real_get = automation.AutomationState.get_queue_item
-        stale_reads = [approved]
+        # FAILED, not APPROVED: retry's pre-check would otherwise refuse the stale
+        # row outright and never run the guarded UPDATE this test is about (retry
+        # is legal from FAILED only — the RM remediation
+        # design, decision 1).
+        stale_reads = [replace(approved, state=QueueState.FAILED)]
 
         def stale_get(self: automation.AutomationState, queue_item_id: str) -> automation.QueueItem:
             if stale_reads:
