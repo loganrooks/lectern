@@ -1644,7 +1644,8 @@ def test_rejected_guarded_transition_rolls_back_write_transaction(
         monkeypatch.setattr(automation.AutomationState, "get_queue_item", real_get)
         # The zero-row guarded UPDATE must not leave the connection holding an
         # open write transaction after the expected rejection is caught.
-        assert state._connection.in_transaction is False  # noqa: SLF001
+        connection = getattr(state, "_connection")  # noqa: B009
+        assert connection.in_transaction is False
 
 
 def test_unsupported_write_does_not_clobber_concurrent_skip(
@@ -1672,11 +1673,7 @@ def test_unsupported_write_does_not_clobber_concurrent_skip(
 
         # A concurrent operator skip commits between this process's approved
         # read and its terminal write.
-        state._connection.execute(  # noqa: SLF001
-            "UPDATE queue_items SET state = ? WHERE id = ?",
-            (QueueState.SKIPPED.value, approved.id),
-        )
-        state._connection.commit()  # noqa: SLF001
+        state.skip_queue_item(approved.id)
         monkeypatch.setattr(automation.AutomationState, "get_queue_item", stale_get)
 
         with pytest.raises(AutomationError, match=YOUTUBE_METADATA_ONLY_ERROR):
