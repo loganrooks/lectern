@@ -1,0 +1,128 @@
+"""Structural pins for the automation package's layering.
+
+These assert boundaries rather than behavior. They exist because the costs the
+layering buys — a state store that carries no transport, an import surface
+consumers can rely on, and an ingest pipeline that sits above the store rather
+than inside it — are all invisible to a behavioral suite, and so are exactly the
+kind of property a later change can dissolve without any test noticing.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+from pathlib import Path
+
+from lectern import automation, provenance, records, state
+from lectern.sources import local, youtube
+
+PACKAGE = Path(automation.__file__).parent
+
+
+def module_source(module: object) -> str:
+    return Path(inspect.getfile(module)).read_text(encoding="utf-8")  # type: ignore[arg-type]
+
+
+def imported_modules(module: object) -> set[str]:
+    tree = ast.parse(module_source(module))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+            names.add(node.module)
+    return names
+
+
+def defined_classes(module: object) -> set[str]:
+    tree = ast.parse(module_source(module))
+    return {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+
+
+def test_records_is_a_leaf_of_the_package() -> None:
+    # Everything else in the spine depends on the vocabulary, so the vocabulary
+    # may depend on nothing here: that is what keeps the graph acyclic and lets
+    # the store, the adapters, and the provenance writer stay independent.
+    assert {name for name in imported_modules(records) if name.startswith("lectern")} == set()
+
+
+def test_state_store_carries_no_transport_and_defines_no_adapter() -> None:
+    source = module_source(state)
+
+    # The finding this slice answers was a Google HTTP client living in the same
+    # module as the SQLite store. Absence of the import is the checkable form.
+    assert "urllib" not in source
+    assert not [name for name in defined_classes(state) if name.endswith("Adapter")]
+
+
+def test_only_the_youtube_module_opens_the_network() -> None:
+    modules_with_transport = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "urllib.request" in path.read_text(encoding="utf-8")
+    }
+
+    assert modules_with_transport == {"sources/youtube.py"}
+
+
+def test_orchestration_sits_above_the_store() -> None:
+    assert issubclass(automation.AutomationState, state.AutomationStateStore)
+
+    # The pipeline is defined in the composition root, not in the store: this is
+    # what makes `attach_provenance_to_bundle` resolvable through
+    # `lectern.automation`'s globals, which the ingest-rollback tests rely on.
+    assert automation.AutomationState.ingest_queue_item.__module__ == "lectern.automation"
+    assert automation.AutomationState.ingest_one_shot.__module__ == "lectern.automation"
+    assert state.AutomationStateStore.scan_source.__module__ == "lectern.state"
+
+    assert "attach_provenance_to_bundle" in vars(automation)
+    assert automation.attach_provenance_to_bundle is provenance.attach_provenance_to_bundle
+
+
+# Every name a consumer imported from `lectern.automation` before the package
+# split. `cli.py` and the existing tests import from this module and are not
+# adjusted for the new layout, so narrowing this surface is a consumer break
+# even when the suite stays green.
+CONSUMED_NAMES = (
+    "AutomationError",
+    "AutomationState",
+    "DEFAULT_STATE_PATH",
+    "DEFAULT_YOUTUBE_API_KEY_ENV",
+    "QueueItem",
+    "QueueState",
+    "STATE_SCHEMA_VERSION",
+    "SourceKind",
+    "SourcePolicy",
+    "SourceRecord",
+    "YOUTUBE_METADATA_ONLY_ERROR",
+    "YouTubeAPIError",
+    "YouTubePlaylistAdapter",
+    "attach_provenance_to_bundle",
+    "normalize_youtube_playlist_id",
+    "open_state",
+    "preflight_local_folder",
+    "preflight_state_store",
+    "preflight_youtube_playlist",
+)
+
+
+def test_automation_remains_the_single_import_surface() -> None:
+    missing = [name for name in CONSUMED_NAMES if not hasattr(automation, name)]
+    assert missing == []
+    assert set(CONSUMED_NAMES) <= set(automation.__all__)
+
+
+def test_every_split_module_is_reachable_through_the_facade() -> None:
+    # A name that lives in a part module but is absent from the facade is a name
+    # a consumer would have to learn the new layout to reach.
+    for module in (records, state, local, youtube, provenance):
+        exported = {
+            name
+            for name in vars(module)
+            if not name.startswith("_") and name in getattr(module, "__all__", vars(module))
+        }
+        reachable = {name for name in exported if hasattr(automation, name)}
+        # Only the names the facade deliberately publishes need to be reachable;
+        # this asserts the facade is not empty for any part, which is the
+        # failure mode worth catching.
+        assert reachable, f"{module.__name__} contributes nothing to the facade"
