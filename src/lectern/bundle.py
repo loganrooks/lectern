@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 SCHEMA_VERSION = "0.1.0"
 
@@ -202,6 +202,13 @@ class ContentIdentity(BaseModel):
     sha256: str
     bytes: int | None = None
 
+    # Unknown keys are REJECTED here, and the exported schema says so. Pydantic
+    # ignores extras by default, which meant `{"sha256": ..., "path": "/Users/..."}`
+    # validated cleanly and the committed schema admitted it -- so the privacy
+    # boundary this model exists to state was advisory. Asserting that `path` is
+    # not declared was never the same as asserting it is refused.
+    model_config = {"extra": "forbid"}
+
 
 class SourceDocument(BaseModel):
     """`source.json`."""
@@ -266,10 +273,22 @@ class TranscriptMetadataDocument(BaseModel):
 # Every artifact type Lectern writes as JSON, and the model that describes it.
 # Enumerated in one place so "every written artifact type has a schema" is a
 # statement a test can check rather than a claim someone has to audit by hand.
+class TranscriptSegmentsDocument(RootModel[list[TranscriptSegmentRecord]]):
+    """`transcript/segments.json`, which is written as an ARRAY.
+
+    Exporting the element model gave the committed schema an object root, so
+    validating a real artifact against it failed immediately. A round-trip test
+    over elements cannot catch that: it exercises the model and never the
+    artifact.
+    """
+
+    root: list[TranscriptSegmentRecord]
+
+
 ARTIFACT_MODELS: dict[str, type[BaseModel]] = {
     "manifest": Manifest,
     "source": SourceDocument,
-    "transcript-segment": TranscriptSegmentRecord,
+    "transcript-segments": TranscriptSegmentsDocument,
     "transcript-metadata": TranscriptMetadataDocument,
 }
 

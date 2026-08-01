@@ -96,7 +96,14 @@ LEGAL_QUEUE_TRANSITION_SOURCE_VALUES: Mapping[str, tuple[str, ...]] = MappingPro
 )
 
 
-_ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?:[^\s'\"<>|]*[^\s'\"<>|.,;:])?")
+# Paths in error text routinely contain spaces, and stopping at whitespace
+# redacts only the first component: `/tmp/Private Therapy/session.wav` became
+# `<path> Therapy/session.wav`, still naming the directory and the file. The
+# terminator is therefore a quote or end-of-string when the path is quoted --
+# which is how OSError renders it -- and whitespace only as a fallback for
+# unquoted paths.
+_QUOTED_ABSOLUTE_PATH = re.compile(r"(?<=')/[^']*(?=')|(?<=\")/[^\"]*(?=\")")
+_BARE_ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?:[^\s'\"<>|]*[^\s'\"<>|.,;:])?")
 
 PATH_REDACTED = "<path>"
 
@@ -116,7 +123,7 @@ def redact_paths(text: str) -> str:
     name discloses as much as the home directory does.
     """
 
-    return _ABSOLUTE_PATH.sub(PATH_REDACTED, text)
+    return _BARE_ABSOLUTE_PATH.sub(PATH_REDACTED, _QUOTED_ABSOLUTE_PATH.sub(PATH_REDACTED, text))
 
 
 @dataclass(frozen=True)

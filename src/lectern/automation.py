@@ -688,6 +688,12 @@ class AutomationState(AutomationStateStore):
                 "DELETE FROM library_bundles WHERE bundle_id = ? AND queue_item_id = ?",
                 (bundle_id, queue_item_id),
             )
+            # The index rows go with the library row. Without this the bundle
+            # directory is deleted, its registration is gone, and its segments
+            # stay searchable -- so a hit resolves to a bundle that cannot be
+            # shown or cited. The atomicity test covered the commit path and
+            # never this one.
+            self._delete_index_rows(bundle_id)
         elif library_record.previous is not None:
             # The row was updated onto the bundle that has just been deleted; the
             # earlier bundle survives on disk, so the library must point back at it.

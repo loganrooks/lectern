@@ -152,8 +152,10 @@ class AnchorResolution(StrEnum):
 
     EXACT = "exact"
     RELOCATED = "relocated"
+    AMBIGUOUS = "ambiguous"
     MODIFIED = "modified"
     MISSING = "missing"
+    UNSUPPORTED_VERSION = "unsupported-version"
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,14 @@ def resolve_against_segments(anchor: Anchor, segments: list[dict[str, Any]]) -> 
     confident wrong answer rather than a cautious one.
     """
 
+    if anchor.canon_version != CANON_VERSION:
+        # The version is recorded precisely so it can be consulted. Comparing a
+        # digest taken under one rule against text canonicalized by another
+        # reports unchanged words as modified, which is the failure the field
+        # exists to prevent -- so an unsupported version is refused rather than
+        # answered wrongly.
+        return ResolvedAnchor(outcome=AnchorResolution.UNSUPPORTED_VERSION)
+
     by_id: dict[int, dict[str, Any]] = {}
     for segment in segments:
         identifier = segment.get("id")
@@ -249,14 +259,38 @@ def resolve_against_segments(anchor: Anchor, segments: list[dict[str, Any]]) -> 
             current_text=str(at_index.get("text", "")),
         )
 
-    for segment_id, segment in sorted(by_id.items()):
-        if text_digest(str(segment.get("text", ""))) == anchor.text_sha256:
-            return ResolvedAnchor(
-                outcome=AnchorResolution.RELOCATED,
-                segment_id=segment_id,
-                start_s=_as_float(segment.get("start_s")),
-                current_text=str(segment.get("text", "")),
-            )
+    # Every digest match, not the first. A repeated phrase -- "Thank you", a
+    # recurring refrain -- otherwise redirects the citation to a different
+    # occurrence and calls it `relocated`, which is a wrong answer wearing a
+    # confident label. Fixing "fails when it should resolve" is no improvement if
+    # it introduces "resolves to the wrong thing".
+    matches = [
+        (segment_id, segment)
+        for segment_id, segment in sorted(by_id.items())
+        if text_digest(str(segment.get("text", ""))) == anchor.text_sha256
+    ]
+    if len(matches) == 1:
+        segment_id, segment = matches[0]
+        return ResolvedAnchor(
+            outcome=AnchorResolution.RELOCATED,
+            segment_id=segment_id,
+            start_s=_as_float(segment.get("start_s")),
+            current_text=str(segment.get("text", "")),
+        )
+    if len(matches) > 1:
+        # Nearest by timestamp is the best available disambiguation, and it is
+        # reported as ambiguous rather than relocated so a consumer can decide
+        # whether that guess is good enough for its purpose.
+        segment_id, segment = min(
+            matches,
+            key=lambda item: abs((_as_float(item[1].get("start_s")) or 0.0) - anchor.start_s),
+        )
+        return ResolvedAnchor(
+            outcome=AnchorResolution.AMBIGUOUS,
+            segment_id=segment_id,
+            start_s=_as_float(segment.get("start_s")),
+            current_text=str(segment.get("text", "")),
+        )
 
     if at_index is not None:
         return ResolvedAnchor(
@@ -341,6 +375,26 @@ def sample_segment_timings(
                     bundle_id=bundle_id,
                     segment_id=located,
                     detail=f"start_s {start} exceeds duration {duration_s}",
+                )
+            )
+
+        end = _as_float(segment.get("end_s"))
+        if end is not None and duration_s is not None and end > duration_s + DURATION_TOLERANCE_S:
+            issues.append(
+                SamplerIssue(
+                    kind=AnchorIssue.OUT_OF_BOUNDS,
+                    bundle_id=bundle_id,
+                    segment_id=located,
+                    detail=f"end_s {end} exceeds duration {duration_s}",
+                )
+            )
+        if end is not None and end < start:
+            issues.append(
+                SamplerIssue(
+                    kind=AnchorIssue.OUT_OF_ORDER,
+                    bundle_id=bundle_id,
+                    segment_id=located,
+                    detail=f"end_s {end} precedes start_s {start}",
                 )
             )
 

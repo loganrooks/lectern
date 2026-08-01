@@ -54,7 +54,11 @@ def test_sampler_rejects_a_timestamp_past_the_recording(tmp_path: Path) -> None:
     _write_segments(bundle, [{"id": 0, "start_s": 3600.0, "end_s": 3601.0, "text": "impossible"}])
     with open_state(state_path) as state:
         issues = state.sample_anchor_correctness()
-    assert [issue.kind for issue in issues] == [AnchorIssue.OUT_OF_BOUNDS]
+    # Membership rather than an exact list: the same segment can be out of
+    # bounds at both ends, and asserting one issue would pin the sampler to
+    # reporting less than it finds.
+    assert {issue.kind for issue in issues} == {AnchorIssue.OUT_OF_BOUNDS}
+    assert issues
 
 
 def test_sampler_rejects_disordered_segments(tmp_path: Path) -> None:

@@ -470,13 +470,14 @@ class AutomationStateStore:
 
         self._connection.executescript(
             """
-            CREATE VIRTUAL TABLE segment_index USING fts5(
+            CREATE VIRTUAL TABLE IF NOT EXISTS segment_index USING fts5(
                 bundle_id UNINDEXED,
                 segment_id UNINDEXED,
+                display UNINDEXED,
                 body
             );
 
-            CREATE TABLE index_signature (
+            CREATE TABLE IF NOT EXISTS index_signature (
                 canon_version INTEGER NOT NULL,
                 segmenter_version INTEGER NOT NULL
             );
@@ -556,7 +557,7 @@ class AutomationStateStore:
         # cast would state the assumption as a fact the type checker then stops
         # questioning. A malformed segment is skipped, and the reconciliation
         # query is what keeps the skip visible.
-        rows: list[tuple[str, object, str]] = []
+        rows: list[tuple[str, object, str, str]] = []
         for segment in cast(list[Any], segments):
             if not isinstance(segment, dict):
                 continue
@@ -564,9 +565,14 @@ class AutomationStateStore:
             text = entry.get("text")
             if not text:
                 continue
-            rows.append((bundle_id, entry.get("id"), segment_text(str(text))))
+            # `display` is the text as written; `body` is the segmented form the
+            # tokenizer needs. Returning `body` to a caller printed CJK with a
+            # space between every character and whole transcripts for text-only
+            # bundles -- an internal representation escaping as a user-facing one.
+            rows.append((bundle_id, entry.get("id"), str(text), segment_text(str(text))))
         self._connection.executemany(
-            "INSERT INTO segment_index(bundle_id, segment_id, body) VALUES (?, ?, ?)", rows
+            "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
+            rows,
         )
         return len(rows)
 
@@ -586,7 +592,7 @@ class AutomationStateStore:
         try:
             rows = self._connection.execute(
                 """
-                SELECT bundle_id, segment_id, body FROM segment_index
+                SELECT bundle_id, segment_id, display FROM segment_index
                 WHERE segment_index MATCH ? ORDER BY rank LIMIT ?
                 """,
                 (expression, limit),
@@ -689,8 +695,8 @@ class AutomationStateStore:
         """
 
         self._connection.execute(
-            "INSERT INTO segment_index(bundle_id, segment_id, body) VALUES (?, ?, ?)",
-            (bundle_id, segment_id, segment_text(text)),
+            "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
+            (bundle_id, segment_id, text, segment_text(text)),
         )
         self._connection.commit()
 
@@ -722,6 +728,9 @@ class AutomationStateStore:
             ).fetchall()
         ]
 
+    def _delete_index_rows(self, bundle_id: str) -> None:
+        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
+
     def forget_library_bundle(self, bundle_id: str) -> None:
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
         self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))
@@ -746,7 +755,11 @@ class AutomationStateStore:
                 # tolerate it rather than failing the second process.
                 if "duplicate column name" not in str(exc):
                     raise
-        self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
+        # Persist 2, not the current constant. Symbolically referencing
+        # STATE_SCHEMA_VERSION meant bumping it to 3 made this step claim a
+        # version whose tables it had not created: an interruption between here
+        # and v3 creation left a store that every later open would fail to read.
+        self._connection.execute("PRAGMA user_version = 2")
         self._connection.commit()
 
     def _table_has_column(self, table: str, column: str) -> bool:

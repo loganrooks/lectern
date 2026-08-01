@@ -27,7 +27,7 @@ from lectern.bundle import (
     Manifest,
     SourceDocument,
     TranscriptMetadataDocument,
-    TranscriptSegmentRecord,
+    TranscriptSegmentsDocument,
     export_artifact_schemas,
 )
 
@@ -41,7 +41,7 @@ SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas"
 ARTIFACT_FILES = {
     "manifest.json": "manifest",
     "source.json": "source",
-    "transcript/segments.json": "transcript-segment",
+    "transcript/segments.json": "transcript-segments",
     "transcript/metadata.json": "transcript-metadata",
 }
 
@@ -98,13 +98,13 @@ def test_source_document_round_trips(tmp_path: Path) -> None:
 
 def test_transcript_segments_round_trip(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
-    rows: list[dict[str, Any]] = json.loads(
-        (bundle / "transcript" / "segments.json").read_text(encoding="utf-8")
-    )
-    assert rows
-    for row in rows:
-        segment = TranscriptSegmentRecord.model_validate(row)
-        assert TranscriptSegmentRecord.model_validate_json(segment.model_dump_json()) == segment
+    # Validated as the whole ARTIFACT, not element by element. Round-tripping
+    # elements exercises the model and never the file, so it could not have
+    # noticed that the exported schema declared an object root for an array.
+    raw = (bundle / "transcript" / "segments.json").read_text(encoding="utf-8")
+    document = TranscriptSegmentsDocument.model_validate_json(raw)
+    assert document.root
+    assert TranscriptSegmentsDocument.model_validate_json(document.model_dump_json()) == document
 
 
 def test_transcript_metadata_round_trips(tmp_path: Path) -> None:

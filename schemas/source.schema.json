@@ -1,6 +1,7 @@
 {
   "$defs": {
     "ContentIdentity": {
+      "additionalProperties": false,
       "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
       "properties": {
         "sha256": {
