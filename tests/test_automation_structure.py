@@ -48,11 +48,20 @@ def test_records_is_a_leaf_of_the_package() -> None:
     assert {name for name in imported_modules(records) if name.startswith("lectern")} == set()
 
 
-def test_state_store_carries_no_transport_and_defines_no_adapter() -> None:
+def test_state_store_defines_no_transport_or_adapter_of_its_own() -> None:
+    """What the store's *own source* contains, which is a weaker claim.
+
+    Kept alongside the import test below rather than replaced by it, because the
+    two pin different things: that test measures what loading the store costs,
+    while this one catches an adapter or transport being written directly into
+    the persistence layer — which no `sys.modules` check would notice, since a
+    hand-rolled client here adds no new import edge. On its own this assertion
+    is not enough: it greps for a symptom, and a store that merely *imports* the
+    transport passes it, which is exactly the gap review found.
+    """
+
     source = module_source(state)
 
-    # The finding this slice answers was a Google HTTP client living in the same
-    # module as the SQLite store. Absence of the import is the checkable form.
     assert "urllib" not in source
     assert not [name for name in defined_classes(state) if name.endswith("Adapter")]
 
