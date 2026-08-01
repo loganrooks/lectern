@@ -39,6 +39,7 @@ OUTWARD_COMMANDS = (
     "library list",
     "library show",
     "library search",
+    "library cite",
 )
 
 

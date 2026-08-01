@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import unicodedata
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
 
 CANON_VERSION = 1
 SEGMENTER_VERSION = 1
@@ -134,3 +137,137 @@ def literal_match_expression(query: str) -> str:
     segmented = segment_text(query)
     escaped = segmented.replace('"', '""')
     return f'"{escaped}"'
+
+
+class AnchorResolution(StrEnum):
+    """What became of the thing a citation pointed at.
+
+    Four states, not two. Collapsing them into resolved/unresolved treats an
+    integrity validator as though it were every consumer: a validator should
+    reject changed text, a player should navigate to a relocated segment while
+    disclosing the move, and a correction interface needs both the prior and the
+    current wording. A boolean can express none of that, and its failure mode is
+    to report `missing` for content that is still there.
+    """
+
+    EXACT = "exact"
+    RELOCATED = "relocated"
+    MODIFIED = "modified"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """A citation's durable reference to one moment in one recording.
+
+    `bundle_id` is what makes it injective across an archive rather than within
+    a single transcript -- `segment_id` restarts at zero for every bundle, so an
+    anchor without it names no particular recording once it is stored anywhere
+    outside the response that produced it.
+
+    `start_s` is carried for display and human recognition and is never identity:
+    the rendered `[t=MM:SS]` form truncates to whole seconds, so two segments in
+    the same second render the same string.
+    """
+
+    bundle_id: str
+    segment_id: int
+    start_s: float
+    text_sha256: str
+    canon_version: int
+
+    def rendered(self) -> str:
+        """The human-facing form. What is shown, never what is stored."""
+
+        total = max(0, int(self.start_s))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"[t={hours:d}:{minutes:02d}:{seconds:02d}]"
+        return f"[t={minutes:02d}:{seconds:02d}]"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bundle_id": self.bundle_id,
+            "segment_id": self.segment_id,
+            "start_s": self.start_s,
+            "text_sha256": self.text_sha256,
+            "canon_version": self.canon_version,
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedAnchor:
+    """The answer to "does this citation still point at what it cited?"."""
+
+    outcome: AnchorResolution
+    segment_id: int | None = None
+    start_s: float | None = None
+    current_text: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome.value,
+            "segment_id": self.segment_id,
+            "start_s": self.start_s,
+            "current_text": self.current_text,
+        }
+
+
+def make_anchor(bundle_id: str, segment_id: int, start_s: float, text: str) -> Anchor:
+    return Anchor(
+        bundle_id=bundle_id,
+        segment_id=segment_id,
+        start_s=start_s,
+        text_sha256=text_digest(text),
+        canon_version=CANON_VERSION,
+    )
+
+
+def resolve_against_segments(anchor: Anchor, segments: list[dict[str, Any]]) -> ResolvedAnchor:
+    """Decide which of the four states an anchor is in, given a transcript.
+
+    Order matters. The identity check comes first at the cited index, then a
+    search by digest across the transcript, and only then a report of change or
+    absence -- because a deletion that renumbers a later segment leaves the
+    cited words present and findable, and answering `missing` there would be a
+    confident wrong answer rather than a cautious one.
+    """
+
+    by_id: dict[int, dict[str, Any]] = {}
+    for segment in segments:
+        identifier = segment.get("id")
+        if isinstance(identifier, int):
+            by_id[identifier] = segment
+
+    at_index = by_id.get(anchor.segment_id)
+    if at_index is not None and text_digest(str(at_index.get("text", ""))) == anchor.text_sha256:
+        return ResolvedAnchor(
+            outcome=AnchorResolution.EXACT,
+            segment_id=anchor.segment_id,
+            start_s=_as_float(at_index.get("start_s")),
+            current_text=str(at_index.get("text", "")),
+        )
+
+    for segment_id, segment in sorted(by_id.items()):
+        if text_digest(str(segment.get("text", ""))) == anchor.text_sha256:
+            return ResolvedAnchor(
+                outcome=AnchorResolution.RELOCATED,
+                segment_id=segment_id,
+                start_s=_as_float(segment.get("start_s")),
+                current_text=str(segment.get("text", "")),
+            )
+
+    if at_index is not None:
+        return ResolvedAnchor(
+            outcome=AnchorResolution.MODIFIED,
+            segment_id=anchor.segment_id,
+            start_s=_as_float(at_index.get("start_s")),
+            current_text=str(at_index.get("text", "")),
+        )
+
+    return ResolvedAnchor(outcome=AnchorResolution.MISSING)
+
+
+def _as_float(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None

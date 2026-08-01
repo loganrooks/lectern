@@ -40,7 +40,16 @@ from lectern.records import (
     metadata_to_json,
     now_timestamp,
 )
-from lectern.search import index_signature, literal_match_expression, segment_text
+from lectern.search import (
+    Anchor,
+    AnchorResolution,
+    ResolvedAnchor,
+    index_signature,
+    literal_match_expression,
+    make_anchor,
+    resolve_against_segments,
+    segment_text,
+)
 
 
 class AutomationStateStore:
@@ -580,6 +589,57 @@ class AutomationStateStore:
             )
             for row in rows
         ]
+
+    def _bundle_segments(self, bundle_id: str) -> list[dict[str, Any]] | None:
+        row = self._connection.execute(
+            "SELECT bundle_path FROM library_bundles WHERE bundle_id = ?", (bundle_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = (Path(str(row[0])) / "transcript" / "segments.json").read_text(
+                encoding="utf-8"
+            )
+            segments = json.loads(payload)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(segments, list):
+            return None
+        typed: list[dict[str, Any]] = []
+        for item in cast(list[Any], segments):
+            if isinstance(item, dict):
+                typed.append(cast(dict[str, Any], item))
+        return typed
+
+    def resolve_anchor(self, anchor: Anchor) -> ResolvedAnchor:
+        """Report which of the four states this citation is in."""
+
+        segments = self._bundle_segments(anchor.bundle_id)
+        if segments is None:
+            return ResolvedAnchor(outcome=AnchorResolution.MISSING)
+        return resolve_against_segments(anchor, segments)
+
+    def cite_segment(self, bundle_id: str, segment_id: int) -> tuple[Anchor, ResolvedAnchor]:
+        """Mint an anchor for a segment and resolve it in the same breath.
+
+        Returning the resolution alongside means a caller never has to assume
+        the citation it just made is good -- which matters most for the case
+        where the bundle is registered but its transcript is unreadable.
+        """
+
+        segments = self._bundle_segments(bundle_id)
+        if segments is None:
+            raise AutomationError(f"no readable transcript for bundle: {bundle_id}")
+        for segment in segments:
+            if segment.get("id") == segment_id:
+                anchor = make_anchor(
+                    bundle_id,
+                    segment_id,
+                    float(segment.get("start_s") or 0.0),
+                    str(segment.get("text", "")),
+                )
+                return anchor, resolve_against_segments(anchor, segments)
+        raise AutomationError(f"segment {segment_id} not found in bundle: {bundle_id}")
 
     def index_synthetic_segment(self, bundle_id: str, segment_id: int, text: str) -> None:
         """Index one segment directly. For fixtures that need a script the audio lacks.

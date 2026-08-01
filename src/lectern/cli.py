@@ -47,6 +47,7 @@ OUTWARD_COMMANDS = (
     "library list",
     "library show",
     "library search",
+    "library cite",
 )
 
 USAGE = """usage: lectern [--version] <command>
@@ -508,6 +509,8 @@ def _library(args: Sequence[str]) -> int:
             return _library_show(rest, state_path, json_output)
         if command == "search":
             return _library_search(rest, state_path, json_output)
+        if command == "cite":
+            return _library_cite(rest, state_path, json_output)
     except AutomationError as exc:
         print(f"library: {exc}", file=sys.stderr)
         return 3
@@ -632,10 +635,35 @@ def _library_search(args: Sequence[str], state_path: Path, json_output: bool) ->
     return 0
 
 
+def _library_cite(args: Sequence[str], state_path: Path, json_output: bool) -> int:
+    if len(args) != 2:
+        _library_usage()
+        return 2
+    try:
+        segment_id = int(args[1])
+    except ValueError:
+        print("library: SEGMENT_ID must be an integer", file=sys.stderr)
+        return 2
+    with open_state(state_path) as state:
+        anchor, resolved = state.cite_segment(args[0], segment_id)
+    if json_output:
+        _print_json(
+            {
+                "rendered": anchor.rendered(),
+                "anchor": anchor.to_dict(),
+                "outcome": resolved.outcome.value,
+                "resolution": resolved.to_dict(),
+            }
+        )
+    else:
+        print(f"{anchor.rendered()}\t{anchor.bundle_id}\t{resolved.outcome.value}")
+    return 0
+
+
 def _library_usage() -> None:
     print(
-        "usage: lectern library {list|show BUNDLE_ID|search QUERY [--operators]} "
-        "[--state PATH] [--json]",
+        "usage: lectern library {list|show BUNDLE_ID|search QUERY [--operators]|"
+        "cite BUNDLE_ID SEGMENT_ID} [--state PATH] [--json]",
         file=sys.stderr,
     )
 
