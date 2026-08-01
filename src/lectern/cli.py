@@ -26,6 +26,28 @@ from lectern.automation import (
 from lectern.bundle import export_json_schema
 from lectern.ingest import IngestError
 
+# Commands that return stored data to a caller, and therefore must emit no
+# filesystem path in either rendering.
+#
+# This tuple is the CLI's own declaration of its outward surface, and it exists
+# to be compared against the path-projection tests. Without it, that coverage is
+# an allowlist of the commands someone thought of, and a command added later
+# inherits no assertion at all — which is how four commands came to be returning
+# absolute paths under a design that claimed none did.
+#
+# Commands that only accept input (`sources add-folder`), report on a path the
+# caller just supplied (`doctor`, `sources preflight`), or write a file the
+# caller named (`schema export`, `ingest`) are deliberately absent: they
+# disclose nothing the caller did not already type.
+OUTWARD_COMMANDS = (
+    "sources list",
+    "sources scan",
+    "queue list",
+    "queue show",
+    "library list",
+    "library show",
+)
+
 USAGE = """usage: lectern [--version] <command>
 
 commands:
@@ -198,7 +220,7 @@ def _sources_add_folder(args: Sequence[str], state_path: Path, json_output: bool
     if json_output:
         _print_json(source.to_dict())
     else:
-        print(f"{source.id}\t{source.policy.value}\t{source.root_path}")
+        print(f"{source.id}\t{source.policy.value}\t{source.name}")
     return 0
 
 
@@ -223,7 +245,7 @@ def _sources_add_youtube_playlist(args: Sequence[str], state_path: Path, json_ou
     if json_output:
         _print_json(source.to_dict())
     else:
-        print(f"{source.id}\t{source.policy.value}\t{source.root_path}")
+        print(f"{source.id}\t{source.policy.value}\t{source.name}")
     return 0
 
 
@@ -237,7 +259,7 @@ def _sources_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
         _print_json({"sources": [source.to_dict() for source in sources]})
     else:
         for source in sources:
-            print(f"{source.id}\t{source.name}\t{source.policy.value}\t{source.root_path}")
+            print(f"{source.id}\t{source.name}\t{source.policy.value}")
     return 0
 
 
@@ -503,7 +525,7 @@ def _library_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
         _print_json({"bundles": [bundle.to_dict() for bundle in bundles]})
     else:
         for bundle in bundles:
-            print(f"{bundle.bundle_id}\t{bundle.bundle_path}")
+            print(f"{bundle.bundle_id}\t{bundle.created_at}")
     return 0
 
 
@@ -521,7 +543,7 @@ def _library_show(args: Sequence[str], state_path: Path, json_output: bool) -> i
     if json_output:
         _print_json(payload)
     else:
-        print(f"{bundle.bundle_id}\t{bundle.bundle_path}")
+        print(f"{bundle.bundle_id}\t{bundle.created_at}")
     return 0
 
 
