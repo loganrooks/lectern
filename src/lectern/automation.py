@@ -400,7 +400,7 @@ def iter_local_media_files(root: Path) -> Iterator[Path]:
         is_excluded_temp_dir = any(
             part.startswith(EXCLUDED_SCAN_DIR_PREFIXES) for part in relative_parts
         )
-        if is_excluded_dir or is_excluded_temp_dir or _is_bundle_output_path(root, path):
+        if is_excluded_dir or is_excluded_temp_dir or is_bundle_output_path(root, path):
             continue
         if path.is_symlink() or not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS:
             continue
@@ -614,9 +614,17 @@ class AutomationState:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._migrate()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._migrate()
+        except BaseException:
+            # A store that never finished initializing is never returned, so no
+            # caller holds it to close. Releasing the handle here is the only
+            # opportunity; `BaseException` because an interrupt between connect
+            # and migrate leaks exactly as a migration error does.
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         self._connection.close()
@@ -1858,8 +1866,14 @@ def preflight_state_store(path: Path = DEFAULT_STATE_PATH) -> StateStorePrefligh
     if exists:
         writable_location = writable_location and os.access(resolved, os.W_OK)
         try:
-            with sqlite3.connect(f"file:{resolved}?mode=ro", uri=True) as connection:
+            # A `sqlite3.Connection` context manager commits or rolls back; it
+            # does not close. Preflight is a read-only probe, so the handle has
+            # to be released explicitly rather than left to refcounting.
+            connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+            try:
                 schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                connection.close()
         except sqlite3.Error as exc:
             error = str(exc)
         if schema_version not in (None, *UPGRADABLE_STATE_SCHEMA_VERSIONS):
@@ -2456,14 +2470,27 @@ def _transcript_sidecar_escapes_root(path: Path, root: Path) -> bool:
     return False
 
 
-def _is_bundle_output_path(root: Path, path: Path) -> bool:
+def is_bundle_output_path(root: Path, path: Path) -> bool:
+    """Report whether `path` sits inside a Lectern bundle under `root`.
+
+    Public because it states half of what a local scan excludes, alongside the
+    excluded-directory rules `iter_local_media_files` applies.
+    """
+
     ancestor = path.parent
     while True:
         if (ancestor / MANIFEST_NAME).is_file() and (ancestor / "source.json").is_file():
             return True
         if ancestor == root:
             return False
-        ancestor = ancestor.parent
+        parent = ancestor.parent
+        if parent == ancestor:
+            # The walk reached the filesystem root without meeting `root`, so
+            # `path` is not under it and cannot be this root's bundle output.
+            # The filesystem root is its own parent, so without this the loop
+            # has no termination condition for such a path at all.
+            return False
+        ancestor = parent
 
 
 def _nearest_existing_parent_is_writable(path: Path) -> bool:
