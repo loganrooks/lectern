@@ -46,6 +46,7 @@ OUTWARD_COMMANDS = (
     "queue show",
     "library list",
     "library show",
+    "library search",
 )
 
 USAGE = """usage: lectern [--version] <command>
@@ -505,6 +506,8 @@ def _library(args: Sequence[str]) -> int:
             return _library_list(rest, state_path, json_output)
         if command == "show":
             return _library_show(rest, state_path, json_output)
+        if command == "search":
+            return _library_search(rest, state_path, json_output)
     except AutomationError as exc:
         print(f"library: {exc}", file=sys.stderr)
         return 3
@@ -600,8 +603,41 @@ def _queue_usage() -> None:
     )
 
 
+def _library_search(args: Sequence[str], state_path: Path, json_output: bool) -> int:
+    if not args:
+        _library_usage()
+        return 2
+    rest = list(args)
+    literal = True
+    if rest and rest[-1] == "--operators":
+        literal = False
+        rest = rest[:-1]
+    query = " ".join(rest)
+    with open_state(state_path) as state:
+        try:
+            hits = state.search_segments(query, literal=literal)
+        except ValueError as exc:
+            print(f"library: {exc}", file=sys.stderr)
+            return 2
+    if json_output:
+        _print_json({"results": [hit.to_dict() for hit in hits]})
+    else:
+        # No results is an answer, not an error. Saying so explicitly keeps
+        # "nothing found" distinguishable from "search is broken", which silence
+        # would not.
+        if not hits:
+            print("no matches")
+        for hit in hits:
+            print(f"{hit.bundle_id}\t{hit.segment_id}\t{hit.snippet}")
+    return 0
+
+
 def _library_usage() -> None:
-    print("usage: lectern library {list|show BUNDLE_ID} [--state PATH] [--json]", file=sys.stderr)
+    print(
+        "usage: lectern library {list|show BUNDLE_ID|search QUERY [--operators]} "
+        "[--state PATH] [--json]",
+        file=sys.stderr,
+    )
 
 
 def _usage() -> None:

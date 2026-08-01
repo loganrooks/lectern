@@ -217,6 +217,28 @@ class QueueItem:
 
 
 @dataclass(frozen=True)
+class SearchHit:
+    """One matching transcript segment, addressed by bundle and segment.
+
+    Carries no path, and has no field that could hold one. That is the
+    difference between a boundary and a habit: a caller cannot leak a location
+    through this type by forgetting to project, because there is nowhere to put
+    it.
+    """
+
+    bundle_id: str
+    segment_id: int | None
+    snippet: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bundle_id": self.bundle_id,
+            "segment_id": self.segment_id,
+            "snippet": self.snippet,
+        }
+
+
+@dataclass(frozen=True)
 class LibraryBundle:
     bundle_id: str
     bundle_path: str

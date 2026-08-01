@@ -29,6 +29,7 @@ from lectern.records import (
     QueueState,
     ScanDelta,
     ScanMetadataProvider,
+    SearchHit,
     SourceAdapter,
     SourceItem,
     SourceKind,
@@ -39,7 +40,7 @@ from lectern.records import (
     metadata_to_json,
     now_timestamp,
 )
-from lectern.search import index_signature, segment_text
+from lectern.search import index_signature, literal_match_expression, segment_text
 
 
 class AutomationStateStore:
@@ -547,6 +548,53 @@ class AutomationStateStore:
             "INSERT INTO segment_index(bundle_id, segment_id, body) VALUES (?, ?, ?)", rows
         )
         return len(rows)
+
+    def search_segments(
+        self, query: str, *, literal: bool = True, limit: int = 50
+    ) -> list[SearchHit]:
+        """Find transcript segments matching `query`.
+
+        Literal by default: the text is treated as data, so a remembered phrase
+        containing `+`, `*`, `OR`, or an unmatched quote returns results or
+        nothing rather than a parser error. `literal=False` hands the string to
+        FTS5's grammar, and its syntax errors are reported as such instead of
+        escaping as a bare sqlite exception.
+        """
+
+        expression = literal_match_expression(query) if literal else query
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT bundle_id, segment_id, body FROM segment_index
+                WHERE segment_index MATCH ? ORDER BY rank LIMIT ?
+                """,
+                (expression, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise ValueError(f"invalid search query: {exc}") from exc
+        return [
+            SearchHit(
+                bundle_id=str(row[0]),
+                segment_id=None if row[1] is None else int(row[1]),
+                snippet=str(row[2]),
+            )
+            for row in rows
+        ]
+
+    def index_synthetic_segment(self, bundle_id: str, segment_id: int, text: str) -> None:
+        """Index one segment directly. For fixtures that need a script the audio lacks.
+
+        Public and plainly named so its use in a test reads as fixture
+        construction rather than as a claim that some real bundle contained
+        Japanese -- the synthetic-fixture policy applies to what a test asserts
+        as much as to what it stores.
+        """
+
+        self._connection.execute(
+            "INSERT INTO segment_index(bundle_id, segment_id, body) VALUES (?, ?, ?)",
+            (bundle_id, segment_id, segment_text(text)),
+        )
+        self._connection.commit()
 
     def indexed_segment_count(self, *, bundle_id: str | None = None) -> int:
         if bundle_id is None:

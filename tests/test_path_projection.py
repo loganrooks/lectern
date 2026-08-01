@@ -38,6 +38,7 @@ OUTWARD_COMMANDS = (
     "queue show",
     "library list",
     "library show",
+    "library search",
 )
 
 

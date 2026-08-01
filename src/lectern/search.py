@@ -114,3 +114,23 @@ def index_signature() -> dict[str, int]:
     """
 
     return {"canon_version": CANON_VERSION, "segmenter_version": SEGMENTER_VERSION}
+
+
+def literal_match_expression(query: str) -> str:
+    """Turn user text into an FTS5 MATCH expression that means exactly itself.
+
+    FTS5's query language is not a superset of ordinary prose: `C++ discussion`
+    is a syntax error, `OR` is an operator, `*` is a prefix marker, and an
+    unmatched quote is fatal. A person searching their own archive is typing
+    what they remember hearing, not composing a query, so the default has to be
+    that their text is data.
+
+    Quoting the whole segmented string makes it one phrase, with embedded double
+    quotes doubled per FTS5's own escaping rule. Operator mode stays reachable
+    for anyone who wants the grammar; it just is not what an unqualified search
+    means.
+    """
+
+    segmented = segment_text(query)
+    escaped = segmented.replace('"', '""')
+    return f'"{escaped}"'
