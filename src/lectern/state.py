@@ -39,6 +39,7 @@ from lectern.records import (
     metadata_to_json,
     now_timestamp,
 )
+from lectern.search import index_signature, segment_text
 
 
 class AutomationStateStore:
@@ -52,6 +53,7 @@ class AutomationStateStore:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._migrate()
+            self._rebuild_index_if_stale()
         except BaseException:
             # A store that never finished initializing is never returned, so no
             # caller holds it to close. Releasing the handle here is the only
@@ -373,9 +375,14 @@ class AutomationStateStore:
             )
         if version == 0:
             self._create_schema_v2()
+            self._create_schema_v3()
             return
         if version == 1:
             self._migrate_v1_to_v2()
+            self._create_schema_v3()
+            return
+        if version == 2:
+            self._create_schema_v3()
             return
         raise AutomationError(
             f"unsupported automation state schema {version}; expected {STATE_SCHEMA_VERSION}"
@@ -434,9 +441,144 @@ class AutomationStateStore:
                 created_at TEXT NOT NULL
             );
 
-            PRAGMA user_version = 2;
             """
         )
+        self._connection.commit()
+
+    def _create_schema_v3(self) -> None:
+        """Add the retrieval index, and carry every existing bundle into it.
+
+        Backfill is not an optimisation here, it is the whole point. A migration
+        that creates an empty index leaves an upgrading user's entire archive
+        unsearchable while every fixture-built test stays green, because a suite
+        that only ingests new bundles never has anything old to lose.
+        """
+
+        self._connection.executescript(
+            """
+            CREATE VIRTUAL TABLE segment_index USING fts5(
+                bundle_id UNINDEXED,
+                segment_id UNINDEXED,
+                body
+            );
+
+            CREATE TABLE index_signature (
+                canon_version INTEGER NOT NULL,
+                segmenter_version INTEGER NOT NULL
+            );
+            """
+        )
+        self._write_index_signature()
+        self._backfill_segment_index()
+        self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
+        self._connection.commit()
+
+    def _write_index_signature(self) -> None:
+        signature = index_signature()
+        self._connection.execute("DELETE FROM index_signature")
+        self._connection.execute(
+            "INSERT INTO index_signature(canon_version, segmenter_version) VALUES (?, ?)",
+            (signature["canon_version"], signature["segmenter_version"]),
+        )
+
+    def index_signature_row(self) -> dict[str, int]:
+        row = self._connection.execute(
+            "SELECT canon_version, segmenter_version FROM index_signature"
+        ).fetchone()
+        if row is None:
+            return {}
+        return {"canon_version": int(row[0]), "segmenter_version": int(row[1])}
+
+    def _rebuild_index_if_stale(self) -> None:
+        """Rebuild when the rule that produced the index is not the current rule.
+
+        An index written under one segmentation rule and queried under another
+        fails by returning nothing, with no error anywhere. Comparing the stored
+        signature is what converts that silence into work.
+        """
+
+        if self.index_signature_row() == index_signature():
+            return
+        self._connection.execute("DELETE FROM segment_index")
+        self._write_index_signature()
+        self._backfill_segment_index()
+        self._connection.commit()
+
+    def _backfill_segment_index(self) -> None:
+        for bundle_id, bundle_path in self._connection.execute(
+            "SELECT bundle_id, bundle_path FROM library_bundles"
+        ).fetchall():
+            self._index_bundle_segments(str(bundle_id), Path(str(bundle_path)))
+
+    def _index_bundle_segments(self, bundle_id: str, bundle_dir: Path) -> int:
+        """Stage this bundle's segments for indexing; the caller commits.
+
+        Unreadable bundles are skipped rather than raised on. An archive is
+        exactly where a directory gets moved, renamed, or half-deleted, and one
+        stale row must not cost the user the ability to open their library at
+        all. The reconciliation query is what keeps the skip visible instead of
+        silent.
+        """
+
+        try:
+            payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
+            segments = json.loads(payload)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(segments, list):
+            return 0
+
+        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
+        # Each element is checked rather than cast: this is JSON read back off
+        # disk, so its shape is an assumption until something verifies it, and a
+        # cast would state the assumption as a fact the type checker then stops
+        # questioning. A malformed segment is skipped, and the reconciliation
+        # query is what keeps the skip visible.
+        rows: list[tuple[str, object, str]] = []
+        for segment in cast(list[Any], segments):
+            if not isinstance(segment, dict):
+                continue
+            entry = cast(dict[str, Any], segment)
+            text = entry.get("text")
+            if not text:
+                continue
+            rows.append((bundle_id, entry.get("id"), segment_text(str(text))))
+        self._connection.executemany(
+            "INSERT INTO segment_index(bundle_id, segment_id, body) VALUES (?, ?, ?)", rows
+        )
+        return len(rows)
+
+    def indexed_segment_count(self, *, bundle_id: str | None = None) -> int:
+        if bundle_id is None:
+            row = self._connection.execute("SELECT COUNT(*) FROM segment_index").fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM segment_index WHERE bundle_id = ?", (bundle_id,)
+            ).fetchone()
+        return int(row[0])
+
+    def unindexed_bundle_ids(self) -> list[str]:
+        """Registered bundles with no index rows: the reconciliation invariant.
+
+        Checkable at runtime rather than only in a test, because the states that
+        break it -- an interrupted ingest, a bundle deleted from disk -- happen
+        on a user's machine and not in a fixture.
+        """
+
+        return [
+            str(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT bundle_id FROM library_bundles
+                WHERE bundle_id NOT IN (SELECT DISTINCT bundle_id FROM segment_index)
+                ORDER BY bundle_id
+                """
+            ).fetchall()
+        ]
+
+    def forget_library_bundle(self, bundle_id: str) -> None:
+        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
+        self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))
         self._connection.commit()
 
     def _migrate_v1_to_v2(self) -> None:
@@ -735,6 +877,7 @@ class AutomationStateStore:
                     now_timestamp(),
                 ),
             )
+            self._index_bundle_segments(manifest.bundle_id, bundle_dir)
             return LibraryRecordOutcome(inserted=True, previous=None)
         if existing.queue_item_id == queue_item.id:
             self._connection.execute(
@@ -761,11 +904,11 @@ class AutomationStateStore:
         return _library_bundle_from_row(existing)
 
 
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 
 DEFAULT_STATE_PATH = Path(".lectern") / "state.sqlite"
 
-UPGRADABLE_STATE_SCHEMA_VERSIONS = frozenset({0, 1, STATE_SCHEMA_VERSION})
+UPGRADABLE_STATE_SCHEMA_VERSIONS = frozenset({0, 1, 2, STATE_SCHEMA_VERSION})
 
 
 @dataclass(frozen=True)

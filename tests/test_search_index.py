@@ -1,0 +1,196 @@
+"""The index's life, not just its shape.
+
+The failure this module exists for is invisible to every other test in the
+suite: a user upgrades with hundreds of existing bundles, the migration creates
+an empty index, only newly ingested bundles are ever written to it, and every
+recording they already had becomes unsearchable -- while a fixture suite that
+only ever builds *new* bundles stays entirely green.
+
+That asymmetry is the point. A test that ingests and then searches proves the
+write path works. It cannot prove that anything already on disk was carried
+across, because it never had anything already on disk.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from lectern import cli, search
+from lectern.automation import open_state
+from lectern.state import STATE_SCHEMA_VERSION
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
+SYNTHETIC_TRANSCRIPT = FIXTURE_DIR / "synthetic_talk.transcript.txt"
+
+
+def _ingest(tmp_path: Path, name: str = "synthetic_talk") -> tuple[Path, Path]:
+    """Ingest the fixture and return (state_path, bundle_dir)."""
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    media = media_dir / f"{name}.wav"
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    media.with_suffix(".transcript.txt").write_text(
+        SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    state_path = tmp_path / "state.sqlite"
+    out = tmp_path / "bundles"
+    assert cli.main(["ingest", str(media), "--output", str(out), "--state", str(state_path)]) == 0
+    bundles = sorted(path for path in out.iterdir() if path.is_dir())
+    return state_path, bundles[-1]
+
+
+def _indexed_segment_count(state_path: Path) -> int:
+    with open_state(state_path) as state:
+        return state.indexed_segment_count()
+
+
+def _revert_to_v2(state_path: Path) -> None:
+    """Make a populated store look like one written before the index existed.
+
+    Faithful to the situation that matters: the library rows are already there
+    and the index is not, which is exactly what an upgrading user has.
+    """
+
+    connection = sqlite3.connect(state_path)
+    connection.execute("DROP TABLE IF EXISTS segment_index")
+    connection.execute("DROP TABLE IF EXISTS index_signature")
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    connection.close()
+
+
+def test_ingest_indexes_the_bundle(tmp_path: Path) -> None:
+    state_path, _ = _ingest(tmp_path)
+    assert _indexed_segment_count(state_path) > 0
+
+
+def test_migration_backfills_existing_library_rows(tmp_path: Path) -> None:
+    """The 500-bundle upgrade, in miniature.
+
+    Without backfill this passes every other test in the suite and leaves a
+    user's entire existing archive unsearchable.
+    """
+
+    state_path, _ = _ingest(tmp_path)
+    indexed_before = _indexed_segment_count(state_path)
+    assert indexed_before > 0
+
+    _revert_to_v2(state_path)
+    connection = sqlite3.connect(state_path)
+    assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 2
+    assert connection.execute("SELECT COUNT(*) FROM library_bundles").fetchone()[0] == 1
+    connection.close()
+
+    # Opening the store is what upgrades it.
+    assert _indexed_segment_count(state_path) == indexed_before
+    connection = sqlite3.connect(state_path)
+    assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == STATE_SCHEMA_VERSION
+    connection.close()
+
+
+def test_reconciliation_reports_agreement_after_ingest(tmp_path: Path) -> None:
+    state_path, _ = _ingest(tmp_path)
+    with open_state(state_path) as state:
+        assert state.unindexed_bundle_ids() == []
+
+
+def test_reconciliation_detects_a_missing_bundle(tmp_path: Path) -> None:
+    """The invariant has to be able to fail, or it is decoration."""
+
+    state_path, _ = _ingest(tmp_path)
+    connection = sqlite3.connect(state_path)
+    connection.execute("DELETE FROM segment_index")
+    connection.commit()
+    connection.close()
+
+    with open_state(state_path) as state:
+        assert state.unindexed_bundle_ids() != []
+
+
+def test_rebuild_on_signature_mismatch(tmp_path: Path) -> None:
+    """An index built under one segmentation rule must not be queried under another.
+
+    The stored signature is what turns a silent wrong-answer into a rebuild.
+    Without it, upgrading the segmenter leaves an index whose tokens no query
+    will ever produce, and retrieval fails by returning nothing.
+    """
+
+    state_path, _ = _ingest(tmp_path)
+    connection = sqlite3.connect(state_path)
+    connection.execute("UPDATE index_signature SET segmenter_version = -1")
+    connection.execute("DELETE FROM segment_index")
+    connection.commit()
+    connection.close()
+
+    # Reopening detects the stale signature and rebuilds from the library.
+    assert _indexed_segment_count(state_path) > 0
+    with open_state(state_path) as state:
+        assert state.index_signature_row() == search.index_signature()
+
+
+def test_deleting_a_library_row_deletes_its_index_rows(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    bundle_id = bundle.name
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle_id) > 0
+        state.forget_library_bundle(bundle_id)
+        assert state.indexed_segment_count(bundle_id=bundle_id) == 0
+
+
+def test_index_rows_carry_no_filesystem_path(tmp_path: Path) -> None:
+    # The index is a new store of transcript text; it must not become a new
+    # place for paths to accumulate.
+    state_path, _ = _ingest(tmp_path)
+    connection = sqlite3.connect(state_path)
+    rows = connection.execute("SELECT bundle_id, segment_id, body FROM segment_index").fetchall()
+    connection.close()
+    assert rows
+    for _, _, body in rows:
+        assert str(tmp_path) not in body
+
+
+def test_indexed_text_is_segmented(tmp_path: Path) -> None:
+    """What is stored must be what a query will be compared against.
+
+    Asserted on the stored text rather than on a retrieval result, so a failure
+    points at the writer rather than at the whole pipeline.
+    """
+
+    state_path, bundle = _ingest(tmp_path)
+    segments = json.loads((bundle / "transcript" / "segments.json").read_text(encoding="utf-8"))
+    connection = sqlite3.connect(state_path)
+    stored = connection.execute(
+        "SELECT body FROM segment_index WHERE segment_id = ?", (segments[0]["id"],)
+    ).fetchone()
+    connection.close()
+    assert stored is not None
+    assert stored[0] == search.segment_text(segments[0]["text"])
+
+
+@pytest.mark.parametrize("missing", ["segments", "bundle"])
+def test_backfill_survives_an_unreadable_bundle(tmp_path: Path, missing: str) -> None:
+    """A bundle that cannot be read must not abort the upgrade.
+
+    An archive is exactly the place where one directory has been moved, renamed,
+    or half-deleted. Refusing to open the store in that case would make a single
+    stale row cost the user their whole library.
+    """
+
+    state_path, bundle = _ingest(tmp_path)
+    _revert_to_v2(state_path)
+    if missing == "segments":
+        (bundle / "transcript" / "segments.json").unlink()
+    else:
+        for path in sorted(bundle.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        bundle.rmdir()
+
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count() == 0
+        assert state.unindexed_bundle_ids() != []
