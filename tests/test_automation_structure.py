@@ -13,9 +13,23 @@ import ast
 import inspect
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
+
+import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 from lectern import automation, provenance, records, state
+from lectern.automation import (
+    AutomationError,
+    LocalFolderAdapter,
+    SourceKind,
+    SourcePolicy,
+    SourceRecord,
+    YouTubePlaylistAdapter,
+    default_source_adapter,
+)
 from lectern.sources import local, youtube
 
 PACKAGE = Path(automation.__file__).parent
@@ -161,3 +175,42 @@ def test_importing_the_state_store_does_not_pull_in_a_transport() -> None:
     )
 
     assert result.stdout.strip() == "False False", result.stdout
+
+
+def test_default_adapter_selection_covers_every_scannable_kind(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The composition root's kind-to-adapter mapping, exercised directly.
+
+    Every other test injects an adapter explicitly, so this seam — the one thing
+    that decides which provider a scan actually talks to — was reached by no
+    test at all. It is also where the store/composition-root boundary is
+    enforced, so a regression here would silently reattach the store to a
+    concrete provider.
+    """
+
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake-secret")
+
+    folder = SourceRecord(
+        id="src_local",
+        kind=SourceKind.LOCAL_FOLDER,
+        name="talks",
+        root_path="/tmp/talks",
+        policy=SourcePolicy.REVIEW,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    playlist = replace(folder, id="src_yt", kind=SourceKind.YOUTUBE_PLAYLIST, root_path="PL_SYNTH")
+    one_shot = replace(folder, id="src_one", kind=SourceKind.ONE_SHOT)
+
+    assert isinstance(default_source_adapter(folder), LocalFolderAdapter)
+    assert isinstance(default_source_adapter(playlist), YouTubePlaylistAdapter)
+
+    # A kind with no adapter must be refused, not silently scanned as something
+    # else; the store's unimplemented hook raises the same message.
+    with pytest.raises(AutomationError, match="unsupported source kind for scan"):
+        default_source_adapter(one_shot)
+    with pytest.raises(AutomationError, match="unsupported source kind for scan"):
+        state.AutomationStateStore._default_adapter(  # pyright: ignore[reportPrivateUsage]
+            cast(state.AutomationStateStore, object()), folder
+        )
