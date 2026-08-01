@@ -17,6 +17,7 @@ answer delivered confidently.
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ from lectern.search import AnchorResolution
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
 SYNTHETIC_TRANSCRIPT = FIXTURE_DIR / "synthetic_talk.transcript.txt"
+MULTISCRIPT = json.loads((FIXTURE_DIR / "multiscript_segments.json").read_text(encoding="utf-8"))[
+    "cases"
+]
 
 
 def _archive(tmp_path: Path) -> tuple[Path, Path]:
@@ -174,3 +178,42 @@ def test_cite_emits_no_filesystem_path(tmp_path: Path, capsys: pytest.CaptureFix
         cli.main(["library", "cite", bundle.name, "0", "--state", str(state_path), "--json"]) == 0
     )
     assert str(tmp_path) not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
+def test_anchors_resolve_for_every_supported_script(tmp_path: Path, case: dict[str, Any]) -> None:
+    """The Tier-A clause says the non-Latin fixture exercises indexing AND anchors.
+
+    Indexing was covered by the search tests; anchors were not, so this closes
+    the half of the clause that a Latin-only citation fixture leaves open. It
+    matters beyond box-ticking: the digest is taken over canonicalized text, and
+    NFC normalization is exactly the step most likely to behave differently
+    outside Latin script.
+    """
+
+    state_path, bundle = _archive(tmp_path)
+    _write_segments(
+        bundle, [{"id": 0, "start_s": 1.0, "end_s": 2.0, "text": case["text"], "source": "fixture"}]
+    )
+    anchor = search.make_anchor(bundle.name, 0, 1.0, case["text"])
+    with open_state(state_path) as state:
+        resolved = state.resolve_anchor(anchor)
+    assert resolved.outcome is AnchorResolution.EXACT, case["script"]
+    assert resolved.current_text == case["text"]
+
+
+@pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
+def test_anchor_digests_are_script_independent(case: dict[str, Any]) -> None:
+    """A decomposed rewrite must not break a citation in any script.
+
+    Greek and Hangul both have composed and decomposed forms, so this is not a
+    Latin-only concern -- and a citation that survives an editor's save in
+    English while breaking in Korean would be a worse failure than one that
+    broke everywhere, because nobody would notice it.
+    """
+
+    decomposed = unicodedata.normalize("NFD", case["text"])
+    assert (
+        search.make_anchor("b", 0, 0.0, decomposed).text_sha256
+        == search.make_anchor("b", 0, 0.0, case["text"]).text_sha256
+    )

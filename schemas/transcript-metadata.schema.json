@@ -1,0 +1,217 @@
+{
+  "$defs": {
+    "ContentIdentity": {
+      "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
+      "properties": {
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "ContentIdentity",
+      "type": "object"
+    },
+    "NormalizedAudio": {
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "NormalizedAudio",
+      "type": "object"
+    },
+    "RemoteServices": {
+      "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
+      "properties": {
+        "allowed": {
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "lectern_invoked": {
+          "title": "Lectern Invoked",
+          "type": "boolean"
+        },
+        "requires_explicit_per_item_consent": {
+          "title": "Requires Explicit Per Item Consent",
+          "type": "boolean"
+        },
+        "transcriber_network_posture": {
+          "title": "Transcriber Network Posture",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed",
+        "scope",
+        "lectern_invoked",
+        "requires_explicit_per_item_consent",
+        "transcriber_network_posture"
+      ],
+      "title": "RemoteServices",
+      "type": "object"
+    },
+    "SchemaContract": {
+      "properties": {
+        "manifest_schema_versioned": {
+          "title": "Manifest Schema Versioned",
+          "type": "boolean"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest_schema_versioned",
+        "note"
+      ],
+      "title": "SchemaContract",
+      "type": "object"
+    },
+    "TranscriptArtifacts": {
+      "properties": {
+        "segments": {
+          "title": "Segments",
+          "type": "string"
+        },
+        "transcript": {
+          "title": "Transcript",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segments",
+        "transcript",
+        "summary"
+      ],
+      "title": "TranscriptArtifacts",
+      "type": "object"
+    },
+    "TranscriptBackend": {
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "TranscriptBackend",
+      "type": "object"
+    }
+  },
+  "description": "`transcript/metadata.json`.",
+  "properties": {
+    "schema": {
+      "title": "Schema",
+      "type": "string"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "backend": {
+      "$ref": "#/$defs/TranscriptBackend"
+    },
+    "remote_services": {
+      "$ref": "#/$defs/RemoteServices"
+    },
+    "evidence_limit": {
+      "title": "Evidence Limit",
+      "type": "string"
+    },
+    "source_media": {
+      "$ref": "#/$defs/ContentIdentity"
+    },
+    "normalized_audio": {
+      "$ref": "#/$defs/NormalizedAudio"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/TranscriptArtifacts"
+    },
+    "schema_contract": {
+      "$ref": "#/$defs/SchemaContract"
+    }
+  },
+  "required": [
+    "schema",
+    "generated_at",
+    "method",
+    "backend",
+    "remote_services",
+    "evidence_limit",
+    "source_media",
+    "normalized_audio",
+    "artifacts",
+    "schema_contract"
+  ],
+  "title": "TranscriptMetadataDocument",
+  "type": "object"
+}

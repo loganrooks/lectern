@@ -23,7 +23,7 @@ from lectern.automation import (
     preflight_state_store,
     preflight_youtube_playlist,
 )
-from lectern.bundle import export_json_schema
+from lectern.bundle import export_artifact_schemas, export_json_schema
 from lectern.ingest import IngestError
 
 # Commands that return stored data to a caller, and therefore must emit no
@@ -90,6 +90,16 @@ def _doctor() -> int:
 
 
 def _export_schema(args: Sequence[str]) -> int:
+    if len(args) == 2 and args[0] == "--all-into":
+        # Every artifact type, not only the manifest. Written as a directory
+        # because "schemas for every written artifact type" is a set, and
+        # exporting them one at a time invites the set to fall out of date.
+        directory = Path(args[1])
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, schema_text in export_artifact_schemas().items():
+            (directory / f"{name}.schema.json").write_text(schema_text, encoding="utf-8")
+        print(f"wrote {len(export_artifact_schemas())} schemas to {directory}")
+        return 0
     schema = export_json_schema()
     if not args:
         print(schema, end="")
@@ -100,7 +110,10 @@ def _export_schema(args: Sequence[str]) -> int:
         output.write_text(schema, encoding="utf-8")
         print(f"wrote {output}")
         return 0
-    print("usage: lectern schema export [--output PATH]", file=sys.stderr)
+    print(
+        "usage: lectern schema export [--output PATH | --all-into DIR]",
+        file=sys.stderr,
+    )
     return 2
 
 

@@ -1,0 +1,41 @@
+{
+  "description": "One row of `transcript/segments.json`, the unit a citation anchors to.",
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "integer"
+    },
+    "start_s": {
+      "title": "Start S",
+      "type": "number"
+    },
+    "end_s": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "End S"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "start_s",
+    "text",
+    "source"
+  ],
+  "title": "TranscriptSegmentRecord",
+  "type": "object"
+}

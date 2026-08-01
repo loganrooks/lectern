@@ -167,6 +167,122 @@ class Manifest(BaseModel):
         return manifest
 
 
+class RemoteServices(BaseModel):
+    """The network posture recorded alongside a transcript.
+
+    Modelled rather than left as free-form JSON because it is the field a
+    privacy review reads first, and an unmodelled field is one no schema
+    constrains.
+    """
+
+    allowed: bool
+    scope: str
+    lectern_invoked: bool
+    requires_explicit_per_item_consent: bool
+    transcriber_network_posture: str
+
+
+class TranscriptPointer(BaseModel):
+    method: str
+    metadata: str
+    segments: str
+    transcript: str
+    evidence_limit: str
+    remote_services: RemoteServices
+
+
+class ContentIdentity(BaseModel):
+    """Digest and size, with no field for a location.
+
+    The absence is the design: after LW-11 a bundle records what its media was,
+    not where it sat, and a schema that still admitted a path would leave the
+    door open for one to reappear.
+    """
+
+    sha256: str
+    bytes: int | None = None
+
+
+class SourceDocument(BaseModel):
+    """`source.json`."""
+
+    source: Source
+    sha256: str
+    bytes: int
+    transcript: TranscriptPointer
+    transcript_sidecar: ContentIdentity | None = None
+
+
+class TranscriptSegmentRecord(BaseModel):
+    """One row of `transcript/segments.json`, the unit a citation anchors to."""
+
+    id: int
+    start_s: float
+    end_s: float | None = None
+    text: str
+    source: str
+
+
+class NormalizedAudio(BaseModel):
+    path: str
+    sha256: str
+    bytes: int
+
+
+class TranscriptBackend(BaseModel):
+    kind: str
+    sha256: str | None = None
+    command: str | None = None
+
+
+class TranscriptArtifacts(BaseModel):
+    segments: str
+    transcript: str
+    summary: str
+
+
+class SchemaContract(BaseModel):
+    manifest_schema_versioned: bool
+    note: str
+
+
+class TranscriptMetadataDocument(BaseModel):
+    """`transcript/metadata.json`."""
+
+    schema_: str = Field(alias="schema")
+    generated_at: datetime
+    method: str
+    backend: TranscriptBackend
+    remote_services: RemoteServices
+    evidence_limit: str
+    source_media: ContentIdentity
+    normalized_audio: NormalizedAudio
+    artifacts: TranscriptArtifacts
+    schema_contract: SchemaContract
+
+    model_config = {"populate_by_name": True}
+
+
+# Every artifact type Lectern writes as JSON, and the model that describes it.
+# Enumerated in one place so "every written artifact type has a schema" is a
+# statement a test can check rather than a claim someone has to audit by hand.
+ARTIFACT_MODELS: dict[str, type[BaseModel]] = {
+    "manifest": Manifest,
+    "source": SourceDocument,
+    "transcript-segment": TranscriptSegmentRecord,
+    "transcript-metadata": TranscriptMetadataDocument,
+}
+
+
+def export_artifact_schemas() -> dict[str, str]:
+    """Every artifact schema, keyed by the name its file takes under `schemas/`."""
+
+    return {
+        name: json.dumps(model.model_json_schema(by_alias=True), indent=2) + "\n"
+        for name, model in ARTIFACT_MODELS.items()
+    }
+
+
 def export_json_schema() -> str:
     """Export the manifest JSON Schema (committed under schemas/ on change)."""
     return json.dumps(Manifest.model_json_schema(), indent=2) + "\n"

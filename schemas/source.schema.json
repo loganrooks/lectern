@@ -1,0 +1,225 @@
+{
+  "$defs": {
+    "ContentIdentity": {
+      "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
+      "properties": {
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "ContentIdentity",
+      "type": "object"
+    },
+    "RemoteServices": {
+      "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
+      "properties": {
+        "allowed": {
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "lectern_invoked": {
+          "title": "Lectern Invoked",
+          "type": "boolean"
+        },
+        "requires_explicit_per_item_consent": {
+          "title": "Requires Explicit Per Item Consent",
+          "type": "boolean"
+        },
+        "transcriber_network_posture": {
+          "title": "Transcriber Network Posture",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed",
+        "scope",
+        "lectern_invoked",
+        "requires_explicit_per_item_consent",
+        "transcriber_network_posture"
+      ],
+      "title": "RemoteServices",
+      "type": "object"
+    },
+    "Source": {
+      "description": "Provenance. `local` sources trigger the privacy hard rule (ADR-0002).",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "ref": {
+          "title": "Ref",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Channel"
+        },
+        "published": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Published"
+        },
+        "duration_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration S"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "SourceKind": {
+      "enum": [
+        "youtube",
+        "local",
+        "url"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "TranscriptPointer": {
+      "properties": {
+        "method": {
+          "title": "Method",
+          "type": "string"
+        },
+        "metadata": {
+          "title": "Metadata",
+          "type": "string"
+        },
+        "segments": {
+          "title": "Segments",
+          "type": "string"
+        },
+        "transcript": {
+          "title": "Transcript",
+          "type": "string"
+        },
+        "evidence_limit": {
+          "title": "Evidence Limit",
+          "type": "string"
+        },
+        "remote_services": {
+          "$ref": "#/$defs/RemoteServices"
+        }
+      },
+      "required": [
+        "method",
+        "metadata",
+        "segments",
+        "transcript",
+        "evidence_limit",
+        "remote_services"
+      ],
+      "title": "TranscriptPointer",
+      "type": "object"
+    }
+  },
+  "description": "`source.json`.",
+  "properties": {
+    "source": {
+      "$ref": "#/$defs/Source"
+    },
+    "sha256": {
+      "title": "Sha256",
+      "type": "string"
+    },
+    "bytes": {
+      "title": "Bytes",
+      "type": "integer"
+    },
+    "transcript": {
+      "$ref": "#/$defs/TranscriptPointer"
+    },
+    "transcript_sidecar": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "source",
+    "sha256",
+    "bytes",
+    "transcript"
+  ],
+  "title": "SourceDocument",
+  "type": "object"
+}
