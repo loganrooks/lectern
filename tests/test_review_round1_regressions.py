@@ -169,3 +169,109 @@ def test_sampler_rejects_an_end_beyond_the_recording(tmp_path: Path) -> None:
     with open_state(state_path) as state:
         issues = state.sample_anchor_correctness()
     assert any("end_s" in issue.detail for issue in issues)
+
+
+def test_literal_search_respects_punctuation(tmp_path: Path) -> None:
+    """R2-14. `unicode61` drops punctuation from index and query alike, so a
+    phrase match alone made `C++ discussion` indistinguishable from `C discussion`."""
+
+    state_path, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("punct", 0, "a C discussion about types")
+        assert [h for h in state.search_segments("C discussion") if h.bundle_id == "punct"]
+        assert not [h for h in state.search_segments("C++ discussion") if h.bundle_id == "punct"]
+
+
+def test_hyphenated_query_is_not_the_same_as_spaced(tmp_path: Path) -> None:
+    state_path, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("hyph", 0, "alpha beta gamma")
+        assert not [h for h in state.search_segments("alpha-beta") if h.bundle_id == "hyph"]
+
+
+def test_index_refreshes_when_transcript_content_changes(tmp_path: Path) -> None:
+    """R2-10. A matching rule signature says the index was built the same WAY,
+    not from the same CONTENT. Without this a corrected transcript stayed
+    searchable under its old text while citations read the new file."""
+
+    state_path, bundle = _archive(tmp_path)
+    with open_state(state_path) as state:
+        assert [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
+
+    (bundle / "transcript" / "segments.json").write_text(
+        json.dumps([{"id": 0, "start_s": 0.0, "end_s": 1.0, "text": "entirely different wording"}]),
+        encoding="utf-8",
+    )
+    with open_state(state_path) as state:
+        assert not [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
+        assert [
+            h for h in state.search_segments("entirely different") if h.bundle_id == bundle.name
+        ]
+
+
+def test_a_bundle_unreadable_at_migration_is_indexed_once_restored(tmp_path: Path) -> None:
+    """The other half of R2-10: a temporary failure must not be permanent."""
+
+    state_path, bundle = _archive(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    original = segments_path.read_text(encoding="utf-8")
+    segments_path.unlink()
+
+    connection = sqlite3.connect(state_path)
+    connection.execute("DELETE FROM segment_index")
+    connection.execute("DELETE FROM indexed_bundles")
+    connection.commit()
+    connection.close()
+
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+
+    segments_path.write_text(original, encoding="utf-8")
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle.name) > 0
+
+
+def test_local_command_backend_fields_survive_round_trip() -> None:
+    """R2-05. Unknown keys were ignored, so the identity of the command that
+    produced a transcript vanished on every round trip."""
+
+    from lectern.bundle import TranscriptBackend
+
+    payload = {
+        "kind": "local_command",
+        "argv0": "/usr/bin/whisper",
+        "command_sha256": "a" * 64,
+        "argv_sha256": "b" * 64,
+        "input_argument_mode": "placeholder",
+        "timeout_s": 600.0,
+    }
+    backend = TranscriptBackend.model_validate(payload)
+    assert backend.command_sha256 == "a" * 64
+    assert json.loads(backend.model_dump_json(exclude_none=True)) == payload
+
+
+def test_source_provenance_survives_round_trip() -> None:
+    """R2-06. State schema version, identities, consent, and policy were dropped."""
+
+    from lectern.bundle import SourceProvenance
+
+    payload = {
+        "state_schema_version": 3,
+        "source_id": "src_1",
+        "source_kind": "local-folder",
+        "source_name": "talks",
+        "source_item_id": "item_1",
+        "queue_item_id": "queue_1",
+        "queue_state": "completed",
+        "policy": "review",
+        "consent": "explicit_queue_approval",
+        "remote_services": {
+            "allowed": False,
+            "scope": "lectern_core",
+            "lectern_invoked": False,
+            "requires_explicit_per_item_consent": True,
+            "transcriber_network_posture": "not_applicable_sidecar",
+        },
+    }
+    provenance = SourceProvenance.model_validate(payload)
+    assert json.loads(provenance.model_dump_json()) == payload

@@ -8,6 +8,7 @@ the layer that writes bundles is separable from the layer that records them.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import sqlite3
@@ -52,6 +53,7 @@ from lectern.search import (
     resolve_against_segments,
     sample_segment_timings,
     segment_text,
+    text_contains_literal,
 )
 
 
@@ -67,6 +69,7 @@ class AutomationStateStore:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._migrate()
             self._rebuild_index_if_stale()
+            self.refresh_changed_bundles()
         except BaseException:
             # A store that never finished initializing is never returned, so no
             # caller holds it to close. Releasing the handle here is the only
@@ -481,6 +484,11 @@ class AutomationStateStore:
                 canon_version INTEGER NOT NULL,
                 segmenter_version INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS indexed_bundles (
+                bundle_id TEXT PRIMARY KEY,
+                segments_sha256 TEXT NOT NULL
+            );
             """
         )
         columns = {
@@ -527,6 +535,44 @@ class AutomationStateStore:
         self._backfill_segment_index()
         self._connection.commit()
 
+    def refresh_changed_bundles(self) -> list[str]:
+        """Reindex bundles whose transcript no longer matches what was indexed.
+
+        A matching rule signature says the index was built the same WAY, not
+        that it was built from the same CONTENT. Without this a corrected
+        transcript stays searchable under its old text indefinitely while
+        citation resolution reads the new file and reports different content —
+        the index and the citations disagreeing, silently. It also gives a
+        bundle that was unreadable during migration a later chance to be
+        indexed, so a temporary failure is not permanent.
+        """
+
+        refreshed: list[str] = []
+        for bundle_id, bundle_path in self._connection.execute(
+            "SELECT bundle_id, bundle_path FROM library_bundles"
+        ).fetchall():
+            identifier = str(bundle_id)
+            current = self._segments_digest(Path(str(bundle_path)))
+            if current is None:
+                continue
+            row = self._connection.execute(
+                "SELECT segments_sha256 FROM indexed_bundles WHERE bundle_id = ?", (identifier,)
+            ).fetchone()
+            if row is not None and str(row[0]) == current:
+                continue
+            self._index_bundle_segments(identifier, Path(str(bundle_path)))
+            refreshed.append(identifier)
+        if refreshed:
+            self._connection.commit()
+        return refreshed
+
+    def _segments_digest(self, bundle_dir: Path) -> str | None:
+        try:
+            payload = (bundle_dir / "transcript" / "segments.json").read_bytes()
+        except OSError:
+            return None
+        return hashlib.sha256(payload).hexdigest()
+
     def _backfill_segment_index(self) -> None:
         for bundle_id, bundle_path in self._connection.execute(
             "SELECT bundle_id, bundle_path FROM library_bundles"
@@ -570,6 +616,13 @@ class AutomationStateStore:
             # space between every character and whole transcripts for text-only
             # bundles -- an internal representation escaping as a user-facing one.
             rows.append((bundle_id, entry.get("id"), str(text), segment_text(str(text))))
+        digest = self._segments_digest(bundle_dir)
+        if digest is not None:
+            self._connection.execute(
+                "INSERT INTO indexed_bundles(bundle_id, segments_sha256) VALUES (?, ?) "
+                "ON CONFLICT(bundle_id) DO UPDATE SET segments_sha256 = excluded.segments_sha256",
+                (bundle_id, digest),
+            )
         self._connection.executemany(
             "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
             rows,
@@ -599,7 +652,7 @@ class AutomationStateStore:
             ).fetchall()
         except sqlite3.OperationalError as exc:
             raise ValueError(f"invalid search query: {exc}") from exc
-        return [
+        hits = [
             SearchHit(
                 bundle_id=str(row[0]),
                 segment_id=None if row[1] is None else int(row[1]),
@@ -607,6 +660,12 @@ class AutomationStateStore:
             )
             for row in rows
         ]
+        if literal:
+            # The index finds candidates; the text as written decides. Without
+            # this, "literal" meant "not parsed as operators" rather than "means
+            # exactly itself", and `C++ discussion` matched `C discussion`.
+            hits = [hit for hit in hits if text_contains_literal(hit.snippet, query)]
+        return hits
 
     def _bundle_segments(self, bundle_id: str) -> list[dict[str, Any]] | None:
         row = self._connection.execute(
@@ -730,6 +789,7 @@ class AutomationStateStore:
 
     def _delete_index_rows(self, bundle_id: str) -> None:
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
+        self._connection.execute("DELETE FROM indexed_bundles WHERE bundle_id = ?", (bundle_id,))
 
     def forget_library_bundle(self, bundle_id: str) -> None:
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))

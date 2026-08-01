@@ -210,6 +210,30 @@ class ContentIdentity(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class SourceProvenance(BaseModel):
+    """The automation record appended to `source.json` on a completed ingest.
+
+    Absent on a bare one-shot ingest and present after queue completion, so it is
+    optional here — but declared, because dropping it on round trip would discard
+    the state schema version, the source and queue identities, the consent record,
+    the policy, and the remote-service posture. Those are exactly the fields a
+    later audit would need and would find missing.
+    """
+
+    state_schema_version: int
+    source_id: str
+    source_kind: str
+    source_name: str
+    source_item_id: str
+    queue_item_id: str
+    queue_state: str
+    policy: str
+    # A string naming the basis, e.g. "explicit_queue_approval" — not a
+    # structured record. Modelled from the writer rather than assumed.
+    consent: str
+    remote_services: RemoteServices
+
+
 class SourceDocument(BaseModel):
     """`source.json`."""
 
@@ -218,6 +242,7 @@ class SourceDocument(BaseModel):
     bytes: int
     transcript: TranscriptPointer
     transcript_sidecar: ContentIdentity | None = None
+    provenance: SourceProvenance | None = None
 
 
 class TranscriptSegmentRecord(BaseModel):
@@ -237,9 +262,23 @@ class NormalizedAudio(BaseModel):
 
 
 class TranscriptBackend(BaseModel):
+    """How the transcript was produced.
+
+    The `local_command` fields are declared rather than tolerated: pydantic
+    ignores unknown keys, so a model that omitted them silently discarded the
+    identity of the command that produced the transcript on every round trip,
+    and generated-schema consumers were never told the fields exist. Provenance
+    that only survives when nobody reads it is not provenance.
+    """
+
     kind: str
     sha256: str | None = None
     command: str | None = None
+    argv0: str | None = None
+    command_sha256: str | None = None
+    argv_sha256: str | None = None
+    input_argument_mode: str | None = None
+    timeout_s: float | None = None
 
 
 class TranscriptArtifacts(BaseModel):

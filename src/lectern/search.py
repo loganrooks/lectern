@@ -409,3 +409,19 @@ def sample_segment_timings(
             )
         previous_start = start
     return issues
+
+
+def text_contains_literal(display_text: str, query: str) -> bool:
+    """Whether `display_text` really contains `query`, punctuation included.
+
+    FTS5's `unicode61` discards punctuation from the index and the query alike,
+    so a phrase search for `C++ discussion` also matches `C discussion`, and
+    `a-b` is indistinguishable from `a b`. The index is the right instrument for
+    finding candidates and the wrong one for deciding whether the literal
+    promise holds, so candidates are confirmed against the text as written.
+
+    Case and Unicode form are still normalized, because those are not what a
+    person means by "exactly".
+    """
+
+    return canonical_text(query).casefold() in canonical_text(display_text).casefold()

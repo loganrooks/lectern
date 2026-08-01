@@ -149,6 +149,64 @@
       "title": "SourceKind",
       "type": "string"
     },
+    "SourceProvenance": {
+      "description": "The automation record appended to `source.json` on a completed ingest.\n\nAbsent on a bare one-shot ingest and present after queue completion, so it is\noptional here \u2014 but declared, because dropping it on round trip would discard\nthe state schema version, the source and queue identities, the consent record,\nthe policy, and the remote-service posture. Those are exactly the fields a\nlater audit would need and would find missing.",
+      "properties": {
+        "state_schema_version": {
+          "title": "State Schema Version",
+          "type": "integer"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "source_kind": {
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "source_name": {
+          "title": "Source Name",
+          "type": "string"
+        },
+        "source_item_id": {
+          "title": "Source Item Id",
+          "type": "string"
+        },
+        "queue_item_id": {
+          "title": "Queue Item Id",
+          "type": "string"
+        },
+        "queue_state": {
+          "title": "Queue State",
+          "type": "string"
+        },
+        "policy": {
+          "title": "Policy",
+          "type": "string"
+        },
+        "consent": {
+          "title": "Consent",
+          "type": "string"
+        },
+        "remote_services": {
+          "$ref": "#/$defs/RemoteServices"
+        }
+      },
+      "required": [
+        "state_schema_version",
+        "source_id",
+        "source_kind",
+        "source_name",
+        "source_item_id",
+        "queue_item_id",
+        "queue_state",
+        "policy",
+        "consent",
+        "remote_services"
+      ],
+      "title": "SourceProvenance",
+      "type": "object"
+    },
     "TranscriptPointer": {
       "properties": {
         "method": {
@@ -207,6 +265,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/ContentIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceProvenance"
         },
         {
           "type": "null"
