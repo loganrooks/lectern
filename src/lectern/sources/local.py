@@ -86,39 +86,40 @@ def is_bundle_output_path(root: Path, path: Path) -> bool:
     Public because it states half of what a local scan excludes, alongside the
     excluded-directory rules `iter_local_media_files` applies.
 
-    Containment is checked first, before any bundle marker is inspected. A path
-    outside `root` can still sit inside some *other* Lectern bundle, and the
-    marker check would otherwise report that foreign bundle as this root's
-    output — the walk only discovers it never reached `root` afterwards.
+    Everything happens in **one** path space: both operands are resolved once,
+    and the walk climbs the resolved path. Deciding containment in normalized
+    space while walking raw paths is what makes this function subtly wrong, and
+    it goes wrong in more than one way — `root/../foreign/x` is lexically
+    "relative to" `root`, and a symlinked `root` never equals any ancestor of
+    its resolved target, so the walk sails past the root it was supposed to stop
+    at and inspects markers above it. Resolving first, then walking, removes the
+    whole class rather than each symptom.
 
-    Both operands are normalized before comparing, because `Path.relative_to`
-    compares parts without resolving: `root/../foreign/x` is "relative to"
-    `root` and yields a path starting with `..`, which is a way back out of the
-    root and into someone else's bundle. Resolving also settles symlinked
-    components, which a public helper cannot assume its callers have already
-    handled. The marker walk itself still runs on the path as given, so the
-    existing scan caller reaches it with exactly the inputs it did before.
+    Containment is decided before any marker is inspected, because a path
+    outside `root` can still sit inside some *other* Lectern bundle, and that
+    foreign bundle is not this root's output.
     """
 
     try:
-        path.resolve().relative_to(root.resolve())
+        resolved_root = root.resolve()
+        resolved_path = path.resolve()
+        resolved_path.relative_to(resolved_root)
     except (OSError, ValueError):
         return False
 
-    ancestor = path.parent
+    ancestor = resolved_path.parent
     while True:
         if (ancestor / MANIFEST_NAME).is_file() and (ancestor / "source.json").is_file():
             return True
-        if ancestor == root:
+        if ancestor == resolved_root:
             return False
         parent = ancestor.parent
         if parent == ancestor:
-            # Reaching the filesystem root means the walk never met `root`. The
-            # containment check above makes that unreachable for the documented
-            # contract; it is kept because the filesystem root is its own parent,
-            # so without it this loop has no termination condition at all, and a
-            # future caller reaching the walk by another route would hang rather
-            # than return.
+            # Containment plus a resolved walk make this unreachable: climbing
+            # from a path under `resolved_root` must meet it. Kept because the
+            # filesystem root is its own parent, so without it the loop has no
+            # termination condition at all for any caller that reaches it by
+            # another route.
             return False
         ancestor = parent
 
@@ -129,6 +130,13 @@ def _transcript_sidecar_escapes_root(path: Path, root: Path) -> bool:
     `LocalFolderAdapter.discover` drops such media (the sidecar is content the
     approval digest would cover, so it must stay inside the source), and
     `preflight_local_folder` applies the same rule so its count matches discovery.
+
+    Both operands are resolved, for the same reason `is_bundle_output_path`
+    resolves both: comparing a resolved sidecar against the root as given puts
+    the two sides in different path spaces, and a symlinked root then makes a
+    fully contained sidecar look like an escape. Today's callers happen to pass
+    an already-resolved root, so this was latent rather than live — but the
+    function is what states the rule, so it is what should enforce it.
     """
 
     sidecar = path.with_suffix(".transcript.txt")
@@ -137,8 +145,8 @@ def _transcript_sidecar_escapes_root(path: Path, root: Path) -> bool:
     if sidecar.is_symlink():
         return True
     try:
-        sidecar.resolve().relative_to(root)
-    except ValueError:
+        sidecar.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
         return True
     return False
 

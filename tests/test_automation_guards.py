@@ -269,3 +269,53 @@ def test_bundle_output_walk_rejects_a_parent_traversal_escape(tmp_path: Path) ->
 
     with time_budget(5.0):
         assert automation.is_bundle_output_path(root, escaped) is False
+
+
+def test_bundle_output_walk_uses_one_coordinate_system(tmp_path: Path) -> None:
+    """Containment and the ancestor walk must agree on which path space they use.
+
+    Normalizing for the containment test but walking the raw path leaves the two
+    checks in different coordinate systems: when `root` is a symlink and `path`
+    is its resolved target, containment succeeds while `ancestor == root` never
+    can, so the walk climbs straight past the intended root and inspects markers
+    above it.
+    """
+
+    real_root = tmp_path / "real" / "root"
+    media = real_root / "media"
+    media.mkdir(parents=True)
+    (media / "clip.wav").write_bytes(b"")
+
+    # A bundle sitting *above* the root, which the walk must never reach.
+    outer = tmp_path / "real"
+    (outer / "manifest.json").write_text("{}", encoding="utf-8")
+    (outer / "source.json").write_text("{}", encoding="utf-8")
+
+    root_alias = tmp_path / "root-link"
+    root_alias.symlink_to(real_root, target_is_directory=True)
+
+    with time_budget(5.0):
+        assert automation.is_bundle_output_path(root_alias, media / "clip.wav") is False
+
+
+def test_transcript_sidecar_containment_uses_one_coordinate_system(tmp_path: Path) -> None:
+    """The same coordinate-system split, in the sidecar containment check.
+
+    `approval_digest_and_media_size` rejects a sidecar that escapes the source
+    root. That check resolves the sidecar but compared it against the root as
+    given, so a symlinked root made an entirely contained sidecar look like an
+    escape and refused a legitimate file.
+    """
+
+    real_src = tmp_path / "real" / "src"
+    real_src.mkdir(parents=True)
+    media = real_src / "talk.wav"
+    media.write_bytes(b"audio")
+    (real_src / "talk.transcript.txt").write_text("hello", encoding="utf-8")
+
+    root_alias = tmp_path / "src-link"
+    root_alias.symlink_to(real_src, target_is_directory=True)
+
+    digest, size = automation.approval_digest_and_media_size(media, root=root_alias)
+    assert size == len(b"audio")
+    assert len(digest) == 64
