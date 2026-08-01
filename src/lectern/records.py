@@ -35,6 +35,19 @@ class SourceKind(StrEnum):
     YOUTUBE_PLAYLIST = "youtube-playlist"
 
 
+class LibraryKind(StrEnum):
+    """What sort of thing a library record points at.
+
+    Reserved now, with a second member present from the start, because a
+    discriminator introduced alongside its second case is a discriminator whose
+    extensibility has been exercised. One added later against a single existing
+    kind is an assumption that the shape will hold.
+    """
+
+    RECORDING = "recording"
+    NOTE = "note"
+
+
 class SourcePolicy(StrEnum):
     DISABLED = "disabled"
     SCAN_ONLY = "scan-only"
@@ -246,6 +259,7 @@ class LibraryBundle:
     source_item_id: str
     queue_item_id: str
     created_at: str
+    kind: LibraryKind = LibraryKind.RECORDING
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -257,6 +271,7 @@ class LibraryBundle:
             "source_item_id": self.source_item_id,
             "queue_item_id": self.queue_item_id,
             "created_at": self.created_at,
+            "kind": self.kind.value,
         }
 
 

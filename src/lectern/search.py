@@ -271,3 +271,87 @@ def resolve_against_segments(anchor: Anchor, segments: list[dict[str, Any]]) -> 
 
 def _as_float(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+class AnchorIssue(StrEnum):
+    """Ways a segment fails to name a moment that exists."""
+
+    OUT_OF_BOUNDS = "out-of-bounds"
+    OUT_OF_ORDER = "out-of-order"
+
+
+@dataclass(frozen=True)
+class SamplerIssue:
+    """One located defect. Locating it is the point: an issue nobody can find is
+    an issue nobody can fix."""
+
+    kind: AnchorIssue
+    bundle_id: str
+    segment_id: int | None
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "bundle_id": self.bundle_id,
+            "segment_id": self.segment_id,
+            "detail": self.detail,
+        }
+
+
+# A recording's declared duration and its last timestamp legitimately disagree by
+# a little: normalization resamples, and a transcriber may round. The tolerance
+# exists so the sampler reports transcripts that are wrong rather than transcripts
+# that are merely imprecise.
+DURATION_TOLERANCE_S = 2.0
+
+
+def sample_segment_timings(
+    bundle_id: str, segments: list[dict[str, Any]], duration_s: float | None
+) -> list[SamplerIssue]:
+    """Check that each segment names a moment the recording actually contains.
+
+    `duration_s` may be `None`, and absence is not evidence of a bad timestamp:
+    reporting issues there would make the sampler loudest on the bundles whose
+    provenance is weakest, which is where a real signal would be hardest to see.
+    """
+
+    issues: list[SamplerIssue] = []
+    previous_start: float | None = None
+    for segment in segments:
+        segment_id = segment.get("id")
+        located = segment_id if isinstance(segment_id, int) else None
+        start = _as_float(segment.get("start_s"))
+        if start is None:
+            continue
+
+        if start < 0:
+            issues.append(
+                SamplerIssue(
+                    kind=AnchorIssue.OUT_OF_BOUNDS,
+                    bundle_id=bundle_id,
+                    segment_id=located,
+                    detail=f"start_s {start} precedes the recording",
+                )
+            )
+        elif duration_s is not None and start > duration_s + DURATION_TOLERANCE_S:
+            issues.append(
+                SamplerIssue(
+                    kind=AnchorIssue.OUT_OF_BOUNDS,
+                    bundle_id=bundle_id,
+                    segment_id=located,
+                    detail=f"start_s {start} exceeds duration {duration_s}",
+                )
+            )
+
+        if previous_start is not None and start < previous_start:
+            issues.append(
+                SamplerIssue(
+                    kind=AnchorIssue.OUT_OF_ORDER,
+                    bundle_id=bundle_id,
+                    segment_id=located,
+                    detail=f"start_s {start} precedes the previous segment at {previous_start}",
+                )
+            )
+        previous_start = start
+    return issues

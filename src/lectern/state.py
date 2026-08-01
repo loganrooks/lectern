@@ -24,6 +24,7 @@ from lectern.records import (
     TERMINAL_QUEUE_STATES,
     AutomationError,
     LibraryBundle,
+    LibraryKind,
     LibraryRecordOutcome,
     QueueItem,
     QueueState,
@@ -44,10 +45,12 @@ from lectern.search import (
     Anchor,
     AnchorResolution,
     ResolvedAnchor,
+    SamplerIssue,
     index_signature,
     literal_match_expression,
     make_anchor,
     resolve_against_segments,
+    sample_segment_timings,
     segment_text,
 )
 
@@ -448,7 +451,8 @@ class AutomationStateStore:
                 source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
                 source_item_id TEXT NOT NULL REFERENCES source_items(id) ON DELETE CASCADE,
                 queue_item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'recording'
             );
 
             """
@@ -478,6 +482,14 @@ class AutomationStateStore:
             );
             """
         )
+        columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(library_bundles)").fetchall()
+        }
+        if "kind" not in columns:
+            self._connection.execute(
+                "ALTER TABLE library_bundles ADD COLUMN kind TEXT NOT NULL DEFAULT 'recording'"
+            )
         self._write_index_signature()
         self._backfill_segment_index()
         self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
@@ -640,6 +652,32 @@ class AutomationStateStore:
                 )
                 return anchor, resolve_against_segments(anchor, segments)
         raise AutomationError(f"segment {segment_id} not found in bundle: {bundle_id}")
+
+    def sample_anchor_correctness(self) -> list[SamplerIssue]:
+        """Check every registered bundle's segments against its declared duration.
+
+        This is the acceptance clause "cite anchors resolve to real transcript
+        segments" read as the promise it makes rather than as the lookup it is
+        easy to satisfy: a segment whose timestamp lies outside the recording
+        resolves perfectly and still cannot be played.
+        """
+
+        issues: list[SamplerIssue] = []
+        for row in self._connection.execute(
+            "SELECT bundle_id, bundle_path FROM library_bundles ORDER BY bundle_id"
+        ).fetchall():
+            bundle_id = str(row[0])
+            segments = self._bundle_segments(bundle_id)
+            if segments is None:
+                continue
+            duration: float | None = None
+            try:
+                manifest = Manifest.load(Path(str(row[1])))
+                duration = manifest.source.duration_s
+            except (OSError, ValueError):
+                duration = None
+            issues.extend(sample_segment_timings(bundle_id, segments, duration))
+        return issues
 
     def index_synthetic_segment(self, bundle_id: str, segment_id: int, text: str) -> None:
         """Index one segment directly. For fixtures that need a script the audio lacks.
@@ -1128,7 +1166,26 @@ def _library_bundle_from_row(row: sqlite3.Row) -> LibraryBundle:
         source_item_id=cast(str, row["source_item_id"]),
         queue_item_id=cast(str, row["queue_item_id"]),
         created_at=cast(str, row["created_at"]),
+        kind=_library_kind_from_row(row),
     )
+
+
+def _library_kind_from_row(row: sqlite3.Row) -> LibraryKind:
+    """Read the discriminator, tolerating one this build does not know.
+
+    A row written by a newer version must stay listable by an older one.
+    Refusing an unrecognised value would turn a field reserved for forward
+    compatibility into the thing that breaks it.
+    """
+
+    try:
+        raw = row["kind"]
+    except (IndexError, KeyError):
+        return LibraryKind.RECORDING
+    try:
+        return LibraryKind(str(raw))
+    except ValueError:
+        return LibraryKind.RECORDING
 
 
 def _metadata_from_row(row: sqlite3.Row) -> dict[str, Any]:
