@@ -32,6 +32,7 @@ from lectern.automation import (
     preflight_state_store,
     preflight_youtube_playlist,
 )
+from lectern.sources import youtube
 
 
 class FakeTransport:
@@ -1224,8 +1225,8 @@ def test_cli_sources_scan_max_pages_limits_pages_and_skips_removals(
     monkeypatch.setenv("YOUTUBE_API_KEY", "fake-secret")
     # FakeTransport raises if a second page is requested, so an unbounded scan fails here.
     monkeypatch.setattr(
-        automation,
-        "_urllib_get",
+        youtube,
+        "urllib_get",
         FakeTransport([_playlist_page([_alpha_item()], next_page_token="NEXT")]),
     )
 

@@ -18,3 +18,8 @@ build/
 # Generated user data and local run output.
 bundles/
 pytest-cache-files-*/
+
+# Coverage measurement output; produced ad hoc, never a build input.
+.coverage
+.coverage.*
+htmlcov/
