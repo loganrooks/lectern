@@ -1,0 +1,90 @@
+{
+  "note": "Synthetic retrieval fixtures. Every sentence below was invented for this test suite and quotes no real source, so the synthetic-fixture policy holds for text as it does for audio. Expected terms are hand-authored rather than generated, because a golden file computed from the implementation asserts nothing.",
+  "canon_version": 1,
+  "cases": [
+    {
+      "script": "latin",
+      "text": "Phenomenology examines experience",
+      "expected_terms": [
+        "examines",
+        "experience",
+        "phenomenology"
+      ],
+      "query": "experience",
+      "note": "Whitespace-delimited and case-folded; the baseline every other case is compared against."
+    },
+    {
+      "script": "greek",
+      "text": "Η φαινομενολογία εξετάζει",
+      "expected_terms": [
+        "εξετάζει",
+        "η",
+        "φαινομενολογία"
+      ],
+      "query": "φαινομενολογία",
+      "note": "Non-Latin but whitespace-delimited, so it needs no segmentation."
+    },
+    {
+      "script": "arabic",
+      "text": "الفلسفة دراسة الوجود",
+      "expected_terms": [
+        "الفلسفة",
+        "الوجود",
+        "دراسة"
+      ],
+      "query": "الفلسفة",
+      "note": "Right-to-left and whitespace-delimited. This is the case the contract's 'non-Latin/RTL' clause names, and it passes WITHOUT segmentation -- which is why satisfying that clause proves nothing about the scripts that actually fail."
+    },
+    {
+      "script": "han",
+      "text": "现象学研究",
+      "expected_terms": [
+        "学",
+        "现",
+        "研",
+        "究",
+        "象"
+      ],
+      "query": "现象",
+      "note": "Unsegmented. Without per-character separation the whole run is one term and a two-character query cannot match it."
+    },
+    {
+      "script": "hiragana",
+      "text": "これはしけん",
+      "expected_terms": [
+        "け",
+        "こ",
+        "し",
+        "ん",
+        "は",
+        "れ"
+      ],
+      "query": "しけん",
+      "note": "Kana are not ideographs. A rule written for 'CJK ideographs' leaves this unsegmented, which is how a scope claim covering Japanese came to be shipped against a rule that served only Chinese."
+    },
+    {
+      "script": "katakana",
+      "text": "テスト",
+      "expected_terms": [
+        "ス",
+        "テ",
+        "ト"
+      ],
+      "query": "テス",
+      "note": "Same class as hiragana, separate block. Deliberately avoids the prolonged sound mark U+30FC, whose tokenizer category is not obvious enough to hand-author an expectation for -- a golden nobody can predict is a golden nobody can check."
+    },
+    {
+      "script": "hangul",
+      "text": "현상학연구",
+      "expected_terms": [
+        "구",
+        "상",
+        "연",
+        "학",
+        "현"
+      ],
+      "query": "현상",
+      "note": "Hangul syllables are precomposed and are not ideographs either."
+    }
+  ]
+}
