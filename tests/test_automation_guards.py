@@ -208,3 +208,39 @@ def test_reused_adapter_reports_no_stale_quota_after_a_failed_rescan() -> None:
     assert adapter.scan_metadata == {}
     assert adapter.pages_attempted == 1
     assert adapter.attempted_quota_units == 1
+
+
+def test_bundle_output_walk_rejects_a_bundle_outside_root(tmp_path: Path) -> None:
+    """A bundle that is not under `root` is not this root's output.
+
+    The marker check runs before the walk can discover it never reached `root`,
+    so a path outside `root` that happens to sit inside some *other* Lectern
+    bundle would otherwise be reported as this root's bundle output.
+    """
+
+    root = tmp_path / "root"
+    root.mkdir()
+    other_bundle = tmp_path / "elsewhere" / "some-bundle"
+    other_bundle.mkdir(parents=True)
+    (other_bundle / "manifest.json").write_text("{}", encoding="utf-8")
+    (other_bundle / "source.json").write_text("{}", encoding="utf-8")
+    outside = other_bundle / "media" / "audio.wav"
+    outside.parent.mkdir()
+    outside.write_bytes(b"")
+
+    with time_budget(5.0):
+        assert automation.is_bundle_output_path(root, outside) is False
+
+
+def test_bundle_output_walk_still_finds_a_bundle_under_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    bundle = root / "bundles" / "talk-0001"
+    bundle.mkdir(parents=True)
+    (bundle / "manifest.json").write_text("{}", encoding="utf-8")
+    (bundle / "source.json").write_text("{}", encoding="utf-8")
+    inside = bundle / "media" / "audio.wav"
+    inside.parent.mkdir()
+    inside.write_bytes(b"")
+
+    with time_budget(5.0):
+        assert automation.is_bundle_output_path(root, inside) is True

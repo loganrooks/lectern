@@ -85,7 +85,19 @@ def is_bundle_output_path(root: Path, path: Path) -> bool:
 
     Public because it states half of what a local scan excludes, alongside the
     excluded-directory rules `iter_local_media_files` applies.
+
+    Containment is checked first, before any bundle marker is inspected. A path
+    outside `root` can still sit inside some *other* Lectern bundle, and the
+    marker check would otherwise report that foreign bundle as this root's
+    output — the walk only discovers it never reached `root` afterwards.
+    Comparison is lexical, matching how `iter_local_media_files` builds the
+    paths it passes (from `root.rglob`), so no caller's result changes.
     """
+
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
 
     ancestor = path.parent
     while True:
@@ -95,10 +107,12 @@ def is_bundle_output_path(root: Path, path: Path) -> bool:
             return False
         parent = ancestor.parent
         if parent == ancestor:
-            # The walk reached the filesystem root without meeting `root`, so
-            # `path` is not under it and cannot be this root's bundle output.
-            # The filesystem root is its own parent, so without this the loop
-            # has no termination condition for such a path at all.
+            # Reaching the filesystem root means the walk never met `root`. The
+            # containment check above makes that unreachable for the documented
+            # contract; it is kept because the filesystem root is its own parent,
+            # so without it this loop has no termination condition at all, and a
+            # future caller reaching the walk by another route would hang rather
+            # than return.
             return False
         ancestor = parent
 
