@@ -90,13 +90,19 @@ def is_bundle_output_path(root: Path, path: Path) -> bool:
     outside `root` can still sit inside some *other* Lectern bundle, and the
     marker check would otherwise report that foreign bundle as this root's
     output — the walk only discovers it never reached `root` afterwards.
-    Comparison is lexical, matching how `iter_local_media_files` builds the
-    paths it passes (from `root.rglob`), so no caller's result changes.
+
+    Both operands are normalized before comparing, because `Path.relative_to`
+    compares parts without resolving: `root/../foreign/x` is "relative to"
+    `root` and yields a path starting with `..`, which is a way back out of the
+    root and into someone else's bundle. Resolving also settles symlinked
+    components, which a public helper cannot assume its callers have already
+    handled. The marker walk itself still runs on the path as given, so the
+    existing scan caller reaches it with exactly the inputs it did before.
     """
 
     try:
-        path.relative_to(root)
-    except ValueError:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
         return False
 
     ancestor = path.parent

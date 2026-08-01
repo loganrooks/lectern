@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 
 from lectern import automation, provenance, records, state
@@ -126,3 +128,27 @@ def test_every_split_module_is_reachable_through_the_facade() -> None:
         # this asserts the facade is not empty for any part, which is the
         # failure mode worth catching.
         assert reachable, f"{module.__name__} contributes nothing to the facade"
+
+
+def test_importing_the_state_store_does_not_pull_in_a_transport() -> None:
+    """The store must not *transitively* acquire the HTTP transport either.
+
+    Grepping this module's own source for `urllib` is too weak a check: an
+    import of the source package reaches `sources.youtube`, and through it
+    `urllib.request`, without the string ever appearing in `state.py`. The
+    boundary this split claims is about what loading the persistence layer
+    actually costs, so it is checked in a fresh interpreter.
+    """
+
+    probe = (
+        "import sys; import lectern.state; "
+        "print('urllib.request' in sys.modules, 'lectern.sources' in sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "False False", result.stdout

@@ -92,6 +92,8 @@ from lectern.state import (
     AutomationStateStore,
     StateStorePreflight,
     preflight_state_store,
+    queue_from_row,
+    source_item_from_row,
 )
 
 # Re-exported so `lectern.automation` remains the spine's single import surface:
@@ -172,6 +174,118 @@ class AutomationState(AutomationStateStore):
     through this module's globals, which is also what lets a caller substitute
     it when exercising the rollback paths below.
     """
+
+    def _default_adapter(self, source: SourceRecord) -> SourceAdapter:
+        """Map a source kind to a concrete adapter.
+
+        This is the composition root's job, and keeping it here is what lets
+        `lectern.state` be imported without loading an HTTP transport.
+        """
+
+        return default_source_adapter(source)
+
+    def add_youtube_playlist_source(
+        self,
+        name: str,
+        playlist: str,
+        policy: SourcePolicy = SourcePolicy.REVIEW,
+    ) -> SourceRecord:
+        """Register a playlist source from a user-supplied playlist id or URL.
+
+        Normalization is provider knowledge, so it happens here and the store is
+        handed the identity it should persist.
+        """
+
+        return super().add_youtube_playlist_source(
+            name, normalize_youtube_playlist_id(playlist), policy
+        )
+
+    def _ensure_one_shot_source(self, source_path: Path) -> SourceRecord:
+        source = source_path.resolve()
+        source_id = make_source_id(SourceKind.ONE_SHOT.value, str(source))
+        now = now_timestamp()
+        self._connection.execute(
+            """
+            INSERT INTO sources(id, kind, name, root_path, policy, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (
+                source_id,
+                SourceKind.ONE_SHOT.value,
+                f"one-shot:{source.name}:{source_id[-8:]}",
+                str(source),
+                SourcePolicy.REVIEW.value,
+                now,
+                now,
+            ),
+        )
+        self._connection.commit()
+        return self.get_source(source_id)
+
+    def _ensure_one_shot_item(self, source: SourceRecord, source_path: Path) -> SourceItem:
+        path = source_path.resolve()
+        digest, size = approval_digest_and_media_size(path)
+        stat = path.stat()
+        now = now_timestamp()
+        item = SourceItem(
+            id=make_source_item_id(source.id, path.name),
+            source_id=source.id,
+            relative_path=path.name,
+            absolute_path=str(path),
+            sha256=digest,
+            size_bytes=size,
+            mtime_ns=stat.st_mtime_ns,
+            present=True,
+            created_at=now,
+            updated_at=now,
+        )
+        old = self._connection.execute(
+            "SELECT * FROM source_items WHERE id = ?",
+            (item.id,),
+        ).fetchone()
+        self._upsert_source_item(
+            item,
+            created_at=source_item_from_row(old).created_at if old is not None else None,
+        )
+        self._connection.commit()
+        return self.get_source_item(item.id)
+
+    def _ensure_one_shot_queue(self, source: SourceRecord, item: SourceItem) -> QueueItem:
+        queue_item_id = make_queue_item_id(item.id, item.sha256)
+        existing = self._connection.execute(
+            "SELECT * FROM queue_items WHERE id = ?",
+            (queue_item_id,),
+        ).fetchone()
+        if existing is not None:
+            queue_item = queue_from_row(existing)
+            if queue_item.state is QueueState.COMPLETED:
+                return queue_item
+            return self._set_queue_state(queue_item.id, QueueState.APPROVED, clear_error=True)
+
+        now = now_timestamp()
+        self._connection.execute(
+            """
+            INSERT INTO queue_items(
+                id, source_id, source_item_id, content_sha256, state, policy,
+                bundle_id, attempts, last_error, created_at, updated_at, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, ?, ?, ?)
+            """,
+            (
+                queue_item_id,
+                source.id,
+                item.id,
+                item.sha256,
+                QueueState.APPROVED.value,
+                source.policy.value,
+                now,
+                now,
+                metadata_to_json(item.metadata),
+            ),
+        )
+        self._connection.commit()
+        return self.get_queue_item(queue_item_id)
 
     def ingest_queue_item(
         self,

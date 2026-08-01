@@ -36,13 +36,9 @@ from lectern.records import (
     SourceRecord,
     make_queue_item_id,
     make_source_id,
-    make_source_item_id,
     metadata_to_json,
     now_timestamp,
 )
-from lectern.sources import default_source_adapter
-from lectern.sources.local import approval_digest_and_media_size
-from lectern.sources.youtube import normalize_youtube_playlist_id
 
 
 class AutomationStateStore:
@@ -114,8 +110,15 @@ class AutomationStateStore:
         playlist: str,
         policy: SourcePolicy = SourcePolicy.REVIEW,
     ) -> SourceRecord:
-        playlist_id = normalize_youtube_playlist_id(playlist)
-        source_id = make_source_id(SourceKind.YOUTUBE_PLAYLIST.value, playlist_id)
+        """Register a playlist source from an already-normalized playlist id.
+
+        Turning a user-supplied playlist URL into an id is provider knowledge,
+        so it belongs to the layer that knows about providers; the store is
+        handed the identity it should persist. `AutomationState` overrides this
+        to normalize first, which is the entry point every caller reaches.
+        """
+
+        source_id = make_source_id(SourceKind.YOUTUBE_PLAYLIST.value, playlist)
         now = now_timestamp()
         existing = self._connection.execute(
             "SELECT * FROM sources WHERE id = ? OR name = ?",
@@ -126,7 +129,7 @@ class AutomationStateStore:
             if (
                 source.kind is SourceKind.YOUTUBE_PLAYLIST
                 and source.name == name
-                and source.root_path == playlist_id
+                and source.root_path == playlist
                 and source.policy is policy
             ):
                 return source
@@ -140,7 +143,7 @@ class AutomationStateStore:
                 source_id,
                 SourceKind.YOUTUBE_PLAYLIST.value,
                 name,
-                playlist_id,
+                playlist,
                 policy.value,
                 now,
                 now,
@@ -164,6 +167,18 @@ class AutomationStateStore:
             raise AutomationError(f"source not found: {source_id_or_name}")
         return _source_from_row(row)
 
+    def _default_adapter(self, source: SourceRecord) -> SourceAdapter:
+        """Resolve the adapter `scan_source` uses when the caller supplies none.
+
+        The store deliberately knows no concrete adapter. That edge is what let
+        a Google HTTP client live in the persistence layer, and importing the
+        adapter package here would reinstate it in a subtler form: loading the
+        store would transitively load a network transport. The composition root
+        overrides this.
+        """
+
+        raise AutomationError(f"unsupported source kind for scan: {source.kind.value}")
+
     def scan_source(
         self,
         source_id_or_name: str,
@@ -180,7 +195,7 @@ class AutomationStateStore:
                 queued=[],
             )
 
-        adapter_for_scan = adapter or default_source_adapter(source)
+        adapter_for_scan = adapter or self._default_adapter(source)
         current_items = _dedupe_by_relative_path(adapter_for_scan.discover(source))
         scan_metadata = _scan_metadata_from_adapter(adapter_for_scan)
         truncated = _scan_reports_truncation(scan_metadata)
@@ -257,7 +272,7 @@ class AutomationStateStore:
                 "SELECT * FROM queue_items WHERE state = ? ORDER BY created_at, id",
                 (state.value,),
             ).fetchall()
-        return [_queue_from_row(row) for row in rows]
+        return [queue_from_row(row) for row in rows]
 
     def get_queue_item(self, queue_item_id: str) -> QueueItem:
         row = self._connection.execute(
@@ -266,7 +281,7 @@ class AutomationStateStore:
         ).fetchone()
         if row is None:
             raise AutomationError(f"queue item not found: {queue_item_id}")
-        return _queue_from_row(row)
+        return queue_from_row(row)
 
     def approve_queue_item(self, queue_item_id: str) -> QueueItem:
         self._reject_illegal_transition(queue_item_id, "approve")
@@ -331,7 +346,7 @@ class AutomationStateStore:
         ).fetchone()
         if row is None:
             raise AutomationError(f"source item not found: {source_item_id}")
-        return _source_item_from_row(row)
+        return source_item_from_row(row)
 
     def list_library(self) -> list[LibraryBundle]:
         rows = self._connection.execute(
@@ -503,7 +518,7 @@ class AutomationStateStore:
                 "SELECT * FROM source_items WHERE source_id = ?",
                 (source_id,),
             ).fetchall()
-        return [_source_item_from_row(row) for row in rows]
+        return [source_item_from_row(row) for row in rows]
 
     def _upsert_source_item(self, item: SourceItem, *, created_at: str | None) -> None:
         self._connection.execute(
@@ -745,93 +760,6 @@ class AutomationStateStore:
             return None
         return _library_bundle_from_row(existing)
 
-    def _ensure_one_shot_source(self, source_path: Path) -> SourceRecord:
-        source = source_path.resolve()
-        source_id = make_source_id(SourceKind.ONE_SHOT.value, str(source))
-        now = now_timestamp()
-        self._connection.execute(
-            """
-            INSERT INTO sources(id, kind, name, root_path, policy, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            (
-                source_id,
-                SourceKind.ONE_SHOT.value,
-                f"one-shot:{source.name}:{source_id[-8:]}",
-                str(source),
-                SourcePolicy.REVIEW.value,
-                now,
-                now,
-            ),
-        )
-        self._connection.commit()
-        return self.get_source(source_id)
-
-    def _ensure_one_shot_item(self, source: SourceRecord, source_path: Path) -> SourceItem:
-        path = source_path.resolve()
-        digest, size = approval_digest_and_media_size(path)
-        stat = path.stat()
-        now = now_timestamp()
-        item = SourceItem(
-            id=make_source_item_id(source.id, path.name),
-            source_id=source.id,
-            relative_path=path.name,
-            absolute_path=str(path),
-            sha256=digest,
-            size_bytes=size,
-            mtime_ns=stat.st_mtime_ns,
-            present=True,
-            created_at=now,
-            updated_at=now,
-        )
-        old = self._connection.execute(
-            "SELECT * FROM source_items WHERE id = ?",
-            (item.id,),
-        ).fetchone()
-        self._upsert_source_item(
-            item,
-            created_at=_source_item_from_row(old).created_at if old is not None else None,
-        )
-        self._connection.commit()
-        return self.get_source_item(item.id)
-
-    def _ensure_one_shot_queue(self, source: SourceRecord, item: SourceItem) -> QueueItem:
-        queue_item_id = make_queue_item_id(item.id, item.sha256)
-        existing = self._connection.execute(
-            "SELECT * FROM queue_items WHERE id = ?",
-            (queue_item_id,),
-        ).fetchone()
-        if existing is not None:
-            queue_item = _queue_from_row(existing)
-            if queue_item.state is QueueState.COMPLETED:
-                return queue_item
-            return self._set_queue_state(queue_item.id, QueueState.APPROVED, clear_error=True)
-
-        now = now_timestamp()
-        self._connection.execute(
-            """
-            INSERT INTO queue_items(
-                id, source_id, source_item_id, content_sha256, state, policy,
-                bundle_id, attempts, last_error, created_at, updated_at, metadata_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, ?, ?, ?)
-            """,
-            (
-                queue_item_id,
-                source.id,
-                item.id,
-                item.sha256,
-                QueueState.APPROVED.value,
-                source.policy.value,
-                now,
-                now,
-                metadata_to_json(item.metadata),
-            ),
-        )
-        self._connection.commit()
-        return self.get_queue_item(queue_item_id)
-
 
 STATE_SCHEMA_VERSION = 2
 
@@ -908,7 +836,7 @@ def _source_from_row(row: sqlite3.Row) -> SourceRecord:
     )
 
 
-def _source_item_from_row(row: sqlite3.Row) -> SourceItem:
+def source_item_from_row(row: sqlite3.Row) -> SourceItem:
     return SourceItem(
         id=cast(str, row["id"]),
         source_id=cast(str, row["source_id"]),
@@ -924,7 +852,7 @@ def _source_item_from_row(row: sqlite3.Row) -> SourceItem:
     )
 
 
-def _queue_from_row(row: sqlite3.Row) -> QueueItem:
+def queue_from_row(row: sqlite3.Row) -> QueueItem:
     return QueueItem(
         id=cast(str, row["id"]),
         source_id=cast(str, row["source_id"]),

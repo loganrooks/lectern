@@ -244,3 +244,28 @@ def test_bundle_output_walk_still_finds_a_bundle_under_root(tmp_path: Path) -> N
 
     with time_budget(5.0):
         assert automation.is_bundle_output_path(root, inside) is True
+
+
+def test_bundle_output_walk_rejects_a_parent_traversal_escape(tmp_path: Path) -> None:
+    """`..` escapes are outside `root` even though they are lexically under it.
+
+    `Path.relative_to` compares parts without normalizing, so
+    `root/../foreign/x` "is relative to" `root` and yields a path beginning with
+    `..`. Containment has to be decided on normalized operands, or a caller can
+    walk out of the root and back into someone else's bundle.
+    """
+
+    root = tmp_path / "root"
+    root.mkdir()
+    foreign = tmp_path / "foreign-bundle"
+    foreign.mkdir()
+    (foreign / "manifest.json").write_text("{}", encoding="utf-8")
+    (foreign / "source.json").write_text("{}", encoding="utf-8")
+    media = foreign / "media"
+    media.mkdir()
+    (media / "clip.wav").write_bytes(b"")
+
+    escaped = root / ".." / "foreign-bundle" / "media" / "clip.wav"
+
+    with time_budget(5.0):
+        assert automation.is_bundle_output_path(root, escaped) is False
