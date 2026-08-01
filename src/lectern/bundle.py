@@ -20,6 +20,23 @@ SCHEMA_VERSION = "0.1.0"
 MANIFEST_NAME = "manifest.json"
 
 
+def schema_version_is_compatible(version: str) -> bool:
+    """Whether this build can read a manifest declaring `version`.
+
+    Compatibility is keyed on the leading component only, matching SUPPORT.md:
+    additive changes raise a later component and stay readable, while a breaking
+    change raises the leading one and must not be read under the old meaning.
+
+    The M5a content-identity change to `Source.ref` is breaking — the field
+    keeps its type while changing what it denotes, so nothing about the shape
+    warns an older reader. The increment itself is an open owner decision; this
+    predicate is written so that settling it is a one-line change to
+    `SCHEMA_VERSION` and nothing else.
+    """
+
+    return version.split(".", 1)[0] == SCHEMA_VERSION.split(".", 1)[0]
+
+
 def atomic_write_text(path: Path, text: str) -> Path:
     """Publish ``text`` at ``path`` via a same-directory temporary file.
 
@@ -81,7 +98,15 @@ class Source(BaseModel):
     """Provenance. `local` sources trigger the privacy hard rule (ADR-0002)."""
 
     kind: SourceKind
-    ref: str  # URL or original file path
+    # A *reference* to the source, never a location on the machine that made
+    # the bundle. For remote kinds that is the URL, which is the identity. For
+    # `local` it is `sha256:<digest>`: a bundle outlives the filesystem it was
+    # built on, so a path in it both discloses the account name and dangles as
+    # soon as the bundle is copied (LW-11, ratified 2026-08-01).
+    ref: str
+    # Size travels with the digest because identity alone cannot tell a caller
+    # whether this was a short clip or a long lecture.
+    bytes: int | None = None
     title: str | None = None
     channel: str | None = None
     published: datetime | None = None
@@ -123,7 +148,23 @@ class Manifest(BaseModel):
 
     @classmethod
     def load(cls, bundle_dir: Path) -> Manifest:
-        return cls.model_validate_json((bundle_dir / MANIFEST_NAME).read_text())
+        """Load a manifest, refusing one this code cannot claim to understand.
+
+        Without this check the version field is decoration: a newer manifest
+        validates against the current model, missing fields take their defaults,
+        and repurposed fields are read under their old meaning. That silence is
+        what makes a same-shaped change dangerous — the consumer gets no error,
+        just a wrong answer. Refusing is the only way the compatibility promise
+        in SUPPORT.md means anything at the point of use.
+        """
+
+        manifest = cls.model_validate_json((bundle_dir / MANIFEST_NAME).read_text())
+        if not schema_version_is_compatible(manifest.schema_version):
+            raise ValueError(
+                f"unsupported bundle schema version {manifest.schema_version!r}; "
+                f"this build reads schema version {SCHEMA_VERSION!r}"
+            )
+        return manifest
 
 
 def export_json_schema() -> str:

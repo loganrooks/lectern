@@ -154,7 +154,8 @@ def ingest_local(
             bundle_id=bundle_id,
             source=Source(
                 kind=SourceKind.LOCAL,
-                ref=str(source),
+                ref=f"sha256:{source_digest}",
+                bytes=source_size,
                 title=source.stem.replace("_", " ").title(),
                 duration_s=source_duration,
             ),
@@ -258,13 +259,13 @@ def _read_transcript_sidecar(source: Path, duration_s: float | None = None) -> T
                     ),
                 ),
                 method="fixture_transcript_sidecar",
-                backend={"kind": "sidecar", "path": str(transcript_path), "sha256": digest},
+                backend={"kind": "sidecar", "sha256": digest},
                 evidence_limit="fixture transcript passthrough; no ASR quality claim",
                 remote_services=_remote_services(
                     transcriber_network_posture="not_applicable_sidecar"
                 ),
                 identity={"method": "fixture_transcript_sidecar", "sha256": digest},
-                sidecar={"path": str(transcript_path), "sha256": digest, "bytes": size},
+                sidecar={"sha256": digest, "bytes": size},
             )
         raise IngestError(f"fixture transcript is empty: {transcript_path}")
     raise IngestError(
@@ -559,7 +560,6 @@ def _transcript_metadata(
         "remote_services": transcript.remote_services,
         "evidence_limit": transcript.evidence_limit,
         "source_media": {
-            "path": str(source),
             "sha256": source_digest,
         },
         "normalized_audio": {

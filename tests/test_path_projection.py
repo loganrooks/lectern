@@ -168,19 +168,17 @@ def test_library_list_emits_no_filesystem_path(
     _assert_no_path(_ingest_one(tmp_path, state, capsys), folder, "library list")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "`library show` embeds the bundle's manifest, and `source.ref` still holds the "
-        "absolute media path. That is LW-11, delivered in phase 2 (content identity), not "
-        "something the projection layer can fix -- the value is inside an artifact this "
-        "command reads, not a field it serializes. strict=True so this fails once phase 2 "
-        "lands and the marker must be removed rather than lingering."
-    ),
-)
 def test_library_show_emits_no_filesystem_path(
     registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
 ) -> None:
+    """Green once phase 2 lands: the embedded manifest no longer carries a path.
+
+    Held as xfail(strict=True) through phase 1 because the leak was inside an
+    artifact this command reads rather than a field it serializes, so the
+    projection layer could not reach it. The strict marker is what forced its
+    own removal the moment content identity landed.
+    """
+
     tmp_path, folder, state = registered
     listing = _ingest_one(tmp_path, state, capsys)
     bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]

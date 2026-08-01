@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import sys
@@ -27,7 +28,13 @@ def test_local_ingest_acceptance_for_synthetic_talk(tmp_path: Path) -> None:
     manifest = Manifest.load(bundle_dir)
     assert manifest.bundle_id.startswith("synthetic-talk-")
     assert manifest.source.kind is SourceKind.LOCAL
-    assert manifest.source.ref == str(SYNTHETIC_TALK)
+    # LW-11 (owner-ratified 2026-08-01): a bundle records what its media was,
+    # not where it sat. The assertion is retargeted from location to identity;
+    # it is the same property -- "this bundle came from that file" -- expressed
+    # in the representation that survives the bundle being copied elsewhere.
+    assert (
+        manifest.source.ref == f"sha256:{hashlib.sha256(SYNTHETIC_TALK.read_bytes()).hexdigest()}"
+    )
 
     for stage in (
         StageName.ACQUIRE,
@@ -45,7 +52,13 @@ def test_local_ingest_acceptance_for_synthetic_talk(tmp_path: Path) -> None:
     assert (bundle_dir / "transcript" / "transcript.md").is_file()
     assert (bundle_dir / "analysis" / "summary.md").is_file()
     source_record = json.loads((bundle_dir / "source.json").read_text(encoding="utf-8"))
-    assert source_record["transcript_sidecar"]["path"] == str(SYNTHETIC_TRANSCRIPT)
+    # LW-11: the sidecar is identified by its content, not its location. The
+    # digest is the stronger assertion anyway -- a path proves only that a
+    # filename was recorded, while the digest proves which bytes were read.
+    assert (
+        source_record["transcript_sidecar"]["sha256"]
+        == hashlib.sha256(SYNTHETIC_TRANSCRIPT.read_bytes()).hexdigest()
+    )
     assert source_record["transcript_sidecar"]["bytes"] == SYNTHETIC_TRANSCRIPT.stat().st_size
 
     reference = SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8").strip()
