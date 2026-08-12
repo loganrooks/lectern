@@ -574,6 +574,12 @@ class AutomationStateStore:
             identifier = str(bundle_id)
             current = self._segments_digest(Path(str(bundle_path)))
             if current is None:
+                # Search results are claims about the bundle as it exists now.
+                # If its supporting transcript vanished or became unreadable,
+                # retaining old FTS rows serves text the bundle can no longer
+                # substantiate and makes reconciliation falsely look current.
+                self._delete_index_rows(identifier)
+                refreshed.append(identifier)
                 continue
             row = self._connection.execute(
                 "SELECT segments_sha256 FROM indexed_bundles WHERE bundle_id = ?", (identifier,)
@@ -613,8 +619,10 @@ class AutomationStateStore:
             payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
             segments = json.loads(payload)
         except (OSError, ValueError):
+            self._delete_index_rows(bundle_id)
             return 0
         if not isinstance(segments, list):
+            self._delete_index_rows(bundle_id)
             return 0
 
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
@@ -623,19 +631,22 @@ class AutomationStateStore:
         # cast would state the assumption as a fact the type checker then stops
         # questioning. A malformed segment is skipped, and the reconciliation
         # query is what keeps the skip visible.
-        rows: list[tuple[str, object, str, str]] = []
+        rows: list[tuple[str, int, str, str]] = []
         for segment in cast(list[Any], segments):
             if not isinstance(segment, dict):
                 continue
             entry = cast(dict[str, Any], segment)
+            segment_id = entry.get("id")
             text = entry.get("text")
-            if not text:
+            if isinstance(segment_id, bool) or not isinstance(segment_id, int):
+                continue
+            if not isinstance(text, str) or not text:
                 continue
             # `display` is the text as written; `body` is the segmented form the
             # tokenizer needs. Returning `body` to a caller printed CJK with a
             # space between every character and whole transcripts for text-only
             # bundles -- an internal representation escaping as a user-facing one.
-            rows.append((bundle_id, entry.get("id"), str(text), segment_text(str(text))))
+            rows.append((bundle_id, segment_id, text, segment_text(text)))
         digest = self._segments_digest(bundle_dir)
         if digest is not None:
             self._connection.execute(

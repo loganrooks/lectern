@@ -113,6 +113,41 @@ def test_reconciliation_detects_a_missing_bundle(tmp_path: Path) -> None:
         assert state.unindexed_bundle_ids() != []
 
 
+def test_reconciliation_removes_stale_hits_when_segments_disappear(tmp_path: Path) -> None:
+    """Search must not retain text the current bundle can no longer support."""
+
+    state_path, bundle = _ingest(tmp_path)
+    with open_state(state_path) as state:
+        assert [hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name]
+
+    (bundle / "transcript" / "segments.json").unlink()
+
+    with open_state(state_path) as state:
+        assert not [
+            hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name
+        ]
+        assert bundle.name in state.unindexed_bundle_ids()
+
+
+@pytest.mark.parametrize("corrupt_bytes", [b"{", b"\xff"])
+def test_reconciliation_removes_stale_hits_when_segments_are_corrupt(
+    tmp_path: Path, corrupt_bytes: bytes
+) -> None:
+    """Readable but unparsable bytes cannot continue supporting old search results."""
+
+    state_path, bundle = _ingest(tmp_path)
+    with open_state(state_path) as state:
+        assert [hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name]
+
+    (bundle / "transcript" / "segments.json").write_bytes(corrupt_bytes)
+
+    with open_state(state_path) as state:
+        assert not [
+            hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name
+        ]
+        assert bundle.name in state.unindexed_bundle_ids()
+
+
 def test_rebuild_on_signature_mismatch(tmp_path: Path) -> None:
     """An index built under one segmentation rule must not be queried under another.
 
@@ -194,3 +229,22 @@ def test_backfill_survives_an_unreadable_bundle(tmp_path: Path, missing: str) ->
     with open_state(state_path) as state:
         assert state.indexed_segment_count() == 0
         assert state.unindexed_bundle_ids() != []
+
+
+@pytest.mark.parametrize("malformed_id", [[0], {"nested": 0}])
+def test_refresh_skips_malformed_segment_ids_without_blocking_store(
+    tmp_path: Path, malformed_id: object
+) -> None:
+    """One malformed bundle must not make the entire local library unavailable."""
+
+    state_path, bundle = _ingest(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    segments[0]["id"] = malformed_id
+    segments_path.write_text(json.dumps(segments), encoding="utf-8")
+
+    with open_state(state_path) as state:
+        assert state.list_library()
+        assert not [
+            hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name
+        ]
