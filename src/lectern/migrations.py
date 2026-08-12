@@ -140,8 +140,14 @@ def _source_path(path: Path) -> Path:
     return source
 
 
-def _role_exists(path: Path) -> bool:
-    return os.path.lexists(path)
+def _role_exists(path: Path, role: str) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect the {role}") from exc
+    return True
 
 
 def _digest(path: Path) -> tuple[str, int]:
@@ -204,7 +210,7 @@ def _artifact_path(bundle: Path, raw: object) -> Path:
 
 
 def _assert_no_symlinks(bundle: Path, role: str) -> None:
-    if not _role_exists(bundle) or bundle.is_symlink() or not bundle.is_dir():
+    if not _role_exists(bundle, f"{role} role") or bundle.is_symlink() or not bundle.is_dir():
         raise MigrationError(f"{role} role must be a real bundle directory")
     try:
         contains_symlink = any(path.is_symlink() for path in bundle.rglob("*"))
@@ -500,7 +506,7 @@ def prepare_bundle_migration(bundle_dir: Path) -> PreparedBundleMigration:
         raise RuntimeError("migration target and manifest schema version disagree")
     source = _source_path(bundle_dir)
     _assert_no_symlinks(source, "source")
-    if _role_exists(source / MARKER_NAME):
+    if _role_exists(source / MARKER_NAME, "source migration marker"):
         raise MigrationError("source role contains a migration marker")
     raw = _read_object(source / MANIFEST_NAME, "source manifest")
     if raw.get("schema_version") != LEGACY_SCHEMA_VERSION:
@@ -512,9 +518,9 @@ def prepare_bundle_migration(bundle_dir: Path) -> PreparedBundleMigration:
 
     staging = source.with_name(source.name + STAGING_SUFFIX)
     backup = source.with_name(source.name + BACKUP_SUFFIX)
-    if _role_exists(backup):
+    if _role_exists(backup, "backup role"):
         raise MigrationError("backup role is already occupied")
-    if _role_exists(staging):
+    if _role_exists(staging, "staging role"):
         raise MigrationError("staging role is already occupied")
     try:
         staging.mkdir(mode=0o700)
@@ -599,3 +605,278 @@ def prepare_bundle_migration(bundle_dir: Path) -> PreparedBundleMigration:
         source_snapshot=source_snapshot,
         target_snapshot=target_snapshot,
     )
+
+
+def _rename(source: Path, destination: Path) -> None:
+    source.rename(destination)
+
+
+def _clear_marker(target: Path) -> None:
+    try:
+        (target / MARKER_NAME).unlink(missing_ok=True)
+    except OSError as exc:
+        raise MigrationError("cannot clear the migration marker") from exc
+
+
+def _role_is_directory(path: Path, role: str) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect the {role} role") from exc
+    return stat.S_ISDIR(mode)
+
+
+def _publish(prepared: PreparedBundleMigration) -> None:
+    _assert_snapshot(prepared.source_dir, prepared.source_snapshot, "source")
+    _assert_snapshot(prepared.staging_dir, prepared.target_snapshot, "target")
+    try:
+        _rename(prepared.source_dir, prepared.backup_dir)
+    except OSError as exc:
+        raise MigrationError("cannot move the source role into the backup role") from exc
+    try:
+        _rename(prepared.staging_dir, prepared.source_dir)
+    except OSError as exc:
+        try:
+            _rename(prepared.backup_dir, prepared.source_dir)
+        except OSError as restore_exc:
+            raise MigrationError(
+                "migration publication failed and source restoration also failed"
+            ) from restore_exc
+        raise MigrationError("cannot publish migrated bundle; original was restored") from exc
+
+    _assert_snapshot(prepared.source_dir, prepared.target_snapshot, "target")
+    _, published_snapshot = _validate_prepared_target(
+        prepared.source_dir,
+        legacy_source=prepared.backup_dir,
+        source_snapshot=prepared.source_snapshot,
+        expected_bundle_id=prepared.bundle_id,
+        source_sha256=prepared.source_sha256,
+        source_bytes=prepared.source_bytes,
+    )
+    if published_snapshot != prepared.target_snapshot:
+        raise MigrationError("target tree changed during migration publication")
+    _assert_snapshot(prepared.source_dir, prepared.target_snapshot, "target")
+    _clear_marker(prepared.source_dir)
+
+
+def _current_version(bundle: Path, role: str) -> str:
+    value = _read_object(bundle / MANIFEST_NAME, f"{role} manifest").get("schema_version")
+    if not isinstance(value, str):
+        raise MigrationError(f"{role} manifest schema version is malformed")
+    return value
+
+
+def _validate_legacy(
+    bundle: Path, *, role: str, expected_bundle_id: str | None = None
+) -> tuple[str, str, int]:
+    _assert_no_symlinks(bundle, role)
+    if _role_exists(bundle / MARKER_NAME, f"{role} migration marker"):
+        raise MigrationError(f"{role} role contains a migration marker")
+    raw = _read_object(bundle / MANIFEST_NAME, f"{role} manifest")
+    if raw.get("schema_version") != LEGACY_SCHEMA_VERSION:
+        raise MigrationError(f"{role} role does not declare schema 0.1.0")
+    bundle_id, manifest_source = _manifest_fields(raw)
+    if expected_bundle_id is not None and bundle_id != expected_bundle_id:
+        raise MigrationError("backup and source bundle IDs disagree")
+    _assert_declared_integrity(bundle, raw)
+    source_sha256, source_bytes = _source_identity(bundle, manifest_source)
+    return bundle_id, source_sha256, source_bytes
+
+
+def _validate_current(bundle: Path) -> tuple[Manifest, str, int]:
+    raw = _read_object(bundle / MANIFEST_NAME, "current manifest")
+    bundle_id, manifest_source = _manifest_fields(raw)
+    _assert_declared_integrity(bundle, raw)
+    source_sha256, source_bytes = _source_identity(bundle, manifest_source)
+    manifest = _validate_target(
+        bundle,
+        expected_bundle_id=bundle_id,
+        source_sha256=source_sha256,
+        source_bytes=source_bytes,
+    )
+    return manifest, source_sha256, source_bytes
+
+
+def _prepared_from_existing_staging(
+    source: Path,
+    staging: Path,
+    backup: Path,
+    *,
+    bundle_id: str,
+    source_sha256: str,
+    source_bytes: int,
+) -> PreparedBundleMigration:
+    if not _role_is_directory(staging, "staging") or not _marker_matches(staging, bundle_id):
+        raise MigrationError("staging role is ambiguous")
+    source_snapshot = _tree_snapshot(source, "source")
+    _, target_snapshot = _validate_prepared_target(
+        staging,
+        legacy_source=source,
+        source_snapshot=source_snapshot,
+        expected_bundle_id=bundle_id,
+        source_sha256=source_sha256,
+        source_bytes=source_bytes,
+    )
+    return PreparedBundleMigration(
+        bundle_id=bundle_id,
+        source_version=LEGACY_SCHEMA_VERSION,
+        target_version=TARGET_SCHEMA_VERSION,
+        source_sha256=source_sha256,
+        source_bytes=source_bytes,
+        source_dir=source,
+        staging_dir=staging,
+        backup_dir=backup,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+
+
+def migrate_bundle(bundle_dir: Path) -> BundleMigrationResult:
+    """Migrate one legacy bundle in place or recover its deterministic roles."""
+    source = _source_path(bundle_dir)
+    staging = source.with_name(source.name + STAGING_SUFFIX)
+    backup = source.with_name(source.name + BACKUP_SUFFIX)
+
+    if _role_exists(source, "source role"):
+        if not _role_is_directory(source, "source"):
+            raise MigrationError("source role is occupied by a non-directory")
+        _assert_no_symlinks(source, "source")
+        version = _current_version(source, "source")
+        if version == TARGET_SCHEMA_VERSION:
+            if _role_exists(staging, "staging role"):
+                raise MigrationError("staging role is occupied beside a current source role")
+            manifest, current_sha256, current_bytes = _validate_current(source)
+            marker_exists = _role_exists(source / MARKER_NAME, "source migration marker")
+            backup_exists = _role_exists(backup, "backup role")
+            if marker_exists and (
+                not backup_exists
+                or not _role_is_directory(backup, "backup")
+                or not _marker_matches(source, manifest.bundle_id)
+            ):
+                raise MigrationError("current source migration state is ambiguous")
+            if backup_exists:
+                if not _role_is_directory(backup, "backup"):
+                    raise MigrationError("backup role is occupied by a non-directory")
+                backup_id, backup_sha256, backup_bytes = _validate_legacy(
+                    backup,
+                    role="backup",
+                    expected_bundle_id=manifest.bundle_id,
+                )
+                if (backup_sha256, backup_bytes) != (current_sha256, current_bytes):
+                    raise MigrationError("backup source identity differs from current target")
+                if marker_exists:
+                    backup_snapshot = _tree_snapshot(backup, "backup")
+                    _validate_prepared_target(
+                        source,
+                        legacy_source=backup,
+                        source_snapshot=backup_snapshot,
+                        expected_bundle_id=backup_id,
+                        source_sha256=backup_sha256,
+                        source_bytes=backup_bytes,
+                    )
+            if marker_exists:
+                _clear_marker(source)
+            return BundleMigrationResult(
+                bundle_id=manifest.bundle_id,
+                source_version=TARGET_SCHEMA_VERSION,
+                target_version=TARGET_SCHEMA_VERSION,
+                outcome="recovered" if marker_exists else "already_current",
+                backup_retained=backup_exists,
+            )
+        if version != LEGACY_SCHEMA_VERSION:
+            raise MigrationError("source role declares an unsupported schema version")
+
+        bundle_id, source_sha256, source_bytes = _validate_legacy(source, role="source")
+        if _role_exists(backup, "backup role"):
+            raise MigrationError("backup role is already occupied")
+        if _role_exists(staging, "staging role"):
+            prepared = _prepared_from_existing_staging(
+                source,
+                staging,
+                backup,
+                bundle_id=bundle_id,
+                source_sha256=source_sha256,
+                source_bytes=source_bytes,
+            )
+            _publish(prepared)
+            return BundleMigrationResult(
+                bundle_id=bundle_id,
+                source_version=LEGACY_SCHEMA_VERSION,
+                target_version=TARGET_SCHEMA_VERSION,
+                outcome="recovered",
+                backup_retained=True,
+            )
+
+        prepared = prepare_bundle_migration(source)
+        _publish(prepared)
+        return BundleMigrationResult(
+            bundle_id=prepared.bundle_id,
+            source_version=prepared.source_version,
+            target_version=prepared.target_version,
+            outcome="migrated",
+            backup_retained=True,
+        )
+
+    if not _role_exists(backup, "backup role"):
+        raise MigrationError("source role is missing and no backup role can restore it")
+    if not _role_is_directory(backup, "backup"):
+        raise MigrationError("backup role is occupied by a non-directory")
+
+    bundle_id, source_sha256, source_bytes = _validate_legacy(backup, role="backup")
+    backup_snapshot = _tree_snapshot(backup, "backup")
+    staging_exists = _role_exists(staging, "staging role")
+    if staging_exists:
+        try:
+            if not _role_is_directory(staging, "staging") or not _marker_matches(
+                staging, bundle_id
+            ):
+                raise MigrationError("staging role is ambiguous")
+            _, target_snapshot = _validate_prepared_target(
+                staging,
+                legacy_source=backup,
+                source_snapshot=backup_snapshot,
+                expected_bundle_id=bundle_id,
+                source_sha256=source_sha256,
+                source_bytes=source_bytes,
+            )
+        except MigrationError:
+            pass
+        else:
+            _assert_snapshot(backup, backup_snapshot, "backup")
+            _assert_snapshot(staging, target_snapshot, "target")
+            try:
+                _rename(staging, source)
+            except OSError as exc:
+                raise MigrationError("cannot finish publication from the staging role") from exc
+            _assert_snapshot(source, target_snapshot, "target")
+            _, published_snapshot = _validate_prepared_target(
+                source,
+                legacy_source=backup,
+                source_snapshot=backup_snapshot,
+                expected_bundle_id=bundle_id,
+                source_sha256=source_sha256,
+                source_bytes=source_bytes,
+            )
+            if published_snapshot != target_snapshot:
+                raise MigrationError("target tree changed during recovery publication")
+            _assert_snapshot(source, target_snapshot, "target")
+            _clear_marker(source)
+            return BundleMigrationResult(
+                bundle_id=bundle_id,
+                source_version=LEGACY_SCHEMA_VERSION,
+                target_version=TARGET_SCHEMA_VERSION,
+                outcome="recovered",
+                backup_retained=True,
+            )
+
+    _assert_snapshot(backup, backup_snapshot, "backup")
+    try:
+        _rename(backup, source)
+    except OSError as exc:
+        raise MigrationError("cannot restore the source role from backup") from exc
+    _assert_snapshot(source, backup_snapshot, "source")
+    if staging_exists:
+        raise MigrationError("restored the original bundle; staging role remains unusable")
+    raise MigrationError("restored the original bundle after an incomplete migration")

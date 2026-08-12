@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -1164,3 +1166,418 @@ def test_prepare_rejects_strict_raw_transcript_segment_numeric_string(
         prepare_bundle_migration(bundle)
     assert str(bundle) not in str(error.value)
     _assert_source_unchanged_and_staging_removed(bundle, before)
+
+
+def test_migrate_swaps_in_target_and_retains_original_backup(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    before = _tree_bytes(bundle)
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "migrated"
+    assert result.backup_retained is True
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    assert _tree_bytes(backup) == before
+
+
+def test_second_rename_failure_restores_legacy_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_rename = migrations._rename  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def fail_second(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic publish failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(migrations, "_rename", fail_second)
+    with pytest.raises(MigrationError, match="publish migrated bundle"):
+        migrations.migrate_bundle(bundle)
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+    assert not os.path.lexists(bundle.with_name(bundle.name + BACKUP_SUFFIX))
+    assert bundle.with_name(bundle.name + STAGING_SUFFIX).is_dir()
+
+
+def test_restart_reuses_marked_target_after_in_process_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_rename = migrations._rename  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def fail_second_once(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic publish failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(migrations, "_rename", fail_second_once)
+    with pytest.raises(MigrationError, match="original was restored"):
+        migrations.migrate_bundle(bundle)
+    monkeypatch.setattr(migrations, "_rename", real_rename)
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "recovered"
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+
+
+def test_restart_finishes_forward_from_backup_and_marked_staging(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    prepared.source_dir.rename(prepared.backup_dir)
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "recovered"
+    assert result.backup_retained is True
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+
+
+def test_restart_restores_backup_when_no_usable_staging_exists(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    shutil.rmtree(prepared.staging_dir)
+    prepared.source_dir.rename(prepared.backup_dir)
+    with pytest.raises(MigrationError, match="restored the original"):
+        migrations.migrate_bundle(bundle)
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+    assert not os.path.lexists(prepared.backup_dir)
+
+
+@pytest.mark.parametrize("role", ["backup", "staging"])
+def test_migrate_preserves_occupied_sibling_role(tmp_path: Path, role: str) -> None:
+    bundle = legacy_bundle(tmp_path)
+    sibling = bundle.with_name(
+        bundle.name + (BACKUP_SUFFIX if role == "backup" else STAGING_SUFFIX)
+    )
+    sibling.mkdir()
+    (sibling / "owner.txt").write_text("unrelated\n", encoding="utf-8")
+    before = _tree_state(bundle)
+    with pytest.raises(MigrationError, match=f"{role} role"):
+        migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle) == before
+    assert (sibling / "owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+
+
+def test_already_current_is_a_validated_no_op(tmp_path: Path) -> None:
+    media = tmp_path / "current" / "synthetic_talk.wav"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    media.with_suffix(".transcript.txt").write_text(
+        SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    bundle = ingest_local(media, tmp_path / "current-bundles").bundle_dir
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "already_current"
+    assert result.source_version == result.target_version == "1.0.0"
+    assert result.backup_retained is False
+
+
+def test_already_current_rejects_hash_invalid_target(tmp_path: Path) -> None:
+    media = tmp_path / "invalid-current" / "synthetic_talk.wav"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    media.with_suffix(".transcript.txt").write_text(
+        SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    bundle = ingest_local(media, tmp_path / "invalid-current-bundles").bundle_dir
+    (bundle / "source.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(MigrationError, match="declared artifact integrity"):
+        migrations.migrate_bundle(bundle)
+
+
+def test_rerun_after_migration_validates_the_retained_backup(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "already_current"
+    assert result.backup_retained is True
+
+
+@pytest.mark.parametrize("role", ["source", "target"])
+def test_migrate_rechecks_prepared_snapshots_before_first_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_prepare = migrations.prepare_bundle_migration
+
+    def prepare_then_mutate(path: Path) -> migrations.PreparedBundleMigration:
+        prepared = real_prepare(path)
+        changed = prepared.source_dir if role == "source" else prepared.staging_dir
+        (changed / "transcript" / "transcript.md").write_text(
+            f"late {role} mutation\n", encoding="utf-8"
+        )
+        return prepared
+
+    monkeypatch.setattr(migrations, "prepare_bundle_migration", prepare_then_mutate)
+    with pytest.raises(MigrationError, match=f"{role} tree changed"):
+        migrations.migrate_bundle(bundle)
+    assert not os.path.lexists(bundle.with_name(bundle.name + BACKUP_SUFFIX))
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+
+
+def test_restart_rejects_self_consistent_staging_drift_and_restores_backup(
+    tmp_path: Path,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    prepared.source_dir.rename(prepared.backup_dir)
+    (prepared.staging_dir / "transcript" / "transcript.md").write_text(
+        "self-consistent drift\n", encoding="utf-8"
+    )
+    _repair_manifest_after_artifact_change(prepared.staging_dir)
+
+    with pytest.raises(MigrationError, match="staging role remains unusable"):
+        migrations.migrate_bundle(bundle)
+
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+    assert not os.path.lexists(prepared.backup_dir)
+    assert prepared.staging_dir.is_dir()
+
+
+def test_rerun_after_migration_rejects_invalid_retained_backup(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    (backup / "source.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(MigrationError, match="declared artifact integrity"):
+        migrations.migrate_bundle(bundle)
+
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    assert backup.is_dir()
+
+
+def test_rerun_rejects_valid_backup_with_different_source_identity(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    source_path = backup / "source.json"
+    source = _read_json(source_path)
+    source["sha256"] = "f" * 64
+    _write_json(source_path, source)
+    _repair_manifest_after_artifact_change(backup)
+
+    with pytest.raises(MigrationError, match="backup source identity"):
+        migrations.migrate_bundle(bundle)
+
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    assert backup.is_dir()
+
+
+def _fail_lstat_once(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Path,
+) -> None:
+    real_lstat = Path.lstat
+    failed = False
+
+    def fail_target_once(path: Path) -> os.stat_result:
+        nonlocal failed
+        caller = sys._getframe(1).f_code.co_name  # pyright: ignore[reportPrivateUsage]
+        if not failed and path == target and caller == "_role_exists":
+            failed = True
+            raise PermissionError("synthetic role status failure")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_target_once)
+
+
+def test_source_role_status_error_does_not_overwrite_occupied_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    shutil.rmtree(prepared.staging_dir)
+    prepared.source_dir.rename(prepared.backup_dir)
+    prepared.source_dir.mkdir()
+    (prepared.source_dir / "owner.txt").write_text("unrelated\n", encoding="utf-8")
+    _fail_lstat_once(monkeypatch, prepared.source_dir)
+
+    with pytest.raises(MigrationError, match="cannot inspect the source role") as error:
+        migrations.migrate_bundle(bundle)
+
+    assert str(bundle) not in str(error.value)
+    assert (prepared.source_dir / "owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+    assert prepared.backup_dir.is_dir()
+
+
+@pytest.mark.parametrize("role", ["backup", "staging"])
+def test_legacy_sibling_role_status_error_fails_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    before = _tree_state(bundle)
+    sibling = bundle.with_name(
+        bundle.name + (BACKUP_SUFFIX if role == "backup" else STAGING_SUFFIX)
+    )
+    _fail_lstat_once(monkeypatch, sibling)
+
+    with pytest.raises(MigrationError, match=f"cannot inspect the {role} role") as error:
+        migrations.migrate_bundle(bundle)
+
+    assert str(bundle) not in str(error.value)
+    assert _tree_state(bundle) == before
+    assert not os.path.lexists(sibling)
+
+
+def test_current_marker_status_error_does_not_settle_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    marker = bundle / MARKER_NAME
+    _write_json(
+        marker,
+        migrations._marker_payload(  # pyright: ignore[reportPrivateUsage]
+            Manifest.load(bundle).bundle_id
+        ),
+    )
+    _fail_lstat_once(monkeypatch, marker)
+
+    with pytest.raises(MigrationError, match="cannot inspect the source migration marker") as error:
+        migrations.migrate_bundle(bundle)
+
+    assert str(bundle) not in str(error.value)
+    assert marker.is_file()
+    assert bundle.with_name(bundle.name + BACKUP_SUFFIX).is_dir()
+
+
+def test_current_staging_status_error_preserves_marker_and_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    marker = bundle / MARKER_NAME
+    _write_json(
+        marker,
+        migrations._marker_payload(  # pyright: ignore[reportPrivateUsage]
+            Manifest.load(bundle).bundle_id
+        ),
+    )
+    staging = bundle.with_name(bundle.name + STAGING_SUFFIX)
+    staging.mkdir()
+    (staging / "owner.txt").write_text("unrelated\n", encoding="utf-8")
+    _fail_lstat_once(monkeypatch, staging)
+
+    with pytest.raises(MigrationError, match="cannot inspect the staging role") as error:
+        migrations.migrate_bundle(bundle)
+
+    assert str(bundle) not in str(error.value)
+    assert marker.is_file()
+    assert (staging / "owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+
+
+def test_first_rename_failure_retains_retryable_legacy_and_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_rename = migrations._rename  # pyright: ignore[reportPrivateUsage]
+
+    def fail_first(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("synthetic first rename failure")
+
+    monkeypatch.setattr(migrations, "_rename", fail_first)
+    with pytest.raises(MigrationError, match="move the source role") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+    assert not os.path.lexists(bundle.with_name(bundle.name + BACKUP_SUFFIX))
+    assert _staging_role(bundle).is_dir()
+
+    monkeypatch.setattr(migrations, "_rename", real_rename)
+    assert migrations.migrate_bundle(bundle).outcome == "recovered"
+
+
+def test_rollback_failure_retains_forward_recoverable_roles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_rename = migrations._rename  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def fail_publish_and_restore(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls in {2, 3}:
+            raise OSError("synthetic rename failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(migrations, "_rename", fail_publish_and_restore)
+    with pytest.raises(MigrationError, match="restoration also failed") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert not os.path.lexists(bundle)
+    assert bundle.with_name(bundle.name + BACKUP_SUFFIX).is_dir()
+    assert _staging_role(bundle).is_dir()
+
+    monkeypatch.setattr(migrations, "_rename", real_rename)
+    assert migrations.migrate_bundle(bundle).outcome == "recovered"
+
+
+def test_post_publication_validation_failure_is_restart_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_validate = migrations._validate_prepared_target  # pyright: ignore[reportPrivateUsage]
+
+    def fail_only_after_publication(
+        target: Path,
+        **kwargs: Any,
+    ) -> tuple[Manifest, migrations.TreeSnapshot]:
+        result = real_validate(target, **kwargs)
+        if target == bundle:
+            raise MigrationError("synthetic post-publication validation failure")
+        return result
+
+    monkeypatch.setattr(
+        migrations,
+        "_validate_prepared_target",
+        fail_only_after_publication,
+    )
+    with pytest.raises(MigrationError, match="post-publication validation") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    assert (bundle / MARKER_NAME).is_file()
+    assert bundle.with_name(bundle.name + BACKUP_SUFFIX).is_dir()
+
+    monkeypatch.setattr(migrations, "_validate_prepared_target", real_validate)
+    assert migrations.migrate_bundle(bundle).outcome == "recovered"
+    assert not os.path.lexists(bundle / MARKER_NAME)
+
+
+def test_marker_clear_failure_is_restart_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    real_clear = migrations._clear_marker  # pyright: ignore[reportPrivateUsage]
+
+    def fail_clear(target: Path) -> None:
+        del target
+        raise MigrationError("synthetic marker clear failure")
+
+    monkeypatch.setattr(migrations, "_clear_marker", fail_clear)
+    with pytest.raises(MigrationError, match="marker clear failure") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    assert (bundle / MARKER_NAME).is_file()
+    assert bundle.with_name(bundle.name + BACKUP_SUFFIX).is_dir()
+
+    monkeypatch.setattr(migrations, "_clear_marker", real_clear)
+    assert migrations.migrate_bundle(bundle).outcome == "recovered"
+    assert not os.path.lexists(bundle / MARKER_NAME)
