@@ -11,7 +11,8 @@ from typing import Any, cast
 
 import pytest
 
-from lectern import migrations
+from lectern import cli, migrations
+from lectern.automation import open_state
 from lectern.bundle import MANIFEST_NAME, Manifest
 from lectern.ingest import ingest_local
 from lectern.migrations import (
@@ -21,6 +22,7 @@ from lectern.migrations import (
     MigrationError,
     prepare_bundle_migration,
 )
+from lectern.search import Anchor, AnchorResolution
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -90,6 +92,29 @@ def legacy_bundle(tmp_path: Path) -> Path:
     bundle = ingest_local(media, tmp_path / "bundles").bundle_dir
     _write_legacy_shape(bundle, media)
     return bundle
+
+
+def registered_legacy_bundle(tmp_path: Path) -> tuple[Path, Path, str, int, Anchor]:
+    media = tmp_path / "Registered Recordings" / "synthetic_talk.wav"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    media.with_suffix(".transcript.txt").write_text(
+        SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        result = state.ingest_one_shot(media, tmp_path / "registered-bundles")
+        hits = state.search_segments("inspectable knowledge")
+        assert hits
+        hit = hits[0]
+        assert hit.segment_id is not None
+        bundle_id = hit.bundle_id
+        segment_id = hit.segment_id
+        before_anchor, resolved = state.cite_segment(bundle_id, segment_id)
+        assert resolved.outcome is AnchorResolution.EXACT
+        assert state.get_library_bundle(bundle_id).bundle_path == str(result.bundle_dir)
+    _write_legacy_shape(result.bundle_dir, media)
+    return state_path, result.bundle_dir, bundle_id, segment_id, before_anchor
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -1581,3 +1606,31 @@ def test_marker_clear_failure_is_restart_recoverable(
     monkeypatch.setattr(migrations, "_clear_marker", real_clear)
     assert migrations.migrate_bundle(bundle).outcome == "recovered"
     assert not os.path.lexists(bundle / MARKER_NAME)
+
+
+def test_cli_migrates_in_place_with_path_free_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    assert cli.main(["migrate", str(bundle)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "backup_retained": True,
+        "bundle_id": Manifest.load(bundle).bundle_id,
+        "outcome": "migrated",
+        "source_version": "0.1.0",
+        "target_version": "1.0.0",
+    }
+    assert str(bundle) not in json.dumps(payload)
+
+
+def test_library_search_and_cite_survive_same_path_migration(tmp_path: Path) -> None:
+    state_path, bundle, bundle_id, segment_id, before_anchor = registered_legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    with open_state(state_path) as state:
+        assert state.get_library_bundle(bundle_id).bundle_path == str(bundle)
+        after = state.search_segments("inspectable knowledge")
+        assert any(hit.bundle_id == bundle_id and hit.segment_id == segment_id for hit in after)
+        after_anchor, resolved = state.cite_segment(bundle_id, segment_id)
+        assert after_anchor == before_anchor
+        assert resolved.outcome is AnchorResolution.EXACT

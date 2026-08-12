@@ -25,6 +25,7 @@ from lectern.automation import (
 )
 from lectern.bundle import export_artifact_schemas, export_json_schema
 from lectern.ingest import IngestError
+from lectern.migrations import MigrationError, migrate_bundle
 
 # Commands that return stored data to a caller, and therefore must emit no
 # filesystem path in either rendering.
@@ -48,6 +49,7 @@ OUTWARD_COMMANDS = (
     "library show",
     "library search",
     "library cite",
+    "migrate",
 )
 
 USAGE = """usage: lectern [--version] <command>
@@ -55,7 +57,8 @@ USAGE = """usage: lectern [--version] <command>
 commands:
   doctor         check required local tools and state-store access
   ingest         ingest local media into a bundle
-  library        list or show ingested bundles from local state
+  library        list, search, or cite ingested bundles from local state
+  migrate        migrate one bundle to the current manifest schema
   queue          inspect and update discovery queue items
   schema export  print or write the manifest JSON Schema
   sources        manage local source registry and scans
@@ -681,6 +684,19 @@ def _library_usage() -> None:
     )
 
 
+def _migrate_bundle(args: Sequence[str]) -> int:
+    if len(args) != 1 or args[0].startswith("-"):
+        print("usage: lectern migrate BUNDLE", file=sys.stderr)
+        return 2
+    try:
+        result = migrate_bundle(Path(args[0]))
+    except MigrationError as exc:
+        print(f"migrate: {exc}", file=sys.stderr)
+        return 3
+    _print_json(result.to_public_dict())
+    return 0
+
+
 def _usage() -> None:
     print(USAGE, file=sys.stderr)
 
@@ -695,6 +711,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _doctor()
         if args and args[0] == "ingest":
             return _ingest(args[1:])
+        if args and args[0] == "migrate":
+            return _migrate_bundle(args[1:])
         if args and args[0] == "library":
             return _library(args[1:])
         if args and args[0] == "queue":

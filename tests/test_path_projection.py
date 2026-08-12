@@ -23,6 +23,7 @@ import pytest
 from pytest import CaptureFixture
 
 from lectern import cli
+from lectern.ingest import ingest_local
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -40,6 +41,7 @@ OUTWARD_COMMANDS = (
     "library show",
     "library search",
     "library cite",
+    "migrate",
 )
 
 
@@ -54,6 +56,13 @@ def _watched_folder(root: Path) -> Path:
         SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
     )
     return folder
+
+
+def _current_private_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    folder = _watched_folder(tmp_path)
+    media = folder / "synthetic_talk.wav"
+    bundle = ingest_local(media, folder.parent / "bundles").bundle_dir
+    return folder, bundle
 
 
 def _leaky_substrings(folder: Path) -> tuple[str, ...]:
@@ -203,3 +212,24 @@ def test_every_outward_command_is_covered() -> None:
         "outward-facing commands and their path-projection coverage disagree; "
         f"uncovered={sorted(declared - covered)} stale={sorted(covered - declared)}"
     )
+
+
+def test_migrate_success_emits_no_filesystem_path(
+    tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    folder, bundle = _current_private_bundle(tmp_path)
+    assert cli.main(["migrate", str(bundle)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["outcome"] == "already_current"
+    _assert_no_path(captured.out + captured.err, folder, "migrate")
+
+
+def test_migrate_failure_emits_no_filesystem_path(
+    tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    folder, bundle = _current_private_bundle(tmp_path)
+    (bundle / "source.json").write_text("{}\n", encoding="utf-8")
+    assert cli.main(["migrate", str(bundle)]) == 3
+    captured = capsys.readouterr()
+    assert "declared artifact integrity" in captured.err
+    _assert_no_path(captured.out + captured.err, folder, "migrate")
