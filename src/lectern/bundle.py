@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field, RootModel, model_validator
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "1.0.0"
+CONTENT_REF_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_CONTENT_REF = re.compile(CONTENT_REF_PATTERN)
 
 MANIFEST_NAME = "manifest.json"
 
@@ -27,11 +31,9 @@ def schema_version_is_compatible(version: str) -> bool:
     additive changes raise a later component and stay readable, while a breaking
     change raises the leading one and must not be read under the old meaning.
 
-    The M5a content-identity change to `Source.ref` is breaking — the field
-    keeps its type while changing what it denotes, so nothing about the shape
-    warns an older reader. The increment itself is an open owner decision; this
-    predicate is written so that settling it is a one-line change to
-    `SCHEMA_VERSION` and nothing else.
+    The settled `1.0.0` boundary makes legacy `0.1.0` manifests incompatible:
+    the M5a content-identity change keeps `Source.ref` as a string while changing
+    what it denotes, so an older reader cannot detect the break from shape alone.
     """
 
     return version.split(".", 1)[0] == SCHEMA_VERSION.split(".", 1)[0]
@@ -112,6 +114,44 @@ class Source(BaseModel):
     published: datetime | None = None
     duration_s: float | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_local_byte_representation(cls, data: object) -> object:
+        if isinstance(data, dict):
+            values = cast(dict[str, object], data)
+            if values.get("kind") in (SourceKind.LOCAL, SourceKind.LOCAL.value):
+                size = values.get("bytes")
+                if isinstance(size, (str, bool)):
+                    raise ValueError("local source byte size must be a non-negative integer")
+            return values
+        return data
+
+    @model_validator(mode="after")
+    def validate_local_identity(self) -> Source:
+        if self.kind is SourceKind.LOCAL:
+            if _CONTENT_REF.fullmatch(self.ref) is None:
+                raise ValueError("local source ref must be a sha256 content identity")
+            if self.bytes is None or self.bytes < 0:
+                raise ValueError("local source byte size must be a non-negative integer")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "allOf": [
+                {
+                    "if": {"properties": {"kind": {"const": "local"}}},
+                    "then": {
+                        "properties": {
+                            "ref": {"pattern": CONTENT_REF_PATTERN},
+                            "bytes": {"type": "integer", "minimum": 0},
+                        },
+                        "required": ["bytes"],
+                    },
+                }
+            ]
+        }
+    }
+
 
 class ArtifactRef(BaseModel):
     """A produced file, content-addressed for idempotence checks."""
@@ -158,13 +198,15 @@ class Manifest(BaseModel):
         in SUPPORT.md means anything at the point of use.
         """
 
-        manifest = cls.model_validate_json((bundle_dir / MANIFEST_NAME).read_text())
-        if not schema_version_is_compatible(manifest.schema_version):
-            raise ValueError(
-                f"unsupported bundle schema version {manifest.schema_version!r}; "
-                f"this build reads schema version {SCHEMA_VERSION!r}"
-            )
-        return manifest
+        payload: object = json.loads((bundle_dir / MANIFEST_NAME).read_text())
+        if isinstance(payload, dict):
+            version = cast(dict[str, object], payload).get("schema_version")
+            if isinstance(version, str) and not schema_version_is_compatible(version):
+                raise ValueError(
+                    f"unsupported bundle schema version {version!r}; "
+                    f"this build reads schema version {SCHEMA_VERSION!r}"
+                )
+        return cls.model_validate(payload)
 
 
 class RemoteServices(BaseModel):

@@ -162,7 +162,7 @@ unsupported` to inspect them.
 - Local bundles can contain sensitive media-derived artifacts. Keep them out of
   commits and issue reports.
 - Bundle manifest compatibility is tied to the manifest `schema_version`. The
-  current manifest schema version is `0.1.0`; pre-release compatibility policy
+  current manifest schema version is `1.0.0`; pre-release compatibility policy
   is described in [SUPPORT.md](SUPPORT.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security

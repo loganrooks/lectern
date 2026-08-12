@@ -114,15 +114,17 @@ def test_manifest_load_rejects_an_incompatible_schema_version(tmp_path: Path) ->
     This is what made repurposing `source.ref` dangerous rather than merely
     breaking: the field kept its type, so an old consumer got no structural
     error, and `Manifest.load` accepted any version without complaint. The
-    assertion is that an incompatible version is refused -- deliberately not
-    which number is compatible, since that increment is an open owner decision.
+    assertion is that the exact legacy version is refused at the settled major
+    compatibility boundary.
     """
 
     bundle = _ingest(tmp_path)
     manifest_path = bundle / "manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    payload["schema_version"] = "99.0.0"
+    payload["schema_version"] = "0.1.0"
+    payload["source"]["ref"] = "/tmp/legacy.wav"
+    payload["source"].pop("bytes", None)
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="schema version"):
+    with pytest.raises(ValueError, match="unsupported bundle schema version"):
         Manifest.load(bundle)

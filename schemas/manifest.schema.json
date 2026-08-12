@@ -25,6 +25,31 @@
       "type": "object"
     },
     "Source": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "local"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "bytes": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "bytes"
+            ]
+          }
+        }
+      ],
       "description": "Provenance. `local` sources trigger the privacy hard rule (ADR-0002).",
       "properties": {
         "kind": {
@@ -195,7 +220,7 @@
   },
   "properties": {
     "schema_version": {
-      "default": "0.1.0",
+      "default": "1.0.0",
       "title": "Schema Version",
       "type": "string"
     },

@@ -5,6 +5,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from pytest import MonkeyPatch
 
 from lectern.bundle import (
@@ -20,12 +21,67 @@ from lectern.bundle import (
     export_json_schema,
 )
 
+CONTENT_DIGEST = "a" * 64
+
 
 def make_manifest() -> Manifest:
     return Manifest(
         bundle_id="test-0001",
-        source=Source(kind=SourceKind.LOCAL, ref="/tmp/talk.wav", title="Fixture Talk"),
+        source=Source(
+            kind=SourceKind.LOCAL,
+            ref=f"sha256:{CONTENT_DIGEST}",
+            bytes=12,
+            title="Fixture Talk",
+        ),
     )
+
+
+def test_manifest_schema_is_one_zero() -> None:
+    assert SCHEMA_VERSION == "1.0.0"
+
+
+def test_local_source_requires_content_identity_and_size() -> None:
+    with pytest.raises(ValidationError, match="content identity"):
+        Source(kind=SourceKind.LOCAL, ref="/tmp/talk.wav", bytes=12)
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}")
+
+
+def test_local_source_accepts_content_identity() -> None:
+    source = Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}", bytes=12)
+    assert source.ref == f"sha256:{CONTENT_DIGEST}"
+
+
+def test_local_source_rejects_a_negative_size() -> None:
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}", bytes=-1)
+
+
+@pytest.mark.parametrize("raw_bytes", ["12", True])
+def test_local_source_rejects_coercive_byte_values(raw_bytes: object) -> None:
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source.model_validate(
+            {
+                "kind": SourceKind.LOCAL,
+                "ref": f"sha256:{CONTENT_DIGEST}",
+                "bytes": raw_bytes,
+            }
+        )
+
+
+@pytest.mark.parametrize("kind", [SourceKind.YOUTUBE, SourceKind.URL])
+def test_non_local_source_preserves_negative_bytes(kind: SourceKind) -> None:
+    source = Source(kind=kind, ref="remote-id", bytes=-1)
+    assert source.bytes == -1
+
+
+@pytest.mark.parametrize(("raw_bytes", "expected"), [("12", 12), (True, 1)])
+@pytest.mark.parametrize("kind", [SourceKind.YOUTUBE, SourceKind.URL])
+def test_non_local_source_preserves_coercive_bytes(
+    kind: SourceKind, raw_bytes: object, expected: int
+) -> None:
+    source = Source.model_validate({"kind": kind, "ref": "remote-id", "bytes": raw_bytes})
+    assert source.bytes == expected
 
 
 def test_manifest_round_trip(tmp_path: Path) -> None:

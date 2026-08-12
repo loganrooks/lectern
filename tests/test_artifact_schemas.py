@@ -126,6 +126,21 @@ def test_committed_schema_matches_its_model(name: str) -> None:
     assert path.read_text(encoding="utf-8") == export_artifact_schemas()[name]
 
 
+def test_local_source_schema_requires_content_identity_and_size() -> None:
+    for name in ("manifest", "source"):
+        definitions = json.loads(export_artifact_schemas()[name])["$defs"]
+        local_rule = definitions["Source"]["allOf"][0]
+        assert local_rule["if"] == {"properties": {"kind": {"const": "local"}}}
+        assert local_rule["then"]["required"] == ["bytes"]
+        assert local_rule["then"]["properties"]["ref"]["pattern"] == (r"^sha256:[0-9a-f]{64}$")
+        assert local_rule["then"]["properties"]["bytes"] == {
+            "minimum": 0,
+            "type": "integer",
+        }
+        shared_bytes = definitions["Source"]["properties"]["bytes"]
+        assert shared_bytes["anyOf"][0] == {"type": "integer"}
+
+
 def test_no_artifact_schema_admits_a_filesystem_path() -> None:
     """The promise LW-11 made, enforced at the level of the contract.
 

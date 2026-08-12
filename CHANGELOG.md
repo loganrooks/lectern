@@ -28,4 +28,4 @@ The package version and bundle manifest schema version are separate.
   and agents.
 
 The current package version is `0.0.1`. The current manifest schema version is
-`0.1.0`.
+`1.0.0`.

@@ -23,7 +23,7 @@ automation state schema version are separate.
   automation store (sources, discovery queue, and library index).
 
 The current package version is `0.0.1`. The current manifest schema version is
-`0.1.0`. The current automation state schema version is `3`.
+`1.0.0`. The current automation state schema version is `3`.
 
 Before a stable release, CLI flags and command output may change. Bundle schema
 changes are treated more carefully: additive bundle manifest changes should
