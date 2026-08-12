@@ -172,6 +172,7 @@ and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 
 - [Design](docs/DESIGN.md)
 - [Grey Areas](docs/GREY_AREAS.md)
+- [Bundle migrations](docs/MIGRATIONS.md)
 - [Privacy](PRIVACY.md)
 - [Roadmap](ROADMAP.md)
 - [Support and compatibility](SUPPORT.md)

@@ -30,6 +30,10 @@ changes are treated more carefully: additive bundle manifest changes should
 raise the manifest schema minor version, and breaking changes require a major
 schema version plus migration notes.
 
+The current `0.1.0` to `1.0.0` bundle procedure is documented in
+[docs/MIGRATIONS.md](docs/MIGRATIONS.md). Manifest `1.0.0` does not mean the
+Lectern package has reached `1.0.0`.
+
 ### Automation State Schema
 
 The automation state schema version is recorded in the store's SQLite

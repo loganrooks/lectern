@@ -5,6 +5,9 @@ versioned release notes will become stricter once preview support stabilizes.
 
 ## Unreleased
 
+- Changed local manifest `source.ref` from a filesystem path to a content
+  identity, raised the manifest schema to `1.0.0`, and added the explicit
+  `lectern migrate BUNDLE` procedure with a retained `0.1.0` backup.
 - Added local command transcription support for media without a transcript
   sidecar.
 - Added transcript method metadata, timestamped transcript artifacts, and

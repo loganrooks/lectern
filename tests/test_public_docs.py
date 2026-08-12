@@ -34,3 +34,16 @@ def test_support_tracks_automation_state_schema_version() -> None:
     # this assertion is what keeps the documented number from drifting away from
     # the code.
     assert f"The current automation state schema version is `{STATE_SCHEMA_VERSION}`." in support
+
+
+def test_manifest_migration_is_documented_and_linked() -> None:
+    readme = normalized(read_doc("README.md"))
+    support = normalized(read_doc("SUPPORT.md"))
+    assert (ROOT / "docs/MIGRATIONS.md").is_file()
+    migrations = normalized(read_doc("docs/MIGRATIONS.md"))
+    assert "docs/MIGRATIONS.md" in readme
+    assert "docs/MIGRATIONS.md" in support
+    assert "lectern migrate BUNDLE" in migrations
+    assert ".v0.1.0.bak" in migrations
+    assert "0.1.0" in migrations and "1.0.0" in migrations
+    assert "does not delete the backup" in migrations
