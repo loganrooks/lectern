@@ -149,13 +149,28 @@ item in the terminal `unsupported` state with an explanatory error, and
 through a failure that can never succeed. Use `queue list --queue-state
 unsupported` to inspect them.
 
+## Search and citations
+
+`lectern library search QUERY --state PATH` searches transcript segments and is
+literal by default; pass `--operators` only when you intentionally want SQLite
+FTS operators. `lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns
+an anchor tied to the cited transcript content.
+
+Search tokenization separates words on whitespace and punctuation for Latin,
+Greek, Cyrillic, Arabic, and Hebrew, including right-to-left text. Chinese,
+Japanese, and Korean text is indexed and retrievable with bounded precision.
+Current limits include two-character CJK terms, substring false positives
+inside CJK runs, no word-boundary-accurate CJK search, and English-only
+stemming. Later search work may add ranking or semantic retrieval; the current
+literal search and citation commands are available now.
+
 ## Current Limits
 
 - YouTube support is limited to public-playlist metadata discovery through an
   API key. OAuth/private playlist access is not implemented.
 - Lectern does not download media, captions, or transcripts from external
   services.
-- MCP/API access, richer search, visual evidence, OCR, reference resolution, and
+- MCP/API access, ranked or semantic search, visual evidence, OCR, reference resolution, and
   citation-gated synthesis are later roadmap items.
 - The local command transcriber path is an integration point, not a bundled ASR
   engine or transcript-quality guarantee.

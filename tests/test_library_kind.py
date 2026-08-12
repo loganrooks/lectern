@@ -1,4 +1,4 @@
-"""A library record's `kind`, reserved so the second one costs nothing.
+"""A bundle-only library `kind`, reserved so a later second kind costs nothing.
 
 The acceptance clause is that adding a second `kind` requires no response-shape
 change. Asserting merely that a `kind` field exists would pass for a design that
@@ -8,7 +8,9 @@ callers to change. So the test adds a second kind and compares shapes.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from lectern import cli
 from lectern.automation import open_state
@@ -17,6 +19,12 @@ from lectern.records import LibraryBundle, LibraryKind
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
 SYNTHETIC_TRANSCRIPT = FIXTURE_DIR / "synthetic_talk.transcript.txt"
+
+
+class SyntheticLibraryKind(StrEnum):
+    """A test-only second kind; M5a does not ship a second product kind."""
+
+    NOTE = "synthetic-note"
 
 
 def _archive(tmp_path: Path) -> Path:
@@ -48,21 +56,21 @@ def test_library_record_declares_its_kind(tmp_path: Path) -> None:
     state_path = _archive(tmp_path)
     with open_state(state_path) as state:
         bundle = state.list_library()[0]
-    assert bundle.kind is LibraryKind.RECORDING
-    assert bundle.to_dict()["kind"] == "recording"
+    assert bundle.kind is LibraryKind.BUNDLE
+    assert bundle.to_dict()["kind"] == "bundle"
 
 
 def test_adding_a_second_kind_changes_no_response_shape() -> None:
     """The clause, tested as written rather than as it is easy to satisfy."""
 
-    recording = LibraryBundle(
+    bundle = LibraryBundle(
         bundle_id="b1",
         bundle_path="/tmp/b1",
         source_id="s1",
         source_item_id="i1",
         queue_item_id="q1",
         created_at="2026-01-01T00:00:00+00:00",
-        kind=LibraryKind.RECORDING,
+        kind=LibraryKind.BUNDLE,
     )
     # A second kind, constructed the same way and differing only in the
     # discriminator.
@@ -73,17 +81,17 @@ def test_adding_a_second_kind_changes_no_response_shape() -> None:
         source_item_id="i2",
         queue_item_id="q2",
         created_at="2026-01-01T00:00:00+00:00",
-        kind=LibraryKind.NOTE,
+        kind=cast(LibraryKind, SyntheticLibraryKind.NOTE),
     )
 
-    assert other.to_dict().keys() == recording.to_dict().keys()
-    assert other.to_dict()["kind"] != recording.to_dict()["kind"]
+    assert other.to_dict().keys() == bundle.to_dict().keys()
+    assert other.to_dict()["kind"] != bundle.to_dict()["kind"]
 
 
 def test_kind_is_the_only_discriminator_a_caller_must_read() -> None:
     # If a caller had to branch on anything else to tell kinds apart, the
     # reservation would not have bought what it claims.
-    assert {kind.value for kind in LibraryKind} >= {"recording", "note"}
+    assert {kind.value for kind in LibraryKind} == {"bundle"}
 
 
 def test_unknown_kinds_round_trip_as_the_default(tmp_path: Path) -> None:
@@ -99,4 +107,4 @@ def test_unknown_kinds_round_trip_as_the_default(tmp_path: Path) -> None:
             "UPDATE library_bundles SET kind = 'kind-from-the-future'"
         )
         bundles = state.list_library()
-    assert bundles[0].kind is LibraryKind.RECORDING
+    assert bundles[0].kind is LibraryKind.BUNDLE

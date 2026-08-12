@@ -47,3 +47,15 @@ def test_manifest_migration_is_documented_and_linked() -> None:
     assert ".v0.1.0.bak" in migrations
     assert "0.1.0" in migrations and "1.0.0" in migrations
     assert "does not delete the backup" in migrations
+
+
+def test_readme_states_multilingual_search_scope_and_limits() -> None:
+    readme = normalized(read_doc("README.md"))
+
+    assert "Latin, Greek, Cyrillic, Arabic, and Hebrew" in readme
+    assert "Chinese, Japanese, and Korean" in readme
+    assert "bounded precision" in readme
+    assert "two-character CJK" in readme
+    assert "word-boundary-accurate CJK" in readme
+    assert "English-only stemming" in readme
+    assert "literal by default" in readme

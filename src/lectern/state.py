@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Self, cast
 
-from lectern.bundle import Manifest
+from lectern.bundle import Manifest, StageState
 from lectern.records import (
     LEGAL_QUEUE_TRANSITION_SOURCE_VALUES,
     LEGAL_QUEUE_TRANSITION_SOURCES,
@@ -27,6 +27,7 @@ from lectern.records import (
     LibraryBundle,
     LibraryKind,
     LibraryRecordOutcome,
+    LibraryStatus,
     QueueItem,
     QueueState,
     ScanDelta,
@@ -37,6 +38,7 @@ from lectern.records import (
     SourceKind,
     SourcePolicy,
     SourceRecord,
+    derive_library_status,
     make_queue_item_id,
     make_source_id,
     metadata_to_json,
@@ -368,18 +370,36 @@ class AutomationStateStore:
 
     def list_library(self) -> list[LibraryBundle]:
         rows = self._connection.execute(
-            "SELECT * FROM library_bundles ORDER BY created_at, bundle_id"
+            """
+            SELECT library_bundles.*,
+                   queue_items.state AS library_queue_state,
+                   queue_items.content_sha256 AS library_queue_sha256,
+                   source_items.sha256 AS library_source_sha256
+            FROM library_bundles
+            JOIN queue_items ON queue_items.id = library_bundles.queue_item_id
+            JOIN source_items ON source_items.id = library_bundles.source_item_id
+            ORDER BY library_bundles.created_at, library_bundles.bundle_id
+            """
         ).fetchall()
-        return [_library_bundle_from_row(row) for row in rows]
+        return [_library_bundle_from_row(row, status=_library_status_from_row(row)) for row in rows]
 
     def get_library_bundle(self, bundle_id: str) -> LibraryBundle:
         row = self._connection.execute(
-            "SELECT * FROM library_bundles WHERE bundle_id = ?",
+            """
+            SELECT library_bundles.*,
+                   queue_items.state AS library_queue_state,
+                   queue_items.content_sha256 AS library_queue_sha256,
+                   source_items.sha256 AS library_source_sha256
+            FROM library_bundles
+            JOIN queue_items ON queue_items.id = library_bundles.queue_item_id
+            JOIN source_items ON source_items.id = library_bundles.source_item_id
+            WHERE library_bundles.bundle_id = ?
+            """,
             (bundle_id,),
         ).fetchone()
         if row is None:
             raise AutomationError(f"bundle not found in library: {bundle_id}")
-        return _library_bundle_from_row(row)
+        return _library_bundle_from_row(row, status=_library_status_from_row(row))
 
     def _migrate(self) -> None:
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -455,7 +475,7 @@ class AutomationStateStore:
                 source_item_id TEXT NOT NULL REFERENCES source_items(id) ON DELETE CASCADE,
                 queue_item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
-                kind TEXT NOT NULL DEFAULT 'recording'
+                kind TEXT NOT NULL DEFAULT 'bundle'
             );
 
             """
@@ -497,7 +517,7 @@ class AutomationStateStore:
         }
         if "kind" not in columns:
             self._connection.execute(
-                "ALTER TABLE library_bundles ADD COLUMN kind TEXT NOT NULL DEFAULT 'recording'"
+                "ALTER TABLE library_bundles ADD COLUMN kind TEXT NOT NULL DEFAULT 'bundle'"
             )
         self._write_index_signature()
         self._backfill_segment_index()
@@ -1231,7 +1251,9 @@ def queue_from_row(row: sqlite3.Row) -> QueueItem:
     )
 
 
-def _library_bundle_from_row(row: sqlite3.Row) -> LibraryBundle:
+def _library_bundle_from_row(
+    row: sqlite3.Row, *, status: LibraryStatus = LibraryStatus.READY
+) -> LibraryBundle:
     return LibraryBundle(
         bundle_id=cast(str, row["bundle_id"]),
         bundle_path=cast(str, row["bundle_path"]),
@@ -1240,6 +1262,38 @@ def _library_bundle_from_row(row: sqlite3.Row) -> LibraryBundle:
         queue_item_id=cast(str, row["queue_item_id"]),
         created_at=cast(str, row["created_at"]),
         kind=_library_kind_from_row(row),
+        status=status,
+    )
+
+
+def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
+    """Project the joined queue row and current manifest into library status."""
+
+    try:
+        queue_state = QueueState(str(row["library_queue_state"]))
+        queue_sha256 = str(row["library_queue_sha256"])
+        source_sha256 = str(row["library_source_sha256"])
+    except (IndexError, KeyError, ValueError):
+        return LibraryStatus.INCOMPLETE
+
+    try:
+        manifest = Manifest.load(Path(str(row["bundle_path"])))
+    except (OSError, ValueError):
+        return derive_library_status(queue_state, (), manifest_available=False)
+
+    materialized_stages = [
+        record.state.value
+        for record in manifest.stages.values()
+        if record.state is not StageState.PENDING
+        or record.started is not None
+        or record.finished is not None
+        or record.outputs
+        or record.error is not None
+    ]
+    return derive_library_status(
+        queue_state,
+        materialized_stages,
+        source_changed=queue_sha256 != source_sha256,
     )
 
 
@@ -1254,11 +1308,11 @@ def _library_kind_from_row(row: sqlite3.Row) -> LibraryKind:
     try:
         raw = row["kind"]
     except (IndexError, KeyError):
-        return LibraryKind.RECORDING
+        return LibraryKind.BUNDLE
     try:
         return LibraryKind(str(raw))
     except ValueError:
-        return LibraryKind.RECORDING
+        return LibraryKind.BUNDLE
 
 
 def _metadata_from_row(row: sqlite3.Row) -> dict[str, Any]:

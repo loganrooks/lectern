@@ -20,7 +20,8 @@ from typing import Any
 from lectern import search
 from lectern.automation import open_state
 
-CORPUS_SEGMENTS = 1000
+CORPUS_BUNDLES = 1000
+CORPUS_SEGMENTS = CORPUS_BUNDLES
 
 
 def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
@@ -32,8 +33,8 @@ def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
         # datum would then measure the scanner as much as the search.
         for index in range(CORPUS_SEGMENTS):
             state.index_synthetic_segment(
-                f"bundle-{index // 10:04d}",
-                index % 10,
+                f"bundle-{index:04d}",
+                0,
                 f"synthetic transcript line {index} about phenomenology and experience",
             )
         assert state.indexed_segment_count() == CORPUS_SEGMENTS
@@ -47,6 +48,7 @@ def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
     datum: dict[str, Any] = {
         "measurement": "library search latency",
         "elapsed_ms": round(elapsed_ms, 3),
+        "corpus_bundles": CORPUS_BUNDLES,
         "corpus_segments": CORPUS_SEGMENTS,
         "query": "phenomenology",
         "hits": len(hits),
@@ -66,6 +68,7 @@ def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
     # What is asserted: the datum is complete enough to interpret later. What is
     # deliberately not asserted: how large the number is.
     assert float(datum["elapsed_ms"]) >= 0.0
+    assert int(datum["corpus_bundles"]) >= 1000
     assert int(datum["corpus_segments"]) >= 1000
     assert datum["conditions"]
     assert datum["claim_limit"]
@@ -82,8 +85,8 @@ def test_search_returns_from_a_thousand_segment_corpus(tmp_path: Path) -> None:
     with open_state(state_path) as state:
         for index in range(CORPUS_SEGMENTS):
             state.index_synthetic_segment(
-                f"bundle-{index // 10:04d}", index % 10, f"line {index} distinctive-marker-{index}"
+                f"bundle-{index:04d}", 0, f"line {index} distinctive-marker-{index}"
             )
         hits = state.search_segments("distinctive-marker-777")
     assert len(hits) == 1
-    assert hits[0].bundle_id == "bundle-0077"
+    assert hits[0].bundle_id == "bundle-0777"

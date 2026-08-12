@@ -36,16 +36,9 @@ class SourceKind(StrEnum):
 
 
 class LibraryKind(StrEnum):
-    """What sort of thing a library record points at.
+    """What sort of thing a library record points at today."""
 
-    Reserved now, with a second member present from the start, because a
-    discriminator introduced alongside its second case is a discriminator whose
-    extensibility has been exercised. One added later against a single existing
-    kind is an assumption that the shape will hold.
-    """
-
-    RECORDING = "recording"
-    NOTE = "note"
+    BUNDLE = "bundle"
 
 
 class SourcePolicy(StrEnum):
@@ -61,6 +54,15 @@ class QueueState(StrEnum):
     FAILED = "failed"
     COMPLETED = "completed"
     UNSUPPORTED = "unsupported"
+
+
+class LibraryStatus(StrEnum):
+    """A user-facing summary of trustworthy queue and bundle-stage state."""
+
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
+    NEEDS_REPROCESSING = "needs-reprocessing"
+    READY = "ready"
 
 
 TERMINAL_QUEUE_STATES = frozenset({QueueState.UNSUPPORTED})
@@ -94,6 +96,34 @@ LEGAL_QUEUE_TRANSITION_SOURCE_VALUES: Mapping[str, tuple[str, ...]] = MappingPro
         for action, states in LEGAL_QUEUE_TRANSITION_SOURCES.items()
     }
 )
+
+
+def derive_library_status(
+    queue_state: QueueState,
+    stage_states: Iterable[str],
+    *,
+    source_changed: bool = False,
+    manifest_available: bool = True,
+) -> LibraryStatus:
+    """Summarize only states the queue FSM and manifest actually record.
+
+    Queue transitions remain owned by ``LEGAL_QUEUE_TRANSITION_SOURCES``. This
+    pure projection cannot create a transition; it reports the row and stage
+    records that survived those guards. Untouched future stages are omitted by
+    the state-store adapter, so their default ``pending`` does not make a fully
+    produced bundle look incomplete.
+    """
+
+    stages = {str(state) for state in stage_states}
+    if queue_state in {QueueState.FAILED, QueueState.UNSUPPORTED} or "failed" in stages:
+        return LibraryStatus.FAILED
+    if source_changed:
+        return LibraryStatus.NEEDS_REPROCESSING
+    if queue_state is not QueueState.COMPLETED:
+        return LibraryStatus.INCOMPLETE
+    if not manifest_available or not stages or stages & {"pending", "running"}:
+        return LibraryStatus.INCOMPLETE
+    return LibraryStatus.READY
 
 
 # Paths in error text routinely contain spaces, and stopping at whitespace
@@ -266,7 +296,8 @@ class LibraryBundle:
     source_item_id: str
     queue_item_id: str
     created_at: str
-    kind: LibraryKind = LibraryKind.RECORDING
+    kind: LibraryKind = LibraryKind.BUNDLE
+    status: LibraryStatus = LibraryStatus.READY
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -279,6 +310,7 @@ class LibraryBundle:
             "queue_item_id": self.queue_item_id,
             "created_at": self.created_at,
             "kind": self.kind.value,
+            "status": self.status.value,
         }
 
 
