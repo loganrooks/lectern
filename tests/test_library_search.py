@@ -227,6 +227,15 @@ def test_search_retrieves_unicode_17_extension_j_ideographs(tmp_path: Path) -> N
         assert state.search_segments("\U000323b0\U000323b1")
 
 
+def test_search_retrieves_half_width_katakana(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("half-width-katakana", 0, "ﾃｽﾄ")
+        assert state.search_segments("ﾃｽ")
+        with pytest.raises(ValueError, match="operator-mode search does not support"):
+            state.search_segments("ﾃ OR ｽ", literal=False)
+
+
 def test_search_hit_carries_an_anchorable_reference(tmp_path: Path) -> None:
     state_path = _archive(tmp_path)
     with open_state(state_path) as state:

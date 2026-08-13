@@ -138,6 +138,20 @@ def test_retrieval_follows_the_validated_source_segments_pointer(tmp_path: Path)
         assert resolved.current_text == "pointer-selected unique phrase"
 
 
+def test_retrieval_refuses_a_symlinked_segments_pointer(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    external = tmp_path / "external-segments.json"
+    segments_path.rename(external)
+    segments_path.symlink_to(external)
+
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        assert state.search_segments("knowledge") == []
+        with pytest.raises(AutomationError, match="readable transcript"):
+            state.cite_segment(bundle.name, 0)
+
+
 def test_registered_bundle_identity_must_match_the_loaded_manifest(tmp_path: Path) -> None:
     state_path, bundle = _ingest(tmp_path)
     manifest_path = bundle / "manifest.json"

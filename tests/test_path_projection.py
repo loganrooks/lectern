@@ -225,6 +225,21 @@ def test_library_show_error_emits_no_filesystem_path(
     _assert_no_path(capsys.readouterr().err, folder, "library show error")
 
 
+def test_library_show_contains_a_recursively_nested_manifest(
+    registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
+) -> None:
+    tmp_path, _, state_path = registered
+    listing = _ingest_one(tmp_path, state_path, capsys)
+    bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    manifest_path = Path(bundle.bundle_path) / "manifest.json"
+    manifest_path.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
+
+    assert cli.main(["library", "show", bundle_id, "--state", str(state_path), "--json"]) == 3
+    assert "recursion" in capsys.readouterr().err.lower()
+
+
 def test_library_show_redacts_stage_error_paths(
     registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
 ) -> None:

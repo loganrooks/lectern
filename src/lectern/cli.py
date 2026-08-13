@@ -560,7 +560,7 @@ def _library_show(args: Sequence[str], state_path: Path, json_output: bool) -> i
         bundle = state.get_library_bundle(args[0])
     try:
         manifest = Manifest.load(Path(bundle.bundle_path)).model_dump(mode="json")
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise AutomationError(str(exc)) from exc
     payload = {"bundle": bundle.to_dict(), "manifest": manifest}
     if json_output:

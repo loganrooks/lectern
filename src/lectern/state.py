@@ -1444,10 +1444,22 @@ def _load_registered_manifest(bundle_id: str, bundle_path: Path) -> Manifest:
 def _read_registered_segments(
     bundle_id: str, bundle_path: Path
 ) -> tuple[bytes, TranscriptSegmentsDocument]:
+    if bundle_path.is_symlink():
+        raise ValueError("registered bundle root must not be a symlink")
     _load_registered_manifest(bundle_id, bundle_path)
-    source_payload = (bundle_path / "source.json").read_bytes()
+    source_relative = Path("source.json")
+    if _has_symlink_component(bundle_path, source_relative):
+        raise ValueError("registered source document must not be a symlink")
+    source_payload = (bundle_path / source_relative).read_bytes()
     source = SourceDocument.model_validate_json(source_payload, strict=True)
-    segments_payload = (bundle_path / source.transcript.segments).read_bytes()
+    segments_relative = Path(source.transcript.segments)
+    if _has_symlink_component(bundle_path, segments_relative):
+        raise ValueError("registered transcript pointer must not contain a symlink")
+    segments_path = (bundle_path / segments_relative).resolve(strict=True)
+    resolved_bundle = bundle_path.resolve(strict=True)
+    if not segments_path.is_relative_to(resolved_bundle):
+        raise ValueError("registered transcript pointer escapes the bundle")
+    segments_payload = segments_path.read_bytes()
     document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)
     return segments_payload, document
 

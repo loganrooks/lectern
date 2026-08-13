@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 CANON_VERSION = 1
-SEGMENTER_VERSION = 5
+SEGMENTER_VERSION = 6
 
 # Code-point ranges written one per script rather than as a single "CJK" range,
 # because the shorthand is what caused the mistake this table fixes: kana and
@@ -50,6 +50,7 @@ _UNSEGMENTED_RANGES: tuple[tuple[int, int], ...] = (
     (0x323B0, 0x3347F),  # CJK unified ideographs extension J
     (0x3040, 0x309F),  # Hiragana
     (0x30A0, 0x30FF),  # Katakana
+    (0xFF65, 0xFF9F),  # Half-width Katakana and marks
     (0xAC00, 0xD7A3),  # Hangul syllables
 )
 
