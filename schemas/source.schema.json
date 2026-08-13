@@ -239,14 +239,17 @@
           "type": "string"
         },
         "metadata": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Metadata",
           "type": "string"
         },
         "segments": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Segments",
           "type": "string"
         },
         "transcript": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Transcript",
           "type": "string"
         },

@@ -24,8 +24,11 @@ import pytest
 from lectern import cli
 from lectern.bundle import (
     ARTIFACT_MODELS,
+    ArtifactRef,
     Manifest,
+    NormalizedAudio,
     SourceDocument,
+    TranscriptArtifacts,
     TranscriptBackend,
     TranscriptMetadataDocument,
     TranscriptSegmentsDocument,
@@ -126,6 +129,16 @@ def test_transcript_backend_rejects_undeclared_path_fields() -> None:
 
     definitions = json.loads(export_artifact_schemas()["transcript-metadata"])["$defs"]
     assert definitions["TranscriptBackend"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("path", ["/Users/alice/audio.wav", "../outside.wav", "a/../b.wav"])
+def test_artifact_paths_must_be_normalized_bundle_relative(path: str) -> None:
+    with pytest.raises(ValueError):
+        ArtifactRef(path=path, sha256="0" * 64, bytes=1)
+    with pytest.raises(ValueError):
+        NormalizedAudio(path=path, sha256="0" * 64, bytes=1)
+    with pytest.raises(ValueError):
+        TranscriptArtifacts(segments=path, transcript="transcript/a.md", summary="analysis/a.md")
 
 
 @pytest.mark.parametrize("name", sorted(ARTIFACT_MODELS))

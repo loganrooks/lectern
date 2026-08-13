@@ -132,7 +132,7 @@ def derive_library_status(
 # terminator is therefore a quote or end-of-string when the path is quoted --
 # which is how OSError renders it -- and whitespace only as a fallback for
 # unquoted paths.
-_QUOTED_ABSOLUTE_PATH = re.compile(r"(?<=')/[^']*(?=')|(?<=\")/[^\"]*(?=\")")
+_QUOTED_ABSOLUTE_PATH = re.compile(r"(?<=')/(?:\\.|[^'\\])*(?=')|(?<=\")/(?:\\.|[^\"\\])*(?=\")")
 _BARE_ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?:[^\s'\"<>|]*[^\s'\"<>|.,;:])?")
 
 PATH_REDACTED = "<path>"

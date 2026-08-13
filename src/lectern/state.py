@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Sequence
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Self, cast
 
-from lectern.bundle import Manifest, StageState
+from lectern.bundle import Manifest, StageState, TranscriptSegmentsDocument
 from lectern.records import (
     LEGAL_QUEUE_TRANSITION_SOURCE_VALUES,
     LEGAL_QUEUE_TRANSITION_SOURCES,
@@ -574,7 +575,14 @@ class AutomationStateStore:
             "SELECT bundle_id, bundle_path FROM library_bundles"
         ).fetchall():
             identifier = str(bundle_id)
-            current = self._segments_digest(Path(str(bundle_path)))
+            bundle_dir = Path(str(bundle_path))
+            try:
+                Manifest.load(bundle_dir)
+            except (OSError, ValueError):
+                self._delete_index_rows(identifier)
+                refreshed.append(identifier)
+                continue
+            current = self._segments_digest(bundle_dir)
             if current is None:
                 # Search results are claims about the bundle as it exists now.
                 # If its supporting transcript vanished or became unreadable,
@@ -588,7 +596,7 @@ class AutomationStateStore:
             ).fetchone()
             if row is not None and str(row[0]) == current:
                 continue
-            self._index_bundle_segments(identifier, Path(str(bundle_path)))
+            self._index_bundle_segments(identifier, bundle_dir)
             refreshed.append(identifier)
         if refreshed:
             self._connection.commit()
@@ -723,7 +731,9 @@ class AutomationStateStore:
             SearchHit(
                 bundle_id=str(row[0]),
                 segment_id=None if row[1] is None else int(row[1]),
-                snippet=_bounded_search_snippet(str(row[2]), query),
+                snippet=_bounded_search_snippet(
+                    str(row[2]), _operator_match_term(str(row[2]), query)
+                ),
             )
             for row in rows
         ]
@@ -738,16 +748,10 @@ class AutomationStateStore:
         try:
             Manifest.load(bundle_dir)
             payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
-            segments = json.loads(payload)
+            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
         except (OSError, ValueError):
             return None
-        if not isinstance(segments, list):
-            return None
-        typed: list[dict[str, Any]] = []
-        for item in cast(list[Any], segments):
-            if isinstance(item, dict):
-                typed.append(cast(dict[str, Any], item))
-        return typed
+        return [item.model_dump(mode="json") for item in document.root]
 
     def resolve_anchor(self, anchor: Anchor) -> ResolvedAnchor:
         """Report which of the four states this citation is in."""
@@ -1367,6 +1371,21 @@ def _bounded_search_snippet(display: str, query: str, *, limit: int = 240) -> st
     if end == len(display):
         start = max(0, end - content_limit)
     return f"{'…' if start else ''}{display[start:end]}{'…' if end < len(display) else ''}"
+
+
+_OPERATOR_TERM = re.compile(r'"((?:""|[^"])*)"|([\w]+)')
+_FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
+
+
+def _operator_match_term(display: str, query: str) -> str:
+    folded_display = display.casefold()
+    for phrase, word in _OPERATOR_TERM.findall(query):
+        candidate = phrase.replace('""', '"') if phrase else word
+        if candidate.upper() in _FTS_OPERATORS:
+            continue
+        if candidate.casefold() in folded_display:
+            return candidate
+    return query
 
 
 def _library_kind_from_row(row: sqlite3.Row) -> LibraryKind:

@@ -40,7 +40,12 @@ def _archive(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _write_segments(bundle: Path, segments: list[dict[str, Any]]) -> None:
-    (bundle / "transcript" / "segments.json").write_text(json.dumps(segments), encoding="utf-8")
+    valid_records = [
+        {**segment, "source": segment.get("source", "fixture")} for segment in segments
+    ]
+    (bundle / "transcript" / "segments.json").write_text(
+        json.dumps(valid_records), encoding="utf-8"
+    )
 
 
 def test_sampler_is_green_on_a_valid_bundle(tmp_path: Path) -> None:

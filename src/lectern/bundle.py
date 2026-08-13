@@ -12,16 +12,38 @@ import re
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
-from typing import cast
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Annotated, cast
 
-from pydantic import BaseModel, Field, RootModel, model_validator
+from pydantic import AfterValidator, BaseModel, Field, RootModel, WithJsonSchema, model_validator
 
 SCHEMA_VERSION = "1.0.0"
 CONTENT_REF_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _CONTENT_REF = re.compile(CONTENT_REF_PATTERN)
 
 MANIFEST_NAME = "manifest.json"
+BUNDLE_RELATIVE_PATH_PATTERN = r"^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$"
+
+
+def _validate_bundle_relative_path(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or "\\" in value
+        or path.is_absolute()
+        or PureWindowsPath(value).drive
+        or path.as_posix() != value
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        raise ValueError("artifact path must be normalized and bundle-relative")
+    return value
+
+
+BundleRelativePath = Annotated[
+    str,
+    AfterValidator(_validate_bundle_relative_path),
+    WithJsonSchema({"type": "string", "pattern": BUNDLE_RELATIVE_PATH_PATTERN}),
+]
 
 
 def schema_version_is_compatible(version: str) -> bool:
@@ -156,7 +178,7 @@ class Source(BaseModel):
 class ArtifactRef(BaseModel):
     """A produced file, content-addressed for idempotence checks."""
 
-    path: str  # relative to bundle root
+    path: BundleRelativePath
     sha256: str
     bytes: int
 
@@ -226,9 +248,9 @@ class RemoteServices(BaseModel):
 
 class TranscriptPointer(BaseModel):
     method: str
-    metadata: str
-    segments: str
-    transcript: str
+    metadata: BundleRelativePath
+    segments: BundleRelativePath
+    transcript: BundleRelativePath
     evidence_limit: str
     remote_services: RemoteServices
 
@@ -298,7 +320,7 @@ class TranscriptSegmentRecord(BaseModel):
 
 
 class NormalizedAudio(BaseModel):
-    path: str
+    path: BundleRelativePath
     sha256: str
     bytes: int
 
@@ -326,9 +348,9 @@ class TranscriptBackend(BaseModel):
 
 
 class TranscriptArtifacts(BaseModel):
-    segments: str
-    transcript: str
-    summary: str
+    segments: BundleRelativePath
+    transcript: BundleRelativePath
+    summary: BundleRelativePath
 
 
 class SchemaContract(BaseModel):

@@ -30,6 +30,7 @@
     "NormalizedAudio": {
       "properties": {
         "path": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Path",
           "type": "string"
         },
@@ -105,14 +106,17 @@
     "TranscriptArtifacts": {
       "properties": {
         "segments": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Segments",
           "type": "string"
         },
         "transcript": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Transcript",
           "type": "string"
         },
         "summary": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Summary",
           "type": "string"
         }

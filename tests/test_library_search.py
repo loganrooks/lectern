@@ -130,6 +130,16 @@ def test_search_snippet_is_bounded_around_the_literal_match(tmp_path: Path) -> N
     assert hit.snippet != display
 
 
+def test_operator_search_snippet_contains_an_actual_matching_term(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    display = f"{'before ' * 100}needle{' after' * 100}"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("long-operator-segment", 0, display)
+        hit = state.search_segments("needle OR absent", literal=False)[0]
+    assert "needle" in hit.snippet
+    assert len(hit.snippet) <= 243
+
+
 @pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
 def test_search_retrieves_every_supported_script(tmp_path: Path, case: dict[str, str]) -> None:
     """Including the two-character CJK queries no tokenizer handles unaided."""

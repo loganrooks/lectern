@@ -4,6 +4,7 @@
       "description": "A produced file, content-addressed for idempotence checks.",
       "properties": {
         "path": {
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
           "title": "Path",
           "type": "string"
         },

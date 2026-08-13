@@ -56,6 +56,13 @@ def test_redaction_still_handles_unquoted_paths() -> None:
     assert "plain" not in redact_paths("failed at /tmp/plain/path.wav while reading")
 
 
+def test_redaction_consumes_escaped_quote_delimiters() -> None:
+    message = "[Errno 2] missing: '/tmp/Bob\\'s \"Private\"/file.wav'"
+    redacted = redact_paths(message)
+    for fragment in ("Bob", "Private", "file.wav", "/tmp"):
+        assert fragment not in redacted, f"{fragment!r} survived redaction: {redacted!r}"
+
+
 def test_ambiguous_relocation_is_not_reported_as_relocated() -> None:
     """R2-11. Fixing "fails when it should resolve" must not introduce
     "resolves to the wrong thing"."""
@@ -164,7 +171,18 @@ def test_sampler_rejects_an_end_beyond_the_recording(tmp_path: Path) -> None:
 
     state_path, bundle = _archive(tmp_path)
     (bundle / "transcript" / "segments.json").write_text(
-        json.dumps([{"id": 0, "start_s": 1.0, "end_s": 3600.0, "text": "long"}]), encoding="utf-8"
+        json.dumps(
+            [
+                {
+                    "id": 0,
+                    "start_s": 1.0,
+                    "end_s": 3600.0,
+                    "text": "long",
+                    "source": "fixture",
+                }
+            ]
+        ),
+        encoding="utf-8",
     )
     with open_state(state_path) as state:
         issues = state.sample_anchor_correctness()
@@ -207,6 +225,20 @@ def test_index_refreshes_when_transcript_content_changes(tmp_path: Path) -> None
         assert [
             h for h in state.search_segments("entirely different") if h.bundle_id == bundle.name
         ]
+
+
+def test_cached_index_is_removed_when_manifest_becomes_incompatible(tmp_path: Path) -> None:
+    state_path, bundle = _archive(tmp_path)
+    with open_state(state_path) as state:
+        assert [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
+
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "0.1.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with open_state(state_path) as state:
+        assert not [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
 
 
 def test_a_bundle_unreadable_at_migration_is_indexed_once_restored(tmp_path: Path) -> None:

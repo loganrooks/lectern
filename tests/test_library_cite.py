@@ -25,6 +25,7 @@ import pytest
 
 from lectern import cli, search
 from lectern.automation import open_state
+from lectern.records import AutomationError
 from lectern.search import AnchorResolution
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -111,7 +112,15 @@ def test_resolution_relocated_when_a_deletion_renumbers(tmp_path: Path) -> None:
     state_path, bundle = _archive(tmp_path)
     segments = _segments(bundle)
     if len(segments) < 2:
-        segments = segments + [{"id": 1, "start_s": 9.0, "end_s": 10.0, "text": "second line"}]
+        segments = segments + [
+            {
+                "id": 1,
+                "start_s": 9.0,
+                "end_s": 10.0,
+                "text": "second line",
+                "source": "fixture",
+            }
+        ]
         _write_segments(bundle, segments)
     cited = segments[-1]
     anchor = search.make_anchor(bundle.name, int(cited["id"]), 9.0, str(cited["text"]))
@@ -178,6 +187,16 @@ def test_cite_emits_no_filesystem_path(tmp_path: Path, capsys: pytest.CaptureFix
         cli.main(["library", "cite", bundle.name, "0", "--state", str(state_path), "--json"]) == 0
     )
     assert str(tmp_path) not in capsys.readouterr().out
+
+
+def test_cite_refuses_malformed_segment_records(tmp_path: Path) -> None:
+    state_path, bundle = _archive(tmp_path)
+    _write_segments(bundle, [{"id": 0}])
+    with (
+        open_state(state_path) as state,
+        pytest.raises(AutomationError, match="readable transcript"),
+    ):
+        state.cite_segment(bundle.name, 0)
 
 
 @pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
