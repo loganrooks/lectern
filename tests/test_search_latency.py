@@ -33,6 +33,11 @@ def test_latency_datum_is_durably_recorded() -> None:
     assert int(datum["corpus_segments"]) >= 1000
     assert datum["conditions"]
     assert datum["claim_limit"]
+    reconciliation = datum["open_reconcile_search_measurement"]
+    assert int(reconciliation["corpus_bundles"]) == 1000
+    assert int(reconciliation["total_segments_bytes"]) >= 100_000_000
+    assert float(reconciliation["median_elapsed_ms"]) >= 0.0
+    assert reconciliation["conditions"]
 
 
 def test_latency_measurement_reports_its_conditions(tmp_path: Path) -> None:

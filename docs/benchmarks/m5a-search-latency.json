@@ -12,5 +12,15 @@
   "sqlite": "3.53.3",
   "platform": "macOS-27.0-arm64-arm-64bit",
   "conditions": "single process, warm SQLite page cache, temporary filesystem, corpus built by direct index writes rather than folder scan",
-  "claim_limit": "A datum for this corpus on this machine under these conditions. Not a performance guarantee, not a bound, and not comparable across machines."
+  "claim_limit": "A datum for this corpus on this machine under these conditions. Not a performance guarantee, not a bound, and not comparable across machines.",
+  "open_reconcile_search_measurement": {
+    "recorded_at": "2026-08-13T00:28:00+00:00",
+    "corpus_bundles": 1000,
+    "segments_bytes_per_bundle": 100102,
+    "total_segments_bytes": 100102000,
+    "elapsed_ms": [91.352, 66.217, 65.739],
+    "median_elapsed_ms": 66.217,
+    "conditions": "single process, warm filesystem cache, temporary filesystem, 1000 registered current-schema bundles, open state plus reconcile unchanged segment files plus one-result literal search",
+    "claim_limit": "A synthetic local measurement that exposes reconciliation cost. Not a performance guarantee or a basis for silently changing the automation-state schema."
+  }
 }

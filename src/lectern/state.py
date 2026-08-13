@@ -618,6 +618,7 @@ class AutomationStateStore:
         """
 
         try:
+            Manifest.load(bundle_dir)
             payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
             segments = json.loads(payload)
         except (OSError, ValueError):
@@ -699,7 +700,7 @@ class AutomationStateStore:
                         SearchHit(
                             bundle_id=str(row[0]),
                             segment_id=None if row[1] is None else int(row[1]),
-                            snippet=str(row[2]),
+                            snippet=_bounded_search_snippet(str(row[2]), query),
                         )
                         for row in rows
                         if text_contains_literal(str(row[2]), query)
@@ -722,7 +723,7 @@ class AutomationStateStore:
             SearchHit(
                 bundle_id=str(row[0]),
                 segment_id=None if row[1] is None else int(row[1]),
-                snippet=str(row[2]),
+                snippet=_bounded_search_snippet(str(row[2]), query),
             )
             for row in rows
         ]
@@ -733,10 +734,10 @@ class AutomationStateStore:
         ).fetchone()
         if row is None:
             return None
+        bundle_dir = Path(str(row[0]))
         try:
-            payload = (Path(str(row[0])) / "transcript" / "segments.json").read_text(
-                encoding="utf-8"
-            )
+            Manifest.load(bundle_dir)
+            payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
             segments = json.loads(payload)
         except (OSError, ValueError):
             return None
@@ -1317,7 +1318,8 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
         return LibraryStatus.INCOMPLETE
 
     try:
-        manifest = Manifest.load(Path(str(row["bundle_path"])))
+        bundle_path = Path(str(row["bundle_path"]))
+        manifest = Manifest.load(bundle_path)
     except (OSError, ValueError):
         return derive_library_status(queue_state, (), manifest_available=False)
 
@@ -1333,8 +1335,38 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
     return derive_library_status(
         queue_state,
         materialized_stages,
-        source_changed=queue_sha256 != source_sha256,
+        source_changed=(
+            queue_sha256 != source_sha256
+            or not _manifest_outputs_are_materialized(bundle_path, manifest)
+        ),
     )
+
+
+def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) -> bool:
+    for stage in manifest.stages.values():
+        for output in stage.outputs:
+            relative = Path(output.path)
+            if relative.is_absolute() or ".." in relative.parts:
+                return False
+            candidate = bundle_path / relative
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    return False
+            except OSError:
+                return False
+    return True
+
+
+def _bounded_search_snippet(display: str, query: str, *, limit: int = 240) -> str:
+    if len(display) <= limit:
+        return display
+    content_limit = limit - 2
+    match_at = display.casefold().find(query.casefold())
+    start = 0 if match_at < 0 else max(0, match_at - content_limit // 2)
+    end = min(len(display), start + content_limit)
+    if end == len(display):
+        start = max(0, end - content_limit)
+    return f"{'…' if start else ''}{display[start:end]}{'…' if end < len(display) else ''}"
 
 
 def _library_kind_from_row(row: sqlite3.Row) -> LibraryKind:

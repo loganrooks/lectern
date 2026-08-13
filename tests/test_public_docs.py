@@ -59,4 +59,5 @@ def test_readme_states_multilingual_search_scope_and_limits() -> None:
     assert "word-boundary-accurate CJK" in readme
     assert "stemming is not provided" in readme
     assert "operator-mode queries do not support CJK" in readme
+    assert "reconciles registered transcript files on each command open" in readme
     assert "literal by default" in readme

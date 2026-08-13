@@ -23,7 +23,7 @@ from lectern.automation import (
     preflight_state_store,
     preflight_youtube_playlist,
 )
-from lectern.bundle import export_artifact_schemas, export_json_schema
+from lectern.bundle import Manifest, export_artifact_schemas, export_json_schema
 from lectern.ingest import IngestError
 from lectern.migrations import MigrationError, migrate_bundle
 
@@ -557,10 +557,10 @@ def _library_show(args: Sequence[str], state_path: Path, json_output: bool) -> i
         return 2
     with open_state(state_path) as state:
         bundle = state.get_library_bundle(args[0])
-    manifest = {}
-    manifest_path = Path(bundle.bundle_path) / "manifest.json"
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = Manifest.load(Path(bundle.bundle_path)).model_dump(mode="json")
+    except ValueError as exc:
+        raise AutomationError(str(exc)) from exc
     payload = {"bundle": bundle.to_dict(), "manifest": manifest}
     if json_output:
         _print_json(payload)

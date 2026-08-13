@@ -167,7 +167,10 @@ current literal search and citation commands are available now.
 
 The [recorded M5a latency datum](docs/benchmarks/m5a-search-latency.json)
 captures one synthetic 1,000-bundle measurement and its conditions; it is not
-a performance guarantee.
+a performance guarantee. The state store currently reconciles registered
+transcript files on each command open to keep search results aligned with
+changed or missing bundle content. The datum records that open-path cost
+separately from the SQLite query-only timing.
 
 ## Current Limits
 

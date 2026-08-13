@@ -99,3 +99,15 @@ def test_illegal_queue_transition_cannot_change_reported_status(tmp_path: Path) 
         with pytest.raises(AutomationError, match="retry is only legal from state failed"):
             state.retry_queue_item(queue_item_id)
         assert state.get_library_bundle(bundle_id).status is records.LibraryStatus.READY
+
+
+def test_missing_declared_output_requires_reprocessing(tmp_path: Path) -> None:
+    state_path, bundle_id, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    (Path(bundle.bundle_path) / "transcript" / "segments.json").unlink()
+
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )

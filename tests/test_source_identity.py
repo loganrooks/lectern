@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from lectern import cli
+from lectern.automation import AutomationError, open_state
 from lectern.bundle import Manifest
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -128,3 +130,28 @@ def test_manifest_load_rejects_an_incompatible_schema_version(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="unsupported bundle schema version"):
         Manifest.load(bundle)
+
+
+def test_library_readers_refuse_registered_legacy_bundle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bundle = _ingest(tmp_path)
+    state_path = tmp_path / "s.db"
+    manifest_path = bundle / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "0.1.0"
+    payload["source"]["ref"] = "/tmp/private-legacy.wav"
+    payload["source"].pop("bytes", None)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("PRAGMA user_version = 2")
+
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge") == []
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, 0)
+
+    capsys.readouterr()
+    assert cli.main(["library", "show", bundle.name, "--state", str(state_path), "--json"]) == 3
+    output = capsys.readouterr()
+    assert "/tmp/private-legacy.wav" not in output.out + output.err

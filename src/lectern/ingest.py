@@ -319,7 +319,7 @@ def _transcribe_with_local_command(
         method="local_command_json",
         backend={
             "kind": "local_command",
-            "argv0": argv[0],
+            "argv0": Path(argv[0]).name,
             "command_sha256": command_digest,
             "argv_sha256": argv_digest,
             "input_argument_mode": (

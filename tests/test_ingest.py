@@ -232,6 +232,8 @@ def test_local_command_transcriber_produces_metadata_and_anchored_summary(
     assert metadata["remote_services"]["transcriber_network_posture"] == (
         "unverifiable_user_command"
     )
+    assert metadata["backend"]["argv0"] == Path(sys.executable).name
+    assert "/" not in metadata["backend"]["argv0"]
     assert metadata["schema_contract"]["manifest_schema_versioned"] is False
 
     summary = (bundle_dir / "analysis" / "summary.md").read_text(encoding="utf-8")
