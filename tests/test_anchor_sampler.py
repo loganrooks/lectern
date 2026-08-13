@@ -54,6 +54,15 @@ def test_sampler_is_green_on_a_valid_bundle(tmp_path: Path) -> None:
         assert state.sample_anchor_correctness() == []
 
 
+def test_sampler_reports_an_unreadable_registered_bundle(tmp_path: Path) -> None:
+    state_path, bundle = _archive(tmp_path)
+    (bundle / "transcript" / "segments.json").write_text("{}", encoding="utf-8")
+    with open_state(state_path) as state:
+        issues = state.sample_anchor_correctness()
+    assert {issue.kind for issue in issues} == {AnchorIssue.UNREADABLE}
+    assert issues[0].bundle_id == bundle.name
+
+
 def test_sampler_rejects_a_timestamp_past_the_recording(tmp_path: Path) -> None:
     state_path, bundle = _archive(tmp_path)
     _write_segments(bundle, [{"id": 0, "start_s": 3600.0, "end_s": 3601.0, "text": "impossible"}])

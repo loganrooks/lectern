@@ -26,6 +26,7 @@
       "type": "object"
     },
     "Source": {
+      "additionalProperties": false,
       "allOf": [
         {
           "if": {

@@ -47,9 +47,11 @@ from lectern.records import (
 )
 from lectern.search import (
     Anchor,
+    AnchorIssue,
     AnchorResolution,
     ResolvedAnchor,
     SamplerIssue,
+    canonical_text,
     index_signature,
     is_unsegmented_script,
     literal_match_expression,
@@ -799,6 +801,14 @@ class AutomationStateStore:
             bundle_id = str(row[0])
             segments = self._bundle_segments(bundle_id)
             if segments is None:
+                issues.append(
+                    SamplerIssue(
+                        kind=AnchorIssue.UNREADABLE,
+                        bundle_id=bundle_id,
+                        segment_id=None,
+                        detail="manifest or transcript segments are unreadable",
+                    )
+                )
                 continue
             duration: float | None = None
             try:
@@ -1365,12 +1375,29 @@ def _bounded_search_snippet(display: str, query: str, *, limit: int = 240) -> st
     if len(display) <= limit:
         return display
     content_limit = limit - 2
-    match_at = display.casefold().find(query.casefold())
+    match_at = _canonical_match_offset(display, query)
     start = 0 if match_at < 0 else max(0, match_at - content_limit // 2)
     end = min(len(display), start + content_limit)
     if end == len(display):
         start = max(0, end - content_limit)
     return f"{'…' if start else ''}{display[start:end]}{'…' if end < len(display) else ''}"
+
+
+def _canonical_match_offset(display: str, query: str) -> int:
+    canonical_parts: list[str] = []
+    raw_offsets: list[int] = []
+    for token_match in re.finditer(r"\S+", display):
+        if canonical_parts:
+            canonical_parts.append(" ")
+            raw_offsets.append(token_match.start())
+        raw_token = token_match.group()
+        normalized = canonical_text(raw_token).casefold()
+        canonical_parts.append(normalized)
+        raw_offsets.extend(
+            token_match.start() + min(index, len(raw_token) - 1) for index in range(len(normalized))
+        )
+    match_at = "".join(canonical_parts).find(canonical_text(query).casefold())
+    return -1 if match_at < 0 else raw_offsets[match_at]
 
 
 _OPERATOR_TERM = re.compile(r'"((?:""|[^"])*)"|([\w]+)')

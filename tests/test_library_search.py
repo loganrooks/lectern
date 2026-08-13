@@ -130,6 +130,15 @@ def test_search_snippet_is_bounded_around_the_literal_match(tmp_path: Path) -> N
     assert hit.snippet != display
 
 
+def test_literal_snippet_centers_a_canonically_equivalent_match(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    display = f"{'before ' * 100}café   phrase{' after' * 100}"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("canonical-snippet", 0, display)
+        hit = state.search_segments("cafe\u0301 phrase")[0]
+    assert "café" in hit.snippet
+
+
 def test_operator_search_snippet_contains_an_actual_matching_term(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     display = f"{'before ' * 100}needle{' after' * 100}"
@@ -151,6 +160,15 @@ def test_search_retrieves_every_supported_script(tmp_path: Path, case: dict[str,
     assert any(hit.bundle_id == "synthetic-script" for hit in hits), (
         f"{case['script']}: {case['query']!r} did not retrieve its own segment"
     )
+
+
+def test_search_retrieves_supplementary_cjk_ideographs(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("extension-b", 0, "𠀀𠀁𠀂")
+        assert state.search_segments("𠀀𠀁")
+        with pytest.raises(ValueError, match="operator-mode search does not support"):
+            state.search_segments("𠀀 OR 𠀁", literal=False)
 
 
 def test_search_hit_carries_an_anchorable_reference(tmp_path: Path) -> None:

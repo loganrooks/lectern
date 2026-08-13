@@ -158,6 +158,7 @@ class Source(BaseModel):
         return self
 
     model_config = {
+        "extra": "forbid",
         "json_schema_extra": {
             "allOf": [
                 {
@@ -171,7 +172,7 @@ class Source(BaseModel):
                     },
                 }
             ]
-        }
+        },
     }
 
 
@@ -221,13 +222,18 @@ class Manifest(BaseModel):
         """
 
         payload: object = json.loads((bundle_dir / MANIFEST_NAME).read_text())
-        if isinstance(payload, dict):
-            version = cast(dict[str, object], payload).get("schema_version")
-            if isinstance(version, str) and not schema_version_is_compatible(version):
-                raise ValueError(
-                    f"unsupported bundle schema version {version!r}; "
-                    f"this build reads schema version {SCHEMA_VERSION!r}"
-                )
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "bundle manifest must be a JSON object with an explicit schema version"
+            )
+        version = cast(dict[str, object], payload).get("schema_version")
+        if not isinstance(version, str):
+            raise ValueError("bundle manifest requires an explicit string schema version")
+        if not schema_version_is_compatible(version):
+            raise ValueError(
+                f"unsupported bundle schema version {version!r}; "
+                f"this build reads schema version {SCHEMA_VERSION!r}"
+            )
         return cls.model_validate(payload)
 
 
@@ -388,6 +394,13 @@ class TranscriptSegmentsDocument(RootModel[list[TranscriptSegmentRecord]]):
     """
 
     root: list[TranscriptSegmentRecord]
+
+    @model_validator(mode="after")
+    def validate_unique_ids(self) -> TranscriptSegmentsDocument:
+        identifiers = [segment.id for segment in self.root]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("transcript segment ids must be unique")
+        return self
 
 
 ARTIFACT_MODELS: dict[str, type[BaseModel]] = {

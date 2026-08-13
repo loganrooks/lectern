@@ -27,7 +27,9 @@ from lectern.bundle import (
     ArtifactRef,
     Manifest,
     NormalizedAudio,
+    Source,
     SourceDocument,
+    SourceKind,
     TranscriptArtifacts,
     TranscriptBackend,
     TranscriptMetadataDocument,
@@ -139,6 +141,19 @@ def test_artifact_paths_must_be_normalized_bundle_relative(path: str) -> None:
         NormalizedAudio(path=path, sha256="0" * 64, bytes=1)
     with pytest.raises(ValueError):
         TranscriptArtifacts(segments=path, transcript="transcript/a.md", summary="analysis/a.md")
+
+
+def test_source_identity_rejects_undeclared_path_fields() -> None:
+    with pytest.raises(ValueError):
+        Source.model_validate(
+            {"kind": SourceKind.LOCAL, "ref": f"sha256:{'0' * 64}", "bytes": 1, "path": "/x"}
+        )
+
+
+def test_segments_document_rejects_duplicate_ids() -> None:
+    row = {"id": 0, "start_s": 0.0, "text": "one", "source": "fixture"}
+    with pytest.raises(ValueError, match="unique"):
+        TranscriptSegmentsDocument.model_validate([row, {**row, "text": "two"}])
 
 
 @pytest.mark.parametrize("name", sorted(ARTIFACT_MODELS))

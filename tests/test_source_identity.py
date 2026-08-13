@@ -132,6 +132,16 @@ def test_manifest_load_rejects_an_incompatible_schema_version(tmp_path: Path) ->
         Manifest.load(bundle)
 
 
+def test_manifest_load_requires_an_explicit_schema_version(tmp_path: Path) -> None:
+    bundle = _ingest(tmp_path)
+    manifest_path = bundle / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload.pop("schema_version")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema version"):
+        Manifest.load(bundle)
+
+
 def test_library_readers_refuse_registered_legacy_bundle(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
