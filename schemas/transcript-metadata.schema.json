@@ -126,6 +126,7 @@
       "type": "object"
     },
     "TranscriptBackend": {
+      "additionalProperties": false,
       "description": "How the transcript was produced.\n\nThe `local_command` fields are declared rather than tolerated: pydantic\nignores unknown keys, so a model that omitted them silently discarded the\nidentity of the command that produced the transcript on every round trip,\nand generated-schema consumers were never told the fields exist. Provenance\nthat only survives when nobody reads it is not provenance.",
       "properties": {
         "kind": {

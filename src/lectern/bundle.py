@@ -322,6 +322,8 @@ class TranscriptBackend(BaseModel):
     input_argument_mode: str | None = None
     timeout_s: float | None = None
 
+    model_config = {"extra": "forbid"}
+
 
 class TranscriptArtifacts(BaseModel):
     segments: str

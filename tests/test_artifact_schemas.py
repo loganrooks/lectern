@@ -26,6 +26,7 @@ from lectern.bundle import (
     ARTIFACT_MODELS,
     Manifest,
     SourceDocument,
+    TranscriptBackend,
     TranscriptMetadataDocument,
     TranscriptSegmentsDocument,
     export_artifact_schemas,
@@ -117,6 +118,14 @@ def test_transcript_metadata_round_trips(tmp_path: Path) -> None:
         TranscriptMetadataDocument.model_validate_json(document.model_dump_json(by_alias=True))
         == document
     )
+
+
+def test_transcript_backend_rejects_undeclared_path_fields() -> None:
+    with pytest.raises(ValueError):
+        TranscriptBackend.model_validate({"kind": "sidecar", "path": "/private/transcript.txt"})
+
+    definitions = json.loads(export_artifact_schemas()["transcript-metadata"])["$defs"]
+    assert definitions["TranscriptBackend"]["additionalProperties"] is False
 
 
 @pytest.mark.parametrize("name", sorted(ARTIFACT_MODELS))

@@ -50,6 +50,7 @@ from lectern.search import (
     ResolvedAnchor,
     SamplerIssue,
     index_signature,
+    is_unsegmented_script,
     literal_match_expression,
     make_anchor,
     resolve_against_segments,
@@ -480,6 +481,7 @@ class AutomationStateStore:
 
             """
         )
+        self._connection.execute("PRAGMA user_version = 2")
         self._connection.commit()
 
     def _create_schema_v3(self) -> None:
@@ -672,8 +674,41 @@ class AutomationStateStore:
         escaping as a bare sqlite exception.
         """
 
+        if limit <= 0:
+            return []
+        if not literal and any(is_unsegmented_script(character) for character in query):
+            raise ValueError(
+                "operator-mode search does not support CJK scripts; use literal search"
+            )
+
         expression = literal_match_expression(query) if literal else query
         try:
+            if literal:
+                hits: list[SearchHit] = []
+                batch_size = max(50, limit)
+                offset = 0
+                while len(hits) < limit:
+                    rows = self._connection.execute(
+                        """
+                        SELECT bundle_id, segment_id, display FROM segment_index
+                        WHERE segment_index MATCH ? ORDER BY rank, rowid LIMIT ? OFFSET ?
+                        """,
+                        (expression, batch_size, offset),
+                    ).fetchall()
+                    hits.extend(
+                        SearchHit(
+                            bundle_id=str(row[0]),
+                            segment_id=None if row[1] is None else int(row[1]),
+                            snippet=str(row[2]),
+                        )
+                        for row in rows
+                        if text_contains_literal(str(row[2]), query)
+                    )
+                    if len(rows) < batch_size:
+                        break
+                    offset += len(rows)
+                return hits[:limit]
+
             rows = self._connection.execute(
                 """
                 SELECT bundle_id, segment_id, display FROM segment_index
@@ -683,7 +718,7 @@ class AutomationStateStore:
             ).fetchall()
         except sqlite3.OperationalError as exc:
             raise ValueError(f"invalid search query: {exc}") from exc
-        hits = [
+        return [
             SearchHit(
                 bundle_id=str(row[0]),
                 segment_id=None if row[1] is None else int(row[1]),
@@ -691,12 +726,6 @@ class AutomationStateStore:
             )
             for row in rows
         ]
-        if literal:
-            # The index finds candidates; the text as written decides. Without
-            # this, "literal" meant "not parsed as operators" rather than "means
-            # exactly itself", and `C++ discussion` matched `C discussion`.
-            hits = [hit for hit in hits if text_contains_literal(hit.snippet, query)]
-        return hits
 
     def _bundle_segments(self, bundle_id: str) -> list[dict[str, Any]] | None:
         row = self._connection.execute(

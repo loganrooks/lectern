@@ -60,6 +60,26 @@ def test_state_store_initializes_with_schema_version(tmp_path: Path) -> None:
     assert version == STATE_SCHEMA_VERSION
 
 
+def test_version_zero_initialization_resumes_after_v2_commit(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    real_create_v3 = automation.AutomationStateStore._create_schema_v3  # pyright: ignore[reportPrivateUsage]
+
+    def interrupt_after_v2(self: object) -> None:
+        raise RuntimeError("synthetic interruption after v2")
+
+    monkeypatch.setattr(automation.AutomationStateStore, "_create_schema_v3", interrupt_after_v2)
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        open_state(state_path)
+
+    monkeypatch.setattr(automation.AutomationStateStore, "_create_schema_v3", real_create_v3)
+    with open_state(state_path):
+        pass
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == STATE_SCHEMA_VERSION
+
+
 def test_state_store_rejects_unknown_future_schema(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     with sqlite3.connect(state_path) as connection:

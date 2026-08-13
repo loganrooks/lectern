@@ -1,0 +1,16 @@
+{
+  "measurement": "library search latency",
+  "recorded_at": "2026-08-13T00:07:48.428254+00:00",
+  "elapsed_ms": 0.675,
+  "corpus_bundles": 1000,
+  "corpus_segments": 1000,
+  "query": "phenomenology",
+  "hits": 50,
+  "canon_version": 1,
+  "segmenter_version": 1,
+  "python": "3.12.13",
+  "sqlite": "3.53.3",
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "conditions": "single process, warm SQLite page cache, temporary filesystem, corpus built by direct index writes rather than folder scan",
+  "claim_limit": "A datum for this corpus on this machine under these conditions. Not a performance guarantee, not a bound, and not comparable across machines."
+}

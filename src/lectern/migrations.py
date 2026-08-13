@@ -792,14 +792,22 @@ def migrate_bundle(bundle_dir: Path) -> BundleMigrationResult:
         if _role_exists(backup, "backup role"):
             raise MigrationError("backup role is already occupied")
         if _role_exists(staging, "staging role"):
-            prepared = _prepared_from_existing_staging(
-                source,
-                staging,
-                backup,
-                bundle_id=bundle_id,
-                source_sha256=source_sha256,
-                source_bytes=source_bytes,
-            )
+            if not _role_is_directory(staging, "staging") or not _marker_matches(
+                staging, bundle_id
+            ):
+                raise MigrationError("staging role is ambiguous")
+            try:
+                prepared = _prepared_from_existing_staging(
+                    source,
+                    staging,
+                    backup,
+                    bundle_id=bundle_id,
+                    source_sha256=source_sha256,
+                    source_bytes=source_bytes,
+                )
+            except MigrationError:
+                _remove_owned_staging(staging, bundle_id)
+                prepared = prepare_bundle_migration(source)
             _publish(prepared)
             return BundleMigrationResult(
                 bundle_id=bundle_id,

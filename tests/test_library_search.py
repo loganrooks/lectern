@@ -100,6 +100,25 @@ def test_search_operator_mode_surfaces_bad_syntax(tmp_path: Path) -> None:
         state.search_segments("C++", literal=False)
 
 
+def test_search_operator_mode_rejects_unsegmented_scripts_explicitly(tmp_path: Path) -> None:
+    state_path = _archive(tmp_path)
+    with (
+        open_state(state_path) as state,
+        pytest.raises(ValueError, match="operator-mode search does not support"),
+    ):
+        state.search_segments("现象 OR 哲学", literal=False)
+
+
+def test_literal_filter_fills_the_requested_limit_after_false_candidates(tmp_path: Path) -> None:
+    state_path = _archive(tmp_path)
+    with open_state(state_path) as state:
+        for index in range(51):
+            state.index_synthetic_segment(f"false-{index:02d}", 0, "C discussion")
+        state.index_synthetic_segment("exact", 0, "C++ discussion")
+        hits = state.search_segments("C++ discussion", limit=1)
+    assert [hit.bundle_id for hit in hits] == ["exact"]
+
+
 @pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
 def test_search_retrieves_every_supported_script(tmp_path: Path, case: dict[str, str]) -> None:
     """Including the two-character CJK queries no tokenizer handles unaided."""

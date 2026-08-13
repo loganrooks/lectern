@@ -173,6 +173,24 @@ def test_prepare_builds_valid_target_without_mutating_source(tmp_path: Path) -> 
     assert _tree_bytes(bundle) == before
 
 
+def test_migrate_restarts_marker_owned_partial_staging(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    staging = _staging_role(bundle)
+    staging.mkdir(mode=0o700)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    _write_json(
+        staging / MARKER_NAME,
+        migrations._marker_payload(str(manifest["bundle_id"])),  # pyright: ignore[reportPrivateUsage]
+    )
+
+    result = migrations.migrate_bundle(bundle)
+
+    assert result.outcome == "recovered"
+    assert Manifest.load(bundle).schema_version == "1.0.0"
+    assert bundle.with_name(bundle.name + BACKUP_SUFFIX).is_dir()
+    assert not staging.exists()
+
+
 def test_prepare_rejects_hash_mismatch_before_staging(tmp_path: Path) -> None:
     bundle = legacy_bundle(tmp_path)
     (bundle / "source.json").write_text("{}\n", encoding="utf-8")

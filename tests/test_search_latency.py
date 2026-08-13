@@ -22,9 +22,20 @@ from lectern.automation import open_state
 
 CORPUS_BUNDLES = 1000
 CORPUS_SEGMENTS = CORPUS_BUNDLES
+DATUM_PATH = Path(__file__).resolve().parents[1] / "docs" / "benchmarks" / "m5a-search-latency.json"
 
 
-def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
+def test_latency_datum_is_durably_recorded() -> None:
+    datum: dict[str, Any] = json.loads(DATUM_PATH.read_text(encoding="utf-8"))
+    assert datum["measurement"] == "library search latency"
+    assert float(datum["elapsed_ms"]) >= 0.0
+    assert int(datum["corpus_bundles"]) >= 1000
+    assert int(datum["corpus_segments"]) >= 1000
+    assert datum["conditions"]
+    assert datum["claim_limit"]
+
+
+def test_latency_measurement_reports_its_conditions(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     with open_state(state_path) as state:
         # The corpus is built by writing index rows directly rather than by
@@ -63,8 +74,6 @@ def test_latency_datum_is_recorded_with_its_conditions(tmp_path: Path) -> None:
             "guarantee, not a bound, and not comparable across machines."
         ),
     }
-    (tmp_path / "latency-datum.json").write_text(json.dumps(datum, indent=2), encoding="utf-8")
-
     # What is asserted: the datum is complete enough to interpret later. What is
     # deliberately not asserted: how large the number is.
     assert float(datum["elapsed_ms"]) >= 0.0
