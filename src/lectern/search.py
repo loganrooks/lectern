@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 CANON_VERSION = 1
-SEGMENTER_VERSION = 4
+SEGMENTER_VERSION = 5
 
 # Code-point ranges written one per script rather than as a single "CJK" range,
 # because the shorthand is what caused the mistake this table fixes: kana and
@@ -109,8 +109,22 @@ def segment_text(text: str) -> str:
     everywhere and always, so that the index and the query agree.
     """
 
+    canonical = canonical_text(text)
+    original = _space_unsegmented_scripts(canonical)
+    if not any(len(character.casefold()) != 1 for character in canonical):
+        return original
+
+    # `unicode61` handles ordinary one-code-point case differences, but not
+    # expansions such as `ß -> ss`. Keep the original stream first so advanced
+    # operator queries retain their existing terms, then add the expanded form
+    # as a second candidate stream for literal retrieval.
+    expanded = _space_unsegmented_scripts(canonical.casefold())
+    return f"{original} {expanded}"
+
+
+def _space_unsegmented_scripts(text: str) -> str:
     pieces: list[str] = []
-    for character in canonical_text(text):
+    for character in text:
         if is_unsegmented_script(character):
             pieces.append(f" {character} ")
         else:
@@ -143,7 +157,11 @@ def literal_match_expression(query: str) -> str:
     means.
     """
 
-    segmented = segment_text(query)
+    # Literal confirmation uses Unicode casefolding, so the candidate query has
+    # to use the same expansion-aware form. Calling `segment_text` here would
+    # include both the original and expanded streams as one phrase; only the
+    # expanded candidate stream belongs in the MATCH expression.
+    segmented = _space_unsegmented_scripts(canonical_text(query).casefold())
     escaped = segmented.replace('"', '""')
     return f'"{escaped}"'
 

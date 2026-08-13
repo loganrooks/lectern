@@ -180,6 +180,63 @@ def test_cite_renders_a_timestamp_and_stores_an_anchor(
     assert payload["outcome"] == "exact"
 
 
+def test_plain_cite_serializes_distinct_resolvable_same_second_anchors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path, bundle = _archive(tmp_path)
+    _write_segments(
+        bundle,
+        [
+            {
+                "id": 0,
+                "start_s": 0.4,
+                "end_s": 0.6,
+                "text": "first same-second segment",
+                "source": "fixture",
+            },
+            {
+                "id": 1,
+                "start_s": 0.9,
+                "end_s": 1.1,
+                "text": "second same-second segment",
+                "source": "fixture",
+            },
+        ],
+    )
+    capsys.readouterr()
+
+    anchors: list[search.Anchor] = []
+    rendered: list[str] = []
+    for segment_id, expected_start in ((0, 0.4), (1, 0.9)):
+        assert (
+            cli.main(["library", "cite", bundle.name, str(segment_id), "--state", str(state_path)])
+            == 0
+        )
+        output = capsys.readouterr().out.rstrip("\n")
+        rendered_value, serialized_anchor, outcome = output.split("\t")
+        anchor_data = json.loads(serialized_anchor)
+        assert set(anchor_data) == {
+            "bundle_id",
+            "segment_id",
+            "start_s",
+            "text_sha256",
+            "canon_version",
+        }
+        assert anchor_data["start_s"] == expected_start
+        assert str(tmp_path) not in output
+        assert outcome == AnchorResolution.EXACT.value
+        rendered.append(rendered_value)
+        anchors.append(search.Anchor(**anchor_data))
+
+    assert rendered == ["[t=00:00]", "[t=00:00]"]
+    assert anchors[0] != anchors[1]
+    with open_state(state_path) as state:
+        assert [state.resolve_anchor(anchor).outcome for anchor in anchors] == [
+            AnchorResolution.EXACT,
+            AnchorResolution.EXACT,
+        ]
+
+
 def test_cite_emits_no_filesystem_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     state_path, bundle = _archive(tmp_path)
     capsys.readouterr()

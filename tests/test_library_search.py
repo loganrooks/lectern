@@ -93,6 +93,19 @@ def test_search_operator_mode_is_reachable(tmp_path: Path) -> None:
         assert state.search_segments("knowledge OR kangaroo", literal=False)
 
 
+def test_literal_search_supports_casefold_expansion_without_breaking_operator_mode(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("casefold-expansion", 0, "Die Straße bleibt")
+        literal_hits = state.search_segments("STRASSE")
+        operator_hits = state.search_segments("Straße", literal=False)
+
+    assert [hit.bundle_id for hit in literal_hits] == ["casefold-expansion"]
+    assert [hit.bundle_id for hit in operator_hits] == ["casefold-expansion"]
+
+
 def test_search_operator_mode_surfaces_bad_syntax(tmp_path: Path) -> None:
     """Opting into the grammar means opting into its errors, reported clearly."""
 

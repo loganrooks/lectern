@@ -673,7 +673,8 @@ def _library_cite(args: Sequence[str], state_path: Path, json_output: bool) -> i
             }
         )
     else:
-        print(f"{anchor.rendered()}\t{anchor.bundle_id}\t{resolved.outcome.value}")
+        serialized_anchor = json.dumps(anchor.to_dict(), sort_keys=True, separators=(",", ":"))
+        print(f"{anchor.rendered()}\t{serialized_anchor}\t{resolved.outcome.value}")
     return 0
 
 

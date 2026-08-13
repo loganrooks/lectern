@@ -77,16 +77,13 @@ def _require_manifest_schema_version(schema: dict[str, object]) -> None:
 def schema_version_is_compatible(version: str) -> bool:
     """Whether this build can read a manifest declaring `version`.
 
-    Compatibility is keyed on the leading component only, matching SUPPORT.md:
-    additive changes raise a later component and stay readable, while a breaking
-    change raises the leading one and must not be read under the old meaning.
-
-    The settled `1.0.0` boundary makes legacy `0.1.0` manifests incompatible:
-    the M5a content-identity change keeps `Source.ref` as a string while changing
-    what it denotes, so an older reader cannot detect the break from shape alone.
+    The preview reader accepts exactly the schema it implements. Artifact models
+    reject unknown fields so privacy-sensitive data cannot be silently discarded;
+    claiming that a later same-major schema is readable would contradict that
+    strict validation as soon as the later schema added a field.
     """
 
-    return version.split(".", 1)[0] == SCHEMA_VERSION.split(".", 1)[0]
+    return version == SCHEMA_VERSION
 
 
 def atomic_write_text(path: Path, text: str) -> Path:
@@ -250,12 +247,12 @@ class Manifest(ArtifactModel):
     def load(cls, bundle_dir: Path) -> Manifest:
         """Load a manifest, refusing one this code cannot claim to understand.
 
-        Without this check the version field is decoration: a newer manifest
-        validates against the current model, missing fields take their defaults,
-        and repurposed fields are read under their old meaning. That silence is
-        what makes a same-shaped change dangerous — the consumer gets no error,
-        just a wrong answer. Refusing is the only way the compatibility promise
-        in SUPPORT.md means anything at the point of use.
+        Without this check the version field is decoration: a newer same-shaped
+        manifest can validate against the current model, missing fields take their
+        defaults, and repurposed fields are read under their old meaning. That
+        silence is what makes a same-shaped change dangerous — the consumer gets
+        no error, just a wrong answer. Refusing is the only way the compatibility
+        promise in SUPPORT.md means anything at the point of use.
         """
 
         payload: object = json.loads((bundle_dir / MANIFEST_NAME).read_text())

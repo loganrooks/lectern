@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Self, cast
 
-from lectern.bundle import Manifest, StageState, TranscriptSegmentsDocument
+from lectern.bundle import Manifest, SourceDocument, StageState, TranscriptSegmentsDocument
 from lectern.records import (
     LEGAL_QUEUE_TRANSITION_SOURCE_VALUES,
     LEGAL_QUEUE_TRANSITION_SOURCES,
@@ -671,13 +671,7 @@ class AutomationStateStore:
         ).fetchall():
             identifier = str(bundle_id)
             bundle_dir = Path(str(bundle_path))
-            try:
-                Manifest.load(bundle_dir)
-            except (OSError, ValueError, RecursionError):
-                self._delete_index_rows(identifier)
-                refreshed.append(identifier)
-                continue
-            current = self._segments_fingerprint(bundle_dir)
+            current = self._segments_fingerprint(identifier, bundle_dir)
             if current is None:
                 # Search results are claims about the bundle as it exists now.
                 # If its supporting transcript vanished or became unreadable,
@@ -707,11 +701,10 @@ class AutomationStateStore:
         return refreshed
 
     def _segments_fingerprint(
-        self, bundle_dir: Path
+        self, bundle_id: str, bundle_dir: Path
     ) -> tuple[str, tuple[tuple[int, str, str], ...]] | None:
         try:
-            payload = (bundle_dir / "transcript" / "segments.json").read_bytes()
-            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
+            payload, document = _read_registered_segments(bundle_id, bundle_dir)
         except (OSError, ValueError, RecursionError):
             return None
         return hashlib.sha256(payload).hexdigest(), tuple(
@@ -735,9 +728,7 @@ class AutomationStateStore:
         """
 
         try:
-            Manifest.load(bundle_dir)
-            payload = (bundle_dir / "transcript" / "segments.json").read_bytes()
-            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
+            payload, document = _read_registered_segments(bundle_id, bundle_dir)
         except (OSError, ValueError, RecursionError):
             self._delete_index_rows(bundle_id)
             return 0
@@ -837,9 +828,7 @@ class AutomationStateStore:
             return None
         bundle_dir = Path(str(row[0]))
         try:
-            Manifest.load(bundle_dir)
-            payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
-            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
+            _, document = _read_registered_segments(bundle_id, bundle_dir)
         except (OSError, ValueError, RecursionError):
             return None
         return [item.model_dump(mode="json") for item in document.root]
@@ -901,7 +890,7 @@ class AutomationStateStore:
                 continue
             duration: float | None = None
             try:
-                manifest = Manifest.load(Path(str(row[1])))
+                manifest = _load_registered_manifest(bundle_id, Path(str(row[1])))
                 duration = manifest.source.duration_s
             except (OSError, ValueError, RecursionError):
                 duration = None
@@ -1422,7 +1411,7 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
 
     try:
         bundle_path = Path(str(row["bundle_path"]))
-        manifest = Manifest.load(bundle_path)
+        manifest = _load_registered_manifest(str(row["bundle_id"]), bundle_path)
     except (OSError, ValueError, RecursionError):
         return derive_library_status(queue_state, (), manifest_available=False)
 
@@ -1443,6 +1432,24 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
             or not _manifest_outputs_are_materialized(bundle_path, manifest)
         ),
     )
+
+
+def _load_registered_manifest(bundle_id: str, bundle_path: Path) -> Manifest:
+    manifest = Manifest.load(bundle_path)
+    if manifest.bundle_id != bundle_id:
+        raise ValueError("registered bundle id does not match manifest bundle id")
+    return manifest
+
+
+def _read_registered_segments(
+    bundle_id: str, bundle_path: Path
+) -> tuple[bytes, TranscriptSegmentsDocument]:
+    _load_registered_manifest(bundle_id, bundle_path)
+    source_payload = (bundle_path / "source.json").read_bytes()
+    source = SourceDocument.model_validate_json(source_payload, strict=True)
+    segments_payload = (bundle_path / source.transcript.segments).read_bytes()
+    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)
+    return segments_payload, document
 
 
 def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) -> bool:

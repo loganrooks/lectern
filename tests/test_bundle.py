@@ -1,5 +1,6 @@
 """Bundle schema seed tests: round-trip and schema export (M0 acceptance basis)."""
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -19,6 +20,7 @@ from lectern.bundle import (
     StageState,
     atomic_write_text,
     export_json_schema,
+    schema_version_is_compatible,
 )
 
 CONTENT_DIGEST = "a" * 64
@@ -38,6 +40,27 @@ def make_manifest() -> Manifest:
 
 def test_manifest_schema_is_one_zero() -> None:
     assert SCHEMA_VERSION == "1.0.0"
+
+
+@pytest.mark.parametrize("version", ["0.1.0", "1.0.1", "1.1.0", "2.0.0", "1", "garbage"])
+def test_manifest_schema_compatibility_requires_the_exact_version(version: str) -> None:
+    assert not schema_version_is_compatible(version)
+
+
+def test_manifest_schema_compatibility_accepts_the_current_version() -> None:
+    assert schema_version_is_compatible(SCHEMA_VERSION)
+
+
+def test_manifest_load_refuses_a_later_minor_before_artifact_validation(tmp_path: Path) -> None:
+    manifest = make_manifest()
+    path = manifest.save(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "1.1.0"
+    payload["optional_1_1_field"] = "unknown to the 1.0.0 model"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported bundle schema version '1.1.0'"):
+        Manifest.load(tmp_path)
 
 
 def test_local_source_requires_content_identity_and_size() -> None:

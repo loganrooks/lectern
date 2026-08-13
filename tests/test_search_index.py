@@ -13,6 +13,7 @@ across, because it never had anything already on disk.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from lectern import cli, search
 from lectern.automation import open_state
+from lectern.records import AutomationError, LibraryStatus
 from lectern.state import STATE_SCHEMA_VERSION
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -98,6 +100,57 @@ def test_reconciliation_reports_agreement_after_ingest(tmp_path: Path) -> None:
     state_path, _ = _ingest(tmp_path)
     with open_state(state_path) as state:
         assert state.unindexed_bundle_ids() == []
+
+
+def test_retrieval_follows_the_validated_source_segments_pointer(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    source_path = bundle / "source.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    original_segments = bundle / str(source["transcript"]["segments"])
+    moved_segments = bundle / "transcript" / "retrieval-segments.json"
+    segments = json.loads(original_segments.read_text(encoding="utf-8"))
+    segments[0]["text"] = "pointer-selected unique phrase"
+    moved_segments.write_text(json.dumps(segments), encoding="utf-8")
+    original_segments.unlink()
+    source["transcript"]["segments"] = "transcript/retrieval-segments.json"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    replacements = {
+        "source.json": source_path,
+        "transcript/segments.json": moved_segments,
+    }
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            replacement = replacements.get(output["path"])
+            if replacement is None:
+                continue
+            payload = replacement.read_bytes()
+            output["path"] = replacement.relative_to(bundle).as_posix()
+            output["sha256"] = hashlib.sha256(payload).hexdigest()
+            output["bytes"] = len(payload)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with open_state(state_path) as state:
+        hit = state.search_segments("pointer-selected unique phrase")[0]
+        _, resolved = state.cite_segment(bundle.name, int(hit.segment_id or 0))
+        assert resolved.current_text == "pointer-selected unique phrase"
+
+
+def test_registered_bundle_identity_must_match_the_loaded_manifest(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["bundle_id"] = "replacement-bundle"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        assert state.search_segments("knowledge") == []
+        with pytest.raises(AutomationError, match="readable transcript"):
+            state.cite_segment(bundle.name, 0)
+        assert state.get_library_bundle(bundle.name).status is LibraryStatus.INCOMPLETE
 
 
 def test_reconciliation_repairs_a_missing_cached_row(tmp_path: Path) -> None:

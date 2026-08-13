@@ -26,9 +26,15 @@ The current package version is `0.0.1`. The current manifest schema version is
 `1.0.0`. The current automation state schema version is `3`.
 
 Before a stable release, CLI flags and command output may change. Bundle schema
-changes are treated more carefully: additive bundle manifest changes should
-raise the manifest schema minor version, and breaking changes require a major
-schema version plus migration notes.
+changes are treated more carefully. Version increments classify changes:
+additive bundle manifest changes should raise the manifest schema minor version,
+and breaking changes require a major schema version plus migration notes. The
+current preview reader accepts only the exact manifest schema version it
+implements. It does not claim forward compatibility with later same-major
+schemas: strict artifact validation rejects undeclared fields rather than
+silently discarding data, including privacy-sensitive data. Reading a later
+schema therefore requires an updated reader or an explicitly documented
+migration path.
 
 The current `0.1.0` to `1.0.0` bundle procedure is documented in
 [docs/MIGRATIONS.md](docs/MIGRATIONS.md). Manifest `1.0.0` does not mean the
