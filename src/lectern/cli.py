@@ -26,6 +26,7 @@ from lectern.automation import (
 from lectern.bundle import Manifest, export_artifact_schemas, export_json_schema
 from lectern.ingest import IngestError
 from lectern.migrations import MigrationError, migrate_bundle
+from lectern.records import redact_paths
 
 # Commands that return stored data to a caller, and therefore must emit no
 # filesystem path in either rendering.
@@ -528,10 +529,10 @@ def _library(args: Sequence[str]) -> int:
         if command == "cite":
             return _library_cite(rest, state_path, json_output)
     except AutomationError as exc:
-        print(f"library: {exc}", file=sys.stderr)
+        print(f"library: {redact_paths(str(exc))}", file=sys.stderr)
         return 3
     except OSError as exc:
-        print(f"library: {exc}", file=sys.stderr)
+        print(f"library: {redact_paths(str(exc))}", file=sys.stderr)
         return 1
     _library_usage()
     return 2

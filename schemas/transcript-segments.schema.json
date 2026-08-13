@@ -1,9 +1,12 @@
 {
   "$defs": {
     "TranscriptSegmentRecord": {
+      "additionalProperties": false,
       "description": "One row of `transcript/segments.json`, the unit a citation anchors to.",
       "properties": {
         "id": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
           "title": "Id",
           "type": "integer"
         },
@@ -47,5 +50,6 @@
     "$ref": "#/$defs/TranscriptSegmentRecord"
   },
   "title": "TranscriptSegmentsDocument",
-  "type": "array"
+  "type": "array",
+  "x-lectern-uniqueBy": "id"
 }

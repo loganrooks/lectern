@@ -100,8 +100,8 @@ def test_reconciliation_reports_agreement_after_ingest(tmp_path: Path) -> None:
         assert state.unindexed_bundle_ids() == []
 
 
-def test_reconciliation_detects_a_missing_bundle(tmp_path: Path) -> None:
-    """The invariant has to be able to fail, or it is decoration."""
+def test_reconciliation_repairs_a_missing_cached_row(tmp_path: Path) -> None:
+    """A cached digest must not hide missing FTS rows."""
 
     state_path, _ = _ingest(tmp_path)
     connection = sqlite3.connect(state_path)
@@ -110,7 +110,8 @@ def test_reconciliation_detects_a_missing_bundle(tmp_path: Path) -> None:
     connection.close()
 
     with open_state(state_path) as state:
-        assert state.unindexed_bundle_ids() != []
+        assert state.unindexed_bundle_ids() == []
+        assert state.indexed_segment_count() > 0
 
 
 def test_reconciliation_removes_stale_hits_when_segments_disappear(tmp_path: Path) -> None:
@@ -248,3 +249,70 @@ def test_refresh_skips_malformed_segment_ids_without_blocking_store(
         assert not [
             hit for hit in state.search_segments("knowledge") if hit.bundle_id == bundle.name
         ]
+
+
+def test_refresh_rejects_the_whole_duplicate_id_document(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    segments.append({**segments[0], "text": "duplicate-id unique-marker"})
+    segments_path.write_text(json.dumps(segments), encoding="utf-8")
+
+    with open_state(state_path) as state:
+        assert not state.search_segments("unique-marker")
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+
+
+def test_refresh_repairs_partial_cached_index_rows(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    with open_state(state_path) as state:
+        expected = state.indexed_segment_count(bundle_id=bundle.name)
+        state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "DELETE FROM segment_index WHERE rowid IN "
+            "(SELECT rowid FROM segment_index WHERE bundle_id = ? LIMIT 1)",
+            (bundle.name,),
+        )
+        state._connection.commit()  # pyright: ignore[reportPrivateUsage]
+
+    with open_state(state_path) as state:
+        assert state.indexed_segment_count(bundle_id=bundle.name) == expected
+
+
+@pytest.mark.parametrize("column", ["segment_id", "display", "body"])
+def test_refresh_repairs_poisoned_cached_index_rows(tmp_path: Path, column: str) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    connection = sqlite3.connect(state_path)
+    poison: object = "not-an-int" if column == "segment_id" else "forged unique-marker"
+    connection.execute(
+        f"UPDATE segment_index SET {column} = ? WHERE bundle_id = ?",  # noqa: S608
+        (poison, bundle.name),
+    )
+    connection.commit()
+    connection.close()
+
+    with open_state(state_path) as state:
+        assert not state.search_segments("forged unique-marker")
+        assert state.search_segments("knowledge")
+
+
+def test_index_rows_and_cached_digest_come_from_one_segments_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    with open_state(state_path) as state:
+
+        def unexpected_second_read(_bundle_dir: Path) -> object:
+            raise AssertionError("indexing reread segments after building rows")
+
+        monkeypatch.setattr(state, "_segments_fingerprint", unexpected_second_read)
+        assert state._index_bundle_segments(bundle.name, bundle) > 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_refresh_contains_deep_malformed_json_to_one_bundle(tmp_path: Path) -> None:
+    state_path, bundle = _ingest(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments_path.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
+
+    with open_state(state_path) as state:
+        assert state.list_library()
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0

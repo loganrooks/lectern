@@ -33,6 +33,8 @@ def test_latency_datum_is_durably_recorded() -> None:
     assert int(datum["corpus_segments"]) >= 1000
     assert datum["conditions"]
     assert datum["claim_limit"]
+    assert int(datum["canon_version"]) == search.CANON_VERSION
+    assert int(datum["segmenter_version"]) == search.SEGMENTER_VERSION
     reconciliation = datum["open_reconcile_search_measurement"]
     assert int(reconciliation["corpus_bundles"]) == 1000
     assert int(reconciliation["total_segments_bytes"]) >= 100_000_000

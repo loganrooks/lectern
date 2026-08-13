@@ -5,12 +5,14 @@
       "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
       "properties": {
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
         },
         "bytes": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -28,17 +30,20 @@
       "type": "object"
     },
     "NormalizedAudio": {
+      "additionalProperties": false,
       "properties": {
         "path": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Path",
           "type": "string"
         },
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
         },
         "bytes": {
+          "minimum": 0,
           "title": "Bytes",
           "type": "integer"
         }
@@ -52,6 +57,7 @@
       "type": "object"
     },
     "RemoteServices": {
+      "additionalProperties": false,
       "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
       "properties": {
         "allowed": {
@@ -86,6 +92,7 @@
       "type": "object"
     },
     "SchemaContract": {
+      "additionalProperties": false,
       "properties": {
         "manifest_schema_versioned": {
           "title": "Manifest Schema Versioned",
@@ -104,19 +111,20 @@
       "type": "object"
     },
     "TranscriptArtifacts": {
+      "additionalProperties": false,
       "properties": {
         "segments": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Segments",
           "type": "string"
         },
         "transcript": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Transcript",
           "type": "string"
         },
         "summary": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Summary",
           "type": "string"
         }
@@ -140,6 +148,7 @@
         "sha256": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{64}$",
               "type": "string"
             },
             {
@@ -176,6 +185,7 @@
         "command_sha256": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{64}$",
               "type": "string"
             },
             {
@@ -188,6 +198,7 @@
         "argv_sha256": {
           "anyOf": [
             {
+              "pattern": "^[0-9a-f]{64}$",
               "type": "string"
             },
             {
@@ -229,6 +240,7 @@
       "type": "object"
     }
   },
+  "additionalProperties": false,
   "description": "`transcript/metadata.json`.",
   "properties": {
     "schema": {

@@ -5,12 +5,14 @@
       "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
       "properties": {
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
         },
         "bytes": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -28,6 +30,7 @@
       "type": "object"
     },
     "RemoteServices": {
+      "additionalProperties": false,
       "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
       "properties": {
         "allowed": {
@@ -176,6 +179,7 @@
       "type": "string"
     },
     "SourceProvenance": {
+      "additionalProperties": false,
       "description": "The automation record appended to `source.json` on a completed ingest.\n\nAbsent on a bare one-shot ingest and present after queue completion, so it is\noptional here \u2014 but declared, because dropping it on round trip would discard\nthe state schema version, the source and queue identities, the consent record,\nthe policy, and the remote-service posture. Those are exactly the fields a\nlater audit would need and would find missing.",
       "properties": {
         "state_schema_version": {
@@ -234,23 +238,24 @@
       "type": "object"
     },
     "TranscriptPointer": {
+      "additionalProperties": false,
       "properties": {
         "method": {
           "title": "Method",
           "type": "string"
         },
         "metadata": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Metadata",
           "type": "string"
         },
         "segments": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Segments",
           "type": "string"
         },
         "transcript": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Transcript",
           "type": "string"
         },
@@ -274,16 +279,19 @@
       "type": "object"
     }
   },
+  "additionalProperties": false,
   "description": "`source.json`.",
   "properties": {
     "source": {
       "$ref": "#/$defs/Source"
     },
     "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
       "title": "Sha256",
       "type": "string"
     },
     "bytes": {
+      "minimum": 0,
       "title": "Bytes",
       "type": "integer"
     },

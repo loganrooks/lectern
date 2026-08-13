@@ -133,7 +133,12 @@ def derive_library_status(
 # which is how OSError renders it -- and whitespace only as a fallback for
 # unquoted paths.
 _QUOTED_ABSOLUTE_PATH = re.compile(r"(?<=')/(?:\\.|[^'\\])*(?=')|(?<=\")/(?:\\.|[^\"\\])*(?=\")")
-_BARE_ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?:[^\s'\"<>|]*[^\s'\"<>|.,;:])?")
+_BARE_ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?!/)[^\r\n]*")
+_FILE_URI = re.compile(r"(?i)\bfile:/+[^\r\n'\"<>|]*")
+_WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?<!\w)(?:[a-z]:[\\/]|\\\\|(?<!\\)\\(?!\\))[^\r\n'\"<>|]*"
+)
+_DOUBLE_SLASH_PATH = re.compile(r"(?<![:/])//[^\r\n'\"<>|]*")
 
 PATH_REDACTED = "<path>"
 
@@ -153,7 +158,10 @@ def redact_paths(text: str) -> str:
     name discloses as much as the home directory does.
     """
 
-    return _BARE_ABSOLUTE_PATH.sub(PATH_REDACTED, _QUOTED_ABSOLUTE_PATH.sub(PATH_REDACTED, text))
+    redacted = _QUOTED_ABSOLUTE_PATH.sub(PATH_REDACTED, text)
+    for pattern in (_FILE_URI, _WINDOWS_ABSOLUTE_PATH, _DOUBLE_SLASH_PATH, _BARE_ABSOLUTE_PATH):
+        redacted = pattern.sub(PATH_REDACTED, redacted)
+    return redacted
 
 
 @dataclass(frozen=True)

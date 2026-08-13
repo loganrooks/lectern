@@ -12,6 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from lectern import cli, search
 from lectern.automation import open_state
 from lectern.records import redact_paths
@@ -54,6 +56,22 @@ def test_redaction_consumes_paths_containing_spaces() -> None:
 
 def test_redaction_still_handles_unquoted_paths() -> None:
     assert "plain" not in redact_paths("failed at /tmp/plain/path.wav while reading")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "//server/private/alice/session.wav",
+        r"C:\Users\alice\Private\session.wav",
+        r"\\server\share\alice\session.wav",
+        "file:///Users/alice/Private/session.wav",
+    ],
+)
+def test_redaction_handles_cross_platform_absolute_paths(path: str) -> None:
+    redacted = redact_paths(f"failed at {path}")
+    assert "alice" not in redacted
+    assert "session.wav" not in redacted
+    assert "<path>" in redacted
 
 
 def test_redaction_consumes_escaped_quote_delimiters() -> None:
@@ -217,7 +235,17 @@ def test_index_refreshes_when_transcript_content_changes(tmp_path: Path) -> None
         assert [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
 
     (bundle / "transcript" / "segments.json").write_text(
-        json.dumps([{"id": 0, "start_s": 0.0, "end_s": 1.0, "text": "entirely different wording"}]),
+        json.dumps(
+            [
+                {
+                    "id": 0,
+                    "start_s": 0.0,
+                    "end_s": 1.0,
+                    "text": "entirely different wording",
+                    "source": "fixture",
+                }
+            ]
+        ),
         encoding="utf-8",
     )
     with open_state(state_path) as state:

@@ -15,14 +15,28 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, cast
 
-from pydantic import AfterValidator, BaseModel, Field, RootModel, WithJsonSchema, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    FiniteFloat,
+    RootModel,
+    StringConstraints,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
+
+from lectern.records import redact_paths
 
 SCHEMA_VERSION = "1.0.0"
 CONTENT_REF_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _CONTENT_REF = re.compile(CONTENT_REF_PATTERN)
 
 MANIFEST_NAME = "manifest.json"
-BUNDLE_RELATIVE_PATH_PATTERN = r"^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\.\.(?:/|$))(?!.*\\).+$"
+BUNDLE_RELATIVE_PATH_PATTERN = (
+    r"^(?![A-Za-z]:)(?![\s\S]*\\)(?![\s\S]*(?:^|/)\.\.?(?:/|$))[^/]+(?:/[^/]+)*$"
+)
 
 
 def _validate_bundle_relative_path(value: str) -> str:
@@ -44,6 +58,20 @@ BundleRelativePath = Annotated[
     AfterValidator(_validate_bundle_relative_path),
     WithJsonSchema({"type": "string", "pattern": BUNDLE_RELATIVE_PATH_PATTERN}),
 ]
+Sha256Digest = Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+NonNegativeStrictInt = Annotated[int, Field(strict=True, ge=0)]
+SegmentId = Annotated[int, Field(strict=True, ge=0, le=(2**63) - 1)]
+
+
+class ArtifactModel(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+def _require_manifest_schema_version(schema: dict[str, object]) -> None:
+    required = list(cast(list[str], schema.get("required", [])))
+    if "schema_version" not in required:
+        required.insert(0, "schema_version")
+    schema["required"] = required
 
 
 def schema_version_is_compatible(version: str) -> bool:
@@ -118,7 +146,7 @@ class StageState(StrEnum):
     SKIPPED = "skipped"
 
 
-class Source(BaseModel):
+class Source(ArtifactModel):
     """Provenance. `local` sources trigger the privacy hard rule (ADR-0002)."""
 
     kind: SourceKind
@@ -134,7 +162,7 @@ class Source(BaseModel):
     title: str | None = None
     channel: str | None = None
     published: datetime | None = None
-    duration_s: float | None = None
+    duration_s: FiniteFloat | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -176,27 +204,34 @@ class Source(BaseModel):
     }
 
 
-class ArtifactRef(BaseModel):
+class ArtifactRef(ArtifactModel):
     """A produced file, content-addressed for idempotence checks."""
 
     path: BundleRelativePath
-    sha256: str
-    bytes: int
+    sha256: Sha256Digest
+    bytes: NonNegativeStrictInt
 
 
 def empty_artifact_refs() -> list[ArtifactRef]:
     return []
 
 
-class StageRecord(BaseModel):
+class StageRecord(ArtifactModel):
     state: StageState = StageState.PENDING
     started: datetime | None = None
     finished: datetime | None = None
     outputs: list[ArtifactRef] = Field(default_factory=empty_artifact_refs)
     error: str | None = None
 
+    model_config = {"validate_assignment": True}
 
-class Manifest(BaseModel):
+    @field_validator("error")
+    @classmethod
+    def redact_error_paths(cls, value: str | None) -> str | None:
+        return None if value is None else redact_paths(value)
+
+
+class Manifest(ArtifactModel):
     schema_version: str = SCHEMA_VERSION
     bundle_id: str
     created: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -204,6 +239,8 @@ class Manifest(BaseModel):
     stages: dict[StageName, StageRecord] = Field(
         default_factory=lambda: {name: StageRecord() for name in StageName}
     )
+
+    model_config = {"extra": "forbid", "json_schema_extra": _require_manifest_schema_version}
 
     def save(self, bundle_dir: Path) -> Path:
         path = bundle_dir / MANIFEST_NAME
@@ -237,7 +274,7 @@ class Manifest(BaseModel):
         return cls.model_validate(payload)
 
 
-class RemoteServices(BaseModel):
+class RemoteServices(ArtifactModel):
     """The network posture recorded alongside a transcript.
 
     Modelled rather than left as free-form JSON because it is the field a
@@ -252,7 +289,7 @@ class RemoteServices(BaseModel):
     transcriber_network_posture: str
 
 
-class TranscriptPointer(BaseModel):
+class TranscriptPointer(ArtifactModel):
     method: str
     metadata: BundleRelativePath
     segments: BundleRelativePath
@@ -261,7 +298,7 @@ class TranscriptPointer(BaseModel):
     remote_services: RemoteServices
 
 
-class ContentIdentity(BaseModel):
+class ContentIdentity(ArtifactModel):
     """Digest and size, with no field for a location.
 
     The absence is the design: after LW-11 a bundle records what its media was,
@@ -269,8 +306,8 @@ class ContentIdentity(BaseModel):
     door open for one to reappear.
     """
 
-    sha256: str
-    bytes: int | None = None
+    sha256: Sha256Digest
+    bytes: NonNegativeStrictInt | None = None
 
     # Unknown keys are REJECTED here, and the exported schema says so. Pydantic
     # ignores extras by default, which meant `{"sha256": ..., "path": "/Users/..."}`
@@ -280,7 +317,7 @@ class ContentIdentity(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-class SourceProvenance(BaseModel):
+class SourceProvenance(ArtifactModel):
     """The automation record appended to `source.json` on a completed ingest.
 
     Absent on a bare one-shot ingest and present after queue completion, so it is
@@ -304,34 +341,34 @@ class SourceProvenance(BaseModel):
     remote_services: RemoteServices
 
 
-class SourceDocument(BaseModel):
+class SourceDocument(ArtifactModel):
     """`source.json`."""
 
     source: Source
-    sha256: str
-    bytes: int
+    sha256: Sha256Digest
+    bytes: NonNegativeStrictInt
     transcript: TranscriptPointer
     transcript_sidecar: ContentIdentity | None = None
     provenance: SourceProvenance | None = None
 
 
-class TranscriptSegmentRecord(BaseModel):
+class TranscriptSegmentRecord(ArtifactModel):
     """One row of `transcript/segments.json`, the unit a citation anchors to."""
 
-    id: int
-    start_s: float
-    end_s: float | None = None
+    id: SegmentId
+    start_s: FiniteFloat
+    end_s: FiniteFloat | None = None
     text: str
     source: str
 
 
-class NormalizedAudio(BaseModel):
+class NormalizedAudio(ArtifactModel):
     path: BundleRelativePath
-    sha256: str
-    bytes: int
+    sha256: Sha256Digest
+    bytes: NonNegativeStrictInt
 
 
-class TranscriptBackend(BaseModel):
+class TranscriptBackend(ArtifactModel):
     """How the transcript was produced.
 
     The `local_command` fields are declared rather than tolerated: pydantic
@@ -342,29 +379,29 @@ class TranscriptBackend(BaseModel):
     """
 
     kind: str
-    sha256: str | None = None
+    sha256: Sha256Digest | None = None
     command: str | None = None
     argv0: str | None = None
-    command_sha256: str | None = None
-    argv_sha256: str | None = None
+    command_sha256: Sha256Digest | None = None
+    argv_sha256: Sha256Digest | None = None
     input_argument_mode: str | None = None
-    timeout_s: float | None = None
+    timeout_s: FiniteFloat | None = None
 
     model_config = {"extra": "forbid"}
 
 
-class TranscriptArtifacts(BaseModel):
+class TranscriptArtifacts(ArtifactModel):
     segments: BundleRelativePath
     transcript: BundleRelativePath
     summary: BundleRelativePath
 
 
-class SchemaContract(BaseModel):
+class SchemaContract(ArtifactModel):
     manifest_schema_versioned: bool
     note: str
 
 
-class TranscriptMetadataDocument(BaseModel):
+class TranscriptMetadataDocument(ArtifactModel):
     """`transcript/metadata.json`."""
 
     schema_: str = Field(alias="schema")
@@ -378,7 +415,7 @@ class TranscriptMetadataDocument(BaseModel):
     artifacts: TranscriptArtifacts
     schema_contract: SchemaContract
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 # Every artifact type Lectern writes as JSON, and the model that describes it.
@@ -394,6 +431,8 @@ class TranscriptSegmentsDocument(RootModel[list[TranscriptSegmentRecord]]):
     """
 
     root: list[TranscriptSegmentRecord]
+
+    model_config = {"json_schema_extra": {"x-lectern-uniqueBy": "id"}}
 
     @model_validator(mode="after")
     def validate_unique_ids(self) -> TranscriptSegmentsDocument:

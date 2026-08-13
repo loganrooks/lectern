@@ -16,6 +16,7 @@ that succeeds.
 from __future__ import annotations
 
 import json
+import ntpath
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -23,7 +24,9 @@ import pytest
 from pytest import CaptureFixture
 
 from lectern import cli
+from lectern.automation import open_state
 from lectern.ingest import ingest_local
+from lectern.records import PATH_REDACTED, redact_paths
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -91,6 +94,20 @@ def registered(tmp_path: Path) -> Iterator[tuple[Path, Path, Path]]:
 def _assert_no_path(captured: str, folder: Path, command: str) -> None:
     for fragment in _leaky_substrings(folder):
         assert fragment not in captured, f"`{command}` leaked {fragment!r}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param(r"\Users\alice\Private\session.wav", id="root-relative"),
+        pytest.param(r"C:\Users\alice\Private\session.wav", id="drive-backslash"),
+        pytest.param("C:/Users/alice/Private/session.wav", id="drive-forward-slash"),
+        pytest.param(r"\\server\share\alice\Private\session.wav", id="unc"),
+    ],
+)
+def test_windows_absolute_paths_are_completely_redacted(path: str) -> None:
+    assert ntpath.isabs(path), f"fixture is not Windows-absolute: {path!r}"
+    assert redact_paths(f"failed at {path}") == f"failed at {PATH_REDACTED}"
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["plain", "json"])
@@ -195,6 +212,55 @@ def test_library_show_emits_no_filesystem_path(
     bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]
     assert cli.main(["library", "show", bundle_id, "--state", str(state), "--json"]) == 0
     _assert_no_path(capsys.readouterr().out, folder, "library show")
+
+
+def test_library_show_error_emits_no_filesystem_path(
+    registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
+) -> None:
+    tmp_path, folder, state_path = registered
+    listing = _ingest_one(tmp_path, state_path, capsys)
+    bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    (Path(bundle.bundle_path) / "manifest.json").unlink()
+    assert cli.main(["library", "show", bundle_id, "--state", str(state_path), "--json"]) == 1
+    _assert_no_path(capsys.readouterr().err, folder, "library show error")
+
+
+def test_library_show_redacts_stage_error_paths(
+    registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
+) -> None:
+    tmp_path, folder, state_path = registered
+    listing = _ingest_one(tmp_path, state_path, capsys)
+    bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    manifest_path = Path(bundle.bundle_path) / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["stages"]["transcribe"]["error"] = f"failed {folder}/session.wav"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert cli.main(["library", "show", bundle_id, "--state", str(state_path), "--json"]) == 0
+    _assert_no_path(capsys.readouterr().out, folder, "library show stage error")
+
+
+def test_library_show_redacts_windows_root_relative_stage_error_path(
+    registered: tuple[Path, Path, Path], capsys: CaptureFixture[str]
+) -> None:
+    tmp_path, _, state_path = registered
+    listing = _ingest_one(tmp_path, state_path, capsys)
+    bundle_id = json.loads(listing)["bundles"][0]["bundle_id"]
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    manifest_path = Path(bundle.bundle_path) / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    private_path = r"\Users\alice\Private\session.wav"
+    assert ntpath.isabs(private_path)
+    payload["stages"]["transcribe"]["error"] = f"failed at {private_path}"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cli.main(["library", "show", bundle_id, "--state", str(state_path), "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["manifest"]["stages"]["transcribe"]["error"] == f"failed at {PATH_REDACTED}"
 
 
 def test_every_outward_command_is_covered() -> None:

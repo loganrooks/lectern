@@ -23,6 +23,7 @@ from lectern.bundle import (
     TranscriptSegmentsDocument,
     atomic_write_text,
 )
+from lectern.records import redact_paths
 
 LEGACY_SCHEMA_VERSION = "0.1.0"
 TARGET_SCHEMA_VERSION = "1.0.0"
@@ -358,6 +359,14 @@ def _derive_target_documents(
         source_record["ref"] = ref
         source_record["bytes"] = source_bytes
 
+    stages = manifest.get("stages")
+    if isinstance(stages, dict):
+        for stage in cast(dict[str, Any], stages).values():
+            if isinstance(stage, dict):
+                record = cast(dict[str, Any], stage)
+                if isinstance(record.get("error"), str):
+                    record["error"] = redact_paths(cast(str, record["error"]))
+
     sidecar = source_document.get("transcript_sidecar")
     if isinstance(sidecar, dict):
         cast(dict[str, Any], sidecar).pop("path", None)
@@ -410,6 +419,13 @@ def _validate_target(
     manifest_text, manifest_raw = _read_object_with_text(target / MANIFEST_NAME, "target manifest")
     if manifest_raw.get("schema_version") != TARGET_SCHEMA_VERSION:
         raise MigrationError("target manifest does not declare schema 1.0.0")
+    stages = manifest_raw.get("stages")
+    if isinstance(stages, dict):
+        for stage in cast(dict[str, Any], stages).values():
+            if isinstance(stage, dict):
+                error = cast(dict[str, Any], stage).get("error")
+                if isinstance(error, str) and error != redact_paths(error):
+                    raise MigrationError("target manifest contains a path-bearing stage error")
     _assert_declared_integrity(target, manifest_raw)
     source_text, source_raw = _read_object_with_text(
         target / "source.json", "target source metadata"
@@ -611,6 +627,12 @@ def _rename(source: Path, destination: Path) -> None:
     source.rename(destination)
 
 
+def _rename_to_absent(source: Path, destination: Path, role: str) -> None:
+    if _role_exists(destination, f"{role} role"):
+        raise MigrationError(f"{role} role became occupied during migration publication")
+    _rename(source, destination)
+
+
 def _clear_marker(target: Path) -> None:
     try:
         (target / MARKER_NAME).unlink(missing_ok=True)
@@ -632,15 +654,15 @@ def _publish(prepared: PreparedBundleMigration) -> None:
     _assert_snapshot(prepared.source_dir, prepared.source_snapshot, "source")
     _assert_snapshot(prepared.staging_dir, prepared.target_snapshot, "target")
     try:
-        _rename(prepared.source_dir, prepared.backup_dir)
+        _rename_to_absent(prepared.source_dir, prepared.backup_dir, "backup")
     except OSError as exc:
         raise MigrationError("cannot move the source role into the backup role") from exc
     try:
-        _rename(prepared.staging_dir, prepared.source_dir)
-    except OSError as exc:
+        _rename_to_absent(prepared.staging_dir, prepared.source_dir, "source")
+    except (OSError, MigrationError) as exc:
         try:
-            _rename(prepared.backup_dir, prepared.source_dir)
-        except OSError as restore_exc:
+            _rename_to_absent(prepared.backup_dir, prepared.source_dir, "source")
+        except (OSError, MigrationError) as restore_exc:
             raise MigrationError(
                 "migration publication failed and source restoration also failed"
             ) from restore_exc
@@ -855,8 +877,8 @@ def migrate_bundle(bundle_dir: Path) -> BundleMigrationResult:
             _assert_snapshot(backup, backup_snapshot, "backup")
             _assert_snapshot(staging, target_snapshot, "target")
             try:
-                _rename(staging, source)
-            except OSError as exc:
+                _rename_to_absent(staging, source, "source")
+            except (OSError, MigrationError) as exc:
                 raise MigrationError("cannot finish publication from the staging role") from exc
             _assert_snapshot(source, target_snapshot, "target")
             _, published_snapshot = _validate_prepared_target(
@@ -881,8 +903,8 @@ def migrate_bundle(bundle_dir: Path) -> BundleMigrationResult:
 
     _assert_snapshot(backup, backup_snapshot, "backup")
     try:
-        _rename(backup, source)
-    except OSError as exc:
+        _rename_to_absent(backup, source, "source")
+    except (OSError, MigrationError) as exc:
         raise MigrationError("cannot restore the source role from backup") from exc
     _assert_snapshot(source, backup_snapshot, "source")
     if staging_exists:

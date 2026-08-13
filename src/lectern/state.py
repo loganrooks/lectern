@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import unicodedata
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -63,13 +65,102 @@ from lectern.search import (
 )
 
 
+def _restrict_existing_sqlite_sidecar(path: Path) -> None:
+    """Restrict a pre-existing SQLite sidecar before SQLite can read or reuse it."""
+
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AutomationError("cannot securely open a state database sidecar") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise AutomationError("state database sidecar is not a regular file")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_if_same_file(path: Path, identity: tuple[int, int]) -> None:
+    """Remove only the new path still naming the file this invocation created."""
+
+    try:
+        current_stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return
+    if (
+        stat.S_ISREG(current_stat.st_mode)
+        and (
+            current_stat.st_dev,
+            current_stat.st_ino,
+        )
+        == identity
+    ):
+        path.unlink(missing_ok=True)
+
+
 class AutomationStateStore:
     """SQLite-backed local automation state store."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path)
+        try:
+            self.path.parent.mkdir(parents=True)
+        except FileExistsError:
+            pass
+        else:
+            os.chmod(self.path.parent, 0o700)
+        parent_mode = stat.S_IMODE(self.path.parent.stat().st_mode)
+        if parent_mode & 0o022:
+            raise AutomationError("state database directory is not private")
+        created = False
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as exc:
+                raise AutomationError("cannot securely open the state database") from exc
+        else:
+            created = True
+        opened_identity: tuple[int, int] | None = None
+        try:
+            opened_stat = os.fstat(descriptor)
+            opened_identity = (opened_stat.st_dev, opened_stat.st_ino)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise AutomationError("state database path is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            for suffix in ("-journal", "-wal", "-shm"):
+                _restrict_existing_sqlite_sidecar(Path(f"{path}{suffix}"))
+
+            try:
+                self._connection = sqlite3.connect(path)
+            except OSError as exc:
+                raise AutomationError("cannot securely open the state database") from exc
+            try:
+                current_stat = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                self._connection.close()
+                raise AutomationError("state database path changed while opening") from exc
+            if (
+                not stat.S_ISREG(current_stat.st_mode)
+                or (
+                    current_stat.st_dev,
+                    current_stat.st_ino,
+                )
+                != opened_identity
+            ):
+                self._connection.close()
+                raise AutomationError("state database path changed while opening")
+        except BaseException:
+            if created and opened_identity is not None:
+                _unlink_if_same_file(path, opened_identity)
+            raise
+        finally:
+            os.close(descriptor)
         try:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
@@ -82,6 +173,8 @@ class AutomationStateStore:
             # opportunity; `BaseException` because an interrupt between connect
             # and migrate leaks exactly as a migration error does.
             self._connection.close()
+            if created:
+                _unlink_if_same_file(path, opened_identity)
             raise
 
     def close(self) -> None:
@@ -580,11 +673,11 @@ class AutomationStateStore:
             bundle_dir = Path(str(bundle_path))
             try:
                 Manifest.load(bundle_dir)
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 self._delete_index_rows(identifier)
                 refreshed.append(identifier)
                 continue
-            current = self._segments_digest(bundle_dir)
+            current = self._segments_fingerprint(bundle_dir)
             if current is None:
                 # Search results are claims about the bundle as it exists now.
                 # If its supporting transcript vanished or became unreadable,
@@ -596,7 +689,16 @@ class AutomationStateStore:
             row = self._connection.execute(
                 "SELECT segments_sha256 FROM indexed_bundles WHERE bundle_id = ?", (identifier,)
             ).fetchone()
-            if row is not None and str(row[0]) == current:
+            current_digest, expected_rows = current
+            indexed_rows = tuple(
+                (item[0], str(item[1]), str(item[2]))
+                for item in self._connection.execute(
+                    "SELECT segment_id, display, body FROM segment_index "
+                    "WHERE bundle_id = ? ORDER BY segment_id",
+                    (identifier,),
+                ).fetchall()
+            )
+            if row is not None and str(row[0]) == current_digest and indexed_rows == expected_rows:
                 continue
             self._index_bundle_segments(identifier, bundle_dir)
             refreshed.append(identifier)
@@ -604,12 +706,17 @@ class AutomationStateStore:
             self._connection.commit()
         return refreshed
 
-    def _segments_digest(self, bundle_dir: Path) -> str | None:
+    def _segments_fingerprint(
+        self, bundle_dir: Path
+    ) -> tuple[str, tuple[tuple[int, str, str], ...]] | None:
         try:
             payload = (bundle_dir / "transcript" / "segments.json").read_bytes()
-        except OSError:
+            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
+        except (OSError, ValueError, RecursionError):
             return None
-        return hashlib.sha256(payload).hexdigest()
+        return hashlib.sha256(payload).hexdigest(), tuple(
+            (segment.id, segment.text, segment_text(segment.text)) for segment in document.root
+        )
 
     def _backfill_segment_index(self) -> None:
         for bundle_id, bundle_path in self._connection.execute(
@@ -629,44 +736,26 @@ class AutomationStateStore:
 
         try:
             Manifest.load(bundle_dir)
-            payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
-            segments = json.loads(payload)
-        except (OSError, ValueError):
-            self._delete_index_rows(bundle_id)
-            return 0
-        if not isinstance(segments, list):
+            payload = (bundle_dir / "transcript" / "segments.json").read_bytes()
+            document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
+        except (OSError, ValueError, RecursionError):
             self._delete_index_rows(bundle_id)
             return 0
 
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
-        # Each element is checked rather than cast: this is JSON read back off
-        # disk, so its shape is an assumption until something verifies it, and a
-        # cast would state the assumption as a fact the type checker then stops
-        # questioning. A malformed segment is skipped, and the reconciliation
-        # query is what keeps the skip visible.
         rows: list[tuple[str, int, str, str]] = []
-        for segment in cast(list[Any], segments):
-            if not isinstance(segment, dict):
-                continue
-            entry = cast(dict[str, Any], segment)
-            segment_id = entry.get("id")
-            text = entry.get("text")
-            if isinstance(segment_id, bool) or not isinstance(segment_id, int):
-                continue
-            if not isinstance(text, str) or not text:
-                continue
+        for segment in document.root:
             # `display` is the text as written; `body` is the segmented form the
             # tokenizer needs. Returning `body` to a caller printed CJK with a
             # space between every character and whole transcripts for text-only
             # bundles -- an internal representation escaping as a user-facing one.
-            rows.append((bundle_id, segment_id, text, segment_text(text)))
-        digest = self._segments_digest(bundle_dir)
-        if digest is not None:
-            self._connection.execute(
-                "INSERT INTO indexed_bundles(bundle_id, segments_sha256) VALUES (?, ?) "
-                "ON CONFLICT(bundle_id) DO UPDATE SET segments_sha256 = excluded.segments_sha256",
-                (bundle_id, digest),
-            )
+            rows.append((bundle_id, segment.id, segment.text, segment_text(segment.text)))
+        digest = hashlib.sha256(payload).hexdigest()
+        self._connection.execute(
+            "INSERT INTO indexed_bundles(bundle_id, segments_sha256) VALUES (?, ?) "
+            "ON CONFLICT(bundle_id) DO UPDATE SET segments_sha256 = excluded.segments_sha256",
+            (bundle_id, digest),
+        )
         self._connection.executemany(
             "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
             rows,
@@ -751,7 +840,7 @@ class AutomationStateStore:
             Manifest.load(bundle_dir)
             payload = (bundle_dir / "transcript" / "segments.json").read_text(encoding="utf-8")
             document = TranscriptSegmentsDocument.model_validate_json(payload, strict=True)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
         return [item.model_dump(mode="json") for item in document.root]
 
@@ -814,7 +903,7 @@ class AutomationStateStore:
             try:
                 manifest = Manifest.load(Path(str(row[1])))
                 duration = manifest.source.duration_s
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 duration = None
             issues.extend(sample_segment_timings(bundle_id, segments, duration))
         return issues
@@ -1334,7 +1423,7 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
     try:
         bundle_path = Path(str(row["bundle_path"]))
         manifest = Manifest.load(bundle_path)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return derive_library_status(queue_state, (), manifest_available=False)
 
     materialized_stages = [
@@ -1357,6 +1446,12 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
 
 
 def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) -> bool:
+    try:
+        if bundle_path.is_symlink():
+            return False
+        resolved_bundle = bundle_path.resolve(strict=True)
+    except OSError:
+        return False
     for stage in manifest.stages.values():
         for output in stage.outputs:
             relative = Path(output.path)
@@ -1364,11 +1459,28 @@ def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) ->
                 return False
             candidate = bundle_path / relative
             try:
-                if candidate.is_symlink() or not candidate.is_file():
+                resolved_candidate = candidate.resolve(strict=True)
+                if (
+                    _has_symlink_component(bundle_path, relative)
+                    or not resolved_candidate.is_relative_to(resolved_bundle)
+                    or not resolved_candidate.is_file()
+                ):
                     return False
+                payload = resolved_candidate.read_bytes()
             except OSError:
                 return False
+            if len(payload) != output.bytes or hashlib.sha256(payload).hexdigest() != output.sha256:
+                return False
     return True
+
+
+def _has_symlink_component(bundle_path: Path, relative: Path) -> bool:
+    candidate = bundle_path
+    for part in relative.parts:
+        candidate /= part
+        if candidate.is_symlink():
+            return True
+    return False
 
 
 def _bounded_search_snippet(display: str, query: str, *, limit: int = 240) -> str:
@@ -1390,23 +1502,67 @@ def _canonical_match_offset(display: str, query: str) -> int:
         if canonical_parts:
             canonical_parts.append(" ")
             raw_offsets.append(token_match.start())
-        raw_token = token_match.group()
-        normalized = canonical_text(raw_token).casefold()
-        canonical_parts.append(normalized)
-        raw_offsets.extend(
-            token_match.start() + min(index, len(raw_token) - 1) for index in range(len(normalized))
+        normalized, token_offsets = _canonical_token_offsets(
+            token_match.group(), token_match.start()
         )
+        canonical_parts.append(normalized)
+        raw_offsets.extend(token_offsets)
     match_at = "".join(canonical_parts).find(canonical_text(query).casefold())
     return -1 if match_at < 0 else raw_offsets[match_at]
 
 
+def _canonical_token_offsets(raw_token: str, raw_start: int) -> tuple[str, list[int]]:
+    normalized_parts: list[str] = []
+    offsets: list[int] = []
+    index = 0
+    while index < len(raw_token):
+        end = _normalization_cluster_end(raw_token, index)
+        normalized = unicodedata.normalize("NFC", raw_token[index:end]).casefold()
+        normalized_parts.append(normalized)
+        offsets.extend([raw_start + index] * len(normalized))
+        index = end
+    return "".join(normalized_parts), offsets
+
+
+def _normalization_cluster_end(raw_token: str, start: int) -> int:
+    """Return the end of one independently NFC-normalizable source cluster."""
+
+    end = start + 1
+    code_point = ord(raw_token[start])
+    # Hangul NFC composes modern L + V (+ T) Jamo even though every component
+    # has combining class zero, so a combining-mark-only cluster rule splits
+    # exactly the decomposed Korean text canonicalization is meant to preserve.
+    if 0x1100 <= code_point <= 0x1112 and end < len(raw_token):
+        if 0x1161 <= ord(raw_token[end]) <= 0x1175:
+            end += 1
+            if end < len(raw_token) and 0x11A8 <= ord(raw_token[end]) <= 0x11C2:
+                end += 1
+    elif (
+        0xAC00 <= code_point <= 0xD7A3
+        and (code_point - 0xAC00) % 28 == 0
+        and end < len(raw_token)
+        and 0x11A8 <= ord(raw_token[end]) <= 0x11C2
+    ):
+        end += 1
+    while end < len(raw_token) and unicodedata.combining(raw_token[end]):
+        end += 1
+    return end
+
+
 _OPERATOR_TERM = re.compile(r'"((?:""|[^"])*)"|([\w]+)')
 _FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
+_FTS_COLUMN_SELECTOR = re.compile(
+    r"(?i)(?<!\w)(?:"
+    r"\{(?:\s*(?:body|display|bundle_id|segment_id)\s*)+\}"
+    r"|(?:body|display|bundle_id|segment_id)"
+    r")\s*:"
+)
 
 
 def _operator_match_term(display: str, query: str) -> str:
     folded_display = display.casefold()
-    for phrase, word in _OPERATOR_TERM.findall(query):
+    without_selectors = _FTS_COLUMN_SELECTOR.sub("", query)
+    for phrase, word in _OPERATOR_TERM.findall(without_selectors):
         candidate = phrase.replace('""', '"') if phrase else word
         if candidate.upper() in _FTS_OPERATORS:
             continue

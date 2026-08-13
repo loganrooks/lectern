@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sqlite3
+import stat
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from lectern import automation
+from lectern import state as state_module
 from lectern.automation import (
     STATE_SCHEMA_VERSION,
     AutomationError,
@@ -58,6 +60,85 @@ def test_state_store_initializes_with_schema_version(tmp_path: Path) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
 
     assert version == STATE_SCHEMA_VERSION
+
+
+def test_new_state_store_is_private_before_content(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    previous_umask = os.umask(0o022)
+    try:
+        with open_state(state_path) as state:
+            assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+            state._connection.execute("PRAGMA journal_mode=WAL")  # pyright: ignore[reportPrivateUsage]
+            state._connection.execute("CREATE TABLE private_probe(value TEXT)")  # pyright: ignore[reportPrivateUsage]
+            state._connection.execute("INSERT INTO private_probe VALUES ('private transcript')")  # pyright: ignore[reportPrivateUsage]
+            state._connection.commit()  # pyright: ignore[reportPrivateUsage]
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{state_path}{suffix}")
+                if sidecar.exists():
+                    assert stat.S_IMODE(sidecar.stat().st_mode) & 0o077 == 0
+    finally:
+        os.umask(previous_umask)
+
+
+def test_new_state_store_creates_a_private_parent_under_group_umask(tmp_path: Path) -> None:
+    state_path = tmp_path / "missing" / "state.sqlite"
+    previous_umask = os.umask(0o002)
+    try:
+        with open_state(state_path):
+            pass
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+
+
+def test_existing_state_store_and_sidecars_are_restricted(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as first:
+        first._connection.execute("PRAGMA journal_mode=WAL")  # pyright: ignore[reportPrivateUsage]
+        first._connection.execute("CREATE TABLE private_upgrade_probe(value TEXT)")  # pyright: ignore[reportPrivateUsage]
+        first._connection.execute("INSERT INTO private_upgrade_probe VALUES ('private')")  # pyright: ignore[reportPrivateUsage]
+        first._connection.commit()  # pyright: ignore[reportPrivateUsage]
+        os.chmod(state_path, 0o644)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{state_path}{suffix}")
+            if sidecar.exists():
+                os.chmod(sidecar, 0o644)
+
+        with open_state(state_path):
+            pass
+
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{state_path}{suffix}")
+            if sidecar.exists():
+                assert stat.S_IMODE(sidecar.stat().st_mode) & 0o077 == 0
+
+
+def test_state_store_refuses_path_swapped_during_connect(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path):
+        pass
+    victim = tmp_path / "victim.sqlite"
+    with sqlite3.connect(victim) as connection:
+        connection.execute("PRAGMA user_version = 91")
+
+    parked = tmp_path / "checked.sqlite"
+    real_connect = sqlite3.connect
+
+    def swap_then_connect(path: str | Path) -> sqlite3.Connection:
+        if Path(path) == state_path:
+            state_path.rename(parked)
+            state_path.symlink_to(victim)
+        return real_connect(path)
+
+    monkeypatch.setattr(state_module.sqlite3, "connect", swap_then_connect)
+    with pytest.raises(AutomationError, match="changed while opening"):
+        open_state(state_path)
+
+    with real_connect(victim) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 91
 
 
 def test_version_zero_initialization_resumes_after_v2_commit(

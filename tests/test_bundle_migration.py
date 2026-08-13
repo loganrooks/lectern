@@ -1222,6 +1222,36 @@ def test_migrate_swaps_in_target_and_retains_original_backup(tmp_path: Path) -> 
     assert _tree_bytes(backup) == before
 
 
+def test_migration_redacts_stage_error_paths_in_written_target(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    manifest = _read_json(manifest_path)
+    private_path = "/Users/alice/Private Recordings/secret.wav"
+    manifest["stages"]["transcribe"]["error"] = f"decoder failed at {private_path}"
+    _write_json(manifest_path, manifest)
+    before = _tree_bytes(bundle)
+
+    result = migrations.migrate_bundle(bundle)
+    assert result.outcome == "migrated"
+    assert private_path not in manifest_path.read_text(encoding="utf-8")
+    assert "<path>" in manifest_path.read_text(encoding="utf-8")
+    assert _tree_bytes(bundle.with_name(bundle.name + BACKUP_SUFFIX)) == before
+
+
+def test_migration_refuses_undeclared_legacy_extensions_without_data_loss(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    manifest = _read_json(manifest_path)
+    manifest["stages"]["transcribe"]["legacy_extension"] = {"operator_note": "retain me"}
+    _write_json(manifest_path, manifest)
+    before = _tree_bytes(bundle)
+
+    with pytest.raises(MigrationError, match="current artifact models") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert _tree_bytes(bundle) == before
+
+
 def test_second_rename_failure_restores_legacy_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1317,6 +1347,27 @@ def test_already_current_is_a_validated_no_op(tmp_path: Path) -> None:
     assert result.backup_retained is False
 
 
+def test_already_current_refuses_raw_path_bearing_stage_error(tmp_path: Path) -> None:
+    media = tmp_path / "current-path-error" / "synthetic_talk.wav"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(SYNTHETIC_TALK.read_bytes())
+    media.with_suffix(".transcript.txt").write_text(
+        SYNTHETIC_TRANSCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    bundle = ingest_local(media, tmp_path / "current-path-error-bundles").bundle_dir
+    manifest_path = bundle / MANIFEST_NAME
+    payload = _read_json(manifest_path)
+    private_path = "/Users/alice/Private Recordings/secret.wav"
+    payload["stages"]["transcribe"]["error"] = f"failed at {private_path}"
+    _write_json(manifest_path, payload)
+    before = _tree_bytes(bundle)
+
+    with pytest.raises(MigrationError, match="path-bearing stage error") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert _tree_bytes(bundle) == before
+
+
 def test_already_current_rejects_hash_invalid_target(tmp_path: Path) -> None:
     media = tmp_path / "invalid-current" / "synthetic_talk.wav"
     media.parent.mkdir(parents=True)
@@ -1360,6 +1411,50 @@ def test_migrate_rechecks_prepared_snapshots_before_first_rename(
         migrations.migrate_bundle(bundle)
     assert not os.path.lexists(bundle.with_name(bundle.name + BACKUP_SUFFIX))
     assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+
+
+def test_backup_role_appearing_before_first_rename_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    real_assert = migrations._assert_snapshot  # pyright: ignore[reportPrivateUsage]
+
+    def assert_then_occupy(path: Path, expected: Any, role: str) -> None:
+        real_assert(path, expected, role)
+        if role == "target" and not backup.exists():
+            backup.mkdir(mode=0o711)
+            (backup / "owner.txt").write_text("unrelated\n", encoding="utf-8")
+
+    monkeypatch.setattr(migrations, "_assert_snapshot", assert_then_occupy)
+    with pytest.raises(MigrationError, match="backup role became occupied") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert (backup / "owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+    assert _read_json(bundle / MANIFEST_NAME)["schema_version"] == "0.1.0"
+
+
+def test_source_role_appearing_before_forward_recovery_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    prepared.source_dir.rename(prepared.backup_dir)
+    real_assert = migrations._assert_snapshot  # pyright: ignore[reportPrivateUsage]
+
+    def assert_then_occupy(path: Path, expected: Any, role: str) -> None:
+        real_assert(path, expected, role)
+        if role == "target" and not prepared.source_dir.exists():
+            prepared.source_dir.mkdir(mode=0o711)
+            (prepared.source_dir / "owner.txt").write_text("unrelated\n", encoding="utf-8")
+
+    monkeypatch.setattr(migrations, "_assert_snapshot", assert_then_occupy)
+    with pytest.raises(MigrationError, match="finish publication") as error:
+        migrations.migrate_bundle(bundle)
+    assert str(bundle) not in str(error.value)
+    assert (prepared.source_dir / "owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+    assert prepared.backup_dir.is_dir()
+    assert prepared.staging_dir.is_dir()
 
 
 def test_restart_rejects_self_consistent_staging_drift_and_restores_backup(

@@ -10,6 +10,7 @@ failed at retrieval, not taught the user about syntax.
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,25 @@ def test_literal_snippet_centers_a_canonically_equivalent_match(tmp_path: Path) 
     assert "café" in hit.snippet
 
 
+def test_literal_snippet_offset_survives_a_long_decomposed_prefix(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    display = ("e\u0301" * 200) + ".needle" + (" after" * 50)
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("decomposed-prefix", 0, display)
+        hit = state.search_segments("needle")[0]
+    assert "needle" in hit.snippet
+
+
+def test_literal_snippet_offset_survives_decomposed_hangul(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    decomposed = unicodedata.normalize("NFD", "현상학")
+    display = ("before " * 100) + decomposed + (" after" * 50)
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("decomposed-hangul", 0, display)
+        hit = state.search_segments("현상학")[0]
+    assert decomposed in hit.snippet
+
+
 def test_operator_search_snippet_contains_an_actual_matching_term(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     display = f"{'before ' * 100}needle{' after' * 100}"
@@ -147,6 +167,18 @@ def test_operator_search_snippet_contains_an_actual_matching_term(tmp_path: Path
         hit = state.search_segments("needle OR absent", literal=False)[0]
     assert "needle" in hit.snippet
     assert len(hit.snippet) <= 243
+
+
+@pytest.mark.parametrize("selector", ["body", "{body}", "{body display}"])
+def test_operator_column_selector_is_not_used_as_the_snippet_match(
+    tmp_path: Path, selector: str
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    display = "body " + ("filler " * 100) + "needle"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("column-selector", 0, display)
+        hit = state.search_segments(f"{selector}:needle", literal=False)[0]
+    assert "needle" in hit.snippet
 
 
 @pytest.mark.parametrize("case", MULTISCRIPT, ids=[c["script"] for c in MULTISCRIPT])
@@ -169,6 +201,17 @@ def test_search_retrieves_supplementary_cjk_ideographs(tmp_path: Path) -> None:
         assert state.search_segments("𠀀𠀁")
         with pytest.raises(ValueError, match="operator-mode search does not support"):
             state.search_segments("𠀀 OR 𠀁", literal=False)
+
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("extension-i", 0, "\U0002ebf0\U0002ebf1\U0002ebf2")
+        assert state.search_segments("\U0002ebf0\U0002ebf1")
+
+
+def test_search_retrieves_unicode_17_extension_j_ideographs(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment("extension-j", 0, "\U000323b0\U000323b1\U000323b2")
+        assert state.search_segments("\U000323b0\U000323b1")
 
 
 def test_search_hit_carries_an_anchorable_reference(tmp_path: Path) -> None:

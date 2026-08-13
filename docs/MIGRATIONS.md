@@ -17,6 +17,11 @@ versions, and occupied backup/staging roles before overwriting anything. Its
 JSON and error output do not echo filesystem paths. Re-running it on a valid
 `1.0.0` bundle is a checked no-op.
 
+Legacy JSON extension fields that are not declared by Lectern's artifact
+models are refused rather than silently discarded. The original `0.1.0`
+bundle remains unchanged so an operator can inspect or export that extension
+data before retrying with a supported artifact shape.
+
 To roll back while Lectern is stopped, move the `1.0.0` directory aside and
 rename `BUNDLE.v0.1.0.bak` to the original bundle name. Do not merge files from
 the two schema versions.

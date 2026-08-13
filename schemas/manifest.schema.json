@@ -1,18 +1,21 @@
 {
   "$defs": {
     "ArtifactRef": {
+      "additionalProperties": false,
       "description": "A produced file, content-addressed for idempotence checks.",
       "properties": {
         "path": {
-          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Path",
           "type": "string"
         },
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
         },
         "bytes": {
+          "minimum": 0,
           "title": "Bytes",
           "type": "integer"
         }
@@ -154,6 +157,7 @@
       "type": "string"
     },
     "StageRecord": {
+      "additionalProperties": false,
       "properties": {
         "state": {
           "$ref": "#/$defs/StageState",
@@ -220,6 +224,7 @@
       "type": "string"
     }
   },
+  "additionalProperties": false,
   "properties": {
     "schema_version": {
       "default": "1.0.0",
@@ -250,6 +255,7 @@
     }
   },
   "required": [
+    "schema_version",
     "bundle_id",
     "source"
   ],

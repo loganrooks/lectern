@@ -111,3 +111,47 @@ def test_missing_declared_output_requires_reprocessing(tmp_path: Path) -> None:
         assert (
             state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
         )
+
+
+def test_modified_declared_output_requires_reprocessing(tmp_path: Path) -> None:
+    state_path, bundle_id, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    segments = Path(bundle.bundle_path) / "transcript" / "segments.json"
+    segments.write_bytes(segments.read_bytes() + b" ")
+
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )
+
+
+def test_symlinked_declared_output_parent_requires_reprocessing(tmp_path: Path) -> None:
+    state_path, bundle_id, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    bundle_path = Path(bundle.bundle_path)
+    transcript = bundle_path / "transcript"
+    external = tmp_path / "external-transcript"
+    transcript.rename(external)
+    transcript.symlink_to(external, target_is_directory=True)
+
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )
+
+
+def test_symlinked_bundle_root_requires_reprocessing(tmp_path: Path) -> None:
+    state_path, bundle_id, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+    bundle_path = Path(bundle.bundle_path)
+    external = tmp_path / "external-bundle"
+    bundle_path.rename(external)
+    bundle_path.symlink_to(external, target_is_directory=True)
+
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )

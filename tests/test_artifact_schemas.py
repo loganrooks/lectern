@@ -16,6 +16,7 @@ what an ingest actually produces on disk, not from a list someone maintains.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from lectern.bundle import (
     Source,
     SourceDocument,
     SourceKind,
+    StageName,
     TranscriptArtifacts,
     TranscriptBackend,
     TranscriptMetadataDocument,
@@ -149,11 +151,97 @@ def test_source_identity_rejects_undeclared_path_fields() -> None:
             {"kind": SourceKind.LOCAL, "ref": f"sha256:{'0' * 64}", "bytes": 1, "path": "/x"}
         )
 
+    with pytest.raises(ValueError):
+        SourceDocument.model_validate(
+            {
+                "source": {"kind": "local", "ref": f"sha256:{'0' * 64}", "bytes": 1},
+                "sha256": "0" * 64,
+                "bytes": 1,
+                "transcript": {
+                    "method": "fixture",
+                    "metadata": "transcript/metadata.json",
+                    "segments": "transcript/segments.json",
+                    "transcript": "transcript/transcript.md",
+                    "evidence_limit": "fixture",
+                    "remote_services": {
+                        "allowed": False,
+                        "scope": "core",
+                        "lectern_invoked": False,
+                        "requires_explicit_per_item_consent": True,
+                        "transcriber_network_posture": "none",
+                    },
+                },
+                "path": "/x",
+            }
+        )
+
 
 def test_segments_document_rejects_duplicate_ids() -> None:
     row = {"id": 0, "start_s": 0.0, "text": "one", "source": "fixture"}
     with pytest.raises(ValueError, match="unique"):
         TranscriptSegmentsDocument.model_validate([row, {**row, "text": "two"}])
+    schema = json.loads(export_artifact_schemas()["transcript-segments"])
+    assert schema["x-lectern-uniqueBy"] == "id"
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_segments_document_rejects_non_finite_timestamps(timestamp: float) -> None:
+    row = {"id": 0, "start_s": timestamp, "text": "one", "source": "fixture"}
+    with pytest.raises(ValueError, match="finite"):
+        TranscriptSegmentsDocument.model_validate([row])
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_artifact_models_reject_non_finite_duration_and_timeout(value: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        Source(kind=SourceKind.URL, ref="https://example.test/talk", duration_s=value)
+    with pytest.raises(ValueError, match="finite"):
+        TranscriptBackend(kind="fixture", timeout_s=value)
+
+
+def test_artifact_identity_fields_are_constrained() -> None:
+    with pytest.raises(ValueError):
+        ArtifactRef(path="a", sha256="bad", bytes=1)
+    with pytest.raises(ValueError):
+        ArtifactRef(path="a", sha256="0" * 64, bytes=-1)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(-1, -1), ("7", 7), (True, 1)])
+def test_non_local_source_byte_values_retain_legacy_coercion(value: object, expected: int) -> None:
+    source = Source.model_validate(
+        {"kind": SourceKind.URL, "ref": "https://example.test/talk", "bytes": value}
+    )
+    assert source.bytes == expected
+
+
+def test_manifest_schema_requires_the_version_runtime_load_requires() -> None:
+    schema = json.loads(export_artifact_schemas()["manifest"])
+    assert "schema_version" in schema["required"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["a//b", "./a", "a/.", "a/", "a\nb\\c", "a\n/../b"],
+)
+def test_artifact_path_schema_rejects_runtime_noncanonical_paths(path: str) -> None:
+    with pytest.raises(ValueError):
+        ArtifactRef(path=path, sha256="0" * 64, bytes=1)
+    schema = json.loads(export_artifact_schemas()["manifest"])
+    pattern = schema["$defs"]["ArtifactRef"]["properties"]["path"]["pattern"]
+    assert re.fullmatch(pattern, path) is None
+
+
+def test_stage_error_redaction_survives_assignment_and_manifest_save(tmp_path: Path) -> None:
+    manifest = Manifest(
+        bundle_id="fixture",
+        source=Source(kind=SourceKind.URL, ref="https://example.test/talk"),
+    )
+    stage = manifest.stages[StageName.ACQUIRE]
+    stage.error = "failed at /Users/alice/private/session.wav"
+
+    assert stage.error == "failed at <path>"
+    payload = json.loads(manifest.save(tmp_path).read_text(encoding="utf-8"))
+    assert payload["stages"][StageName.ACQUIRE]["error"] == "failed at <path>"
 
 
 @pytest.mark.parametrize("name", sorted(ARTIFACT_MODELS))
