@@ -237,7 +237,9 @@ def test_library_show_contains_a_recursively_nested_manifest(
     manifest_path.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
 
     assert cli.main(["library", "show", bundle_id, "--state", str(state_path), "--json"]) == 3
-    assert "recursion" in capsys.readouterr().err.lower()
+    error = capsys.readouterr().err
+    assert error.startswith("library: ")
+    assert "Traceback" not in error
 
 
 def test_library_show_redacts_stage_error_paths(
