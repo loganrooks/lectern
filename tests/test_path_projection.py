@@ -16,7 +16,6 @@ that succeeds.
 from __future__ import annotations
 
 import json
-import ntpath
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -105,8 +104,7 @@ def _assert_no_path(captured: str, folder: Path, command: str) -> None:
         pytest.param(r"\\server\share\alice\Private\session.wav", id="unc"),
     ],
 )
-def test_windows_absolute_paths_are_completely_redacted(path: str) -> None:
-    assert ntpath.isabs(path), f"fixture is not Windows-absolute: {path!r}"
+def test_windows_rooted_paths_are_completely_redacted(path: str) -> None:
     assert redact_paths(f"failed at {path}") == f"failed at {PATH_REDACTED}"
 
 
@@ -254,7 +252,6 @@ def test_library_show_redacts_windows_root_relative_stage_error_path(
     manifest_path = Path(bundle.bundle_path) / "manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     private_path = r"\Users\alice\Private\session.wav"
-    assert ntpath.isabs(private_path)
     payload["stages"]["transcribe"]["error"] = f"failed at {private_path}"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
