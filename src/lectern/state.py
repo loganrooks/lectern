@@ -707,9 +707,11 @@ class AutomationStateStore:
             payload, document = _read_registered_segments(bundle_id, bundle_dir)
         except (OSError, ValueError, RecursionError):
             return None
-        return hashlib.sha256(payload).hexdigest(), tuple(
+        expected_rows = [
             (segment.id, segment.text, segment_text(segment.text)) for segment in document.root
-        )
+        ]
+        expected_rows.sort(key=lambda row: row[0])
+        return hashlib.sha256(payload).hexdigest(), tuple(expected_rows)
 
     def _backfill_segment_index(self) -> None:
         for bundle_id, bundle_path in self._connection.execute(
@@ -773,19 +775,39 @@ class AutomationStateStore:
             )
 
         expression = literal_match_expression(query) if literal else query
+        normalized_query = canonical_text(query)
+        # unicode61 can erase a punctuation- or symbol-only literal completely,
+        # leaving no FTS term from which to produce candidates. In that case the
+        # display column is scanned in bounded pages and the same exact literal
+        # confirmation is applied before the requested limit.
+        tokenless_literal = (
+            literal
+            and bool(normalized_query)
+            and not any(character.isalnum() for character in normalized_query)
+        )
         try:
             if literal:
                 hits: list[SearchHit] = []
                 batch_size = max(50, limit)
                 offset = 0
                 while len(hits) < limit:
-                    rows = self._connection.execute(
-                        """
-                        SELECT bundle_id, segment_id, display FROM segment_index
-                        WHERE segment_index MATCH ? ORDER BY rank, rowid LIMIT ? OFFSET ?
-                        """,
-                        (expression, batch_size, offset),
-                    ).fetchall()
+                    if tokenless_literal:
+                        rows = self._connection.execute(
+                            """
+                            SELECT bundle_id, segment_id, display FROM segment_index
+                            ORDER BY rowid LIMIT ? OFFSET ?
+                            """,
+                            (batch_size, offset),
+                        ).fetchall()
+                    else:
+                        rows = self._connection.execute(
+                            """
+                            SELECT bundle_id, segment_id, display FROM segment_index
+                            WHERE segment_index MATCH ?
+                            ORDER BY rank, rowid LIMIT ? OFFSET ?
+                            """,
+                            (expression, batch_size, offset),
+                        ).fetchall()
                     hits.extend(
                         SearchHit(
                             bundle_id=str(row[0]),
@@ -1410,8 +1432,9 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
         return LibraryStatus.INCOMPLETE
 
     try:
+        bundle_id = str(row["bundle_id"])
         bundle_path = Path(str(row["bundle_path"]))
-        manifest = _load_registered_manifest(str(row["bundle_id"]), bundle_path)
+        manifest = _load_registered_manifest(bundle_id, bundle_path)
     except (OSError, ValueError, RecursionError):
         return derive_library_status(queue_state, (), manifest_available=False)
 
@@ -1424,6 +1447,14 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
         or record.outputs
         or record.error is not None
     ]
+    try:
+        _load_registered_source_document(bundle_id, bundle_path, manifest)
+    except (OSError, ValueError, RecursionError):
+        return derive_library_status(
+            queue_state,
+            materialized_stages,
+            source_changed=True,
+        )
     return derive_library_status(
         queue_state,
         materialized_stages,
@@ -1441,17 +1472,38 @@ def _load_registered_manifest(bundle_id: str, bundle_path: Path) -> Manifest:
     return manifest
 
 
-def _read_registered_segments(
-    bundle_id: str, bundle_path: Path
-) -> tuple[bytes, TranscriptSegmentsDocument]:
+def _load_registered_source_document(
+    bundle_id: str,
+    bundle_path: Path,
+    manifest: Manifest | None = None,
+) -> SourceDocument:
     if bundle_path.is_symlink():
         raise ValueError("registered bundle root must not be a symlink")
-    _load_registered_manifest(bundle_id, bundle_path)
+    registered_manifest = manifest or _load_registered_manifest(bundle_id, bundle_path)
     source_relative = Path("source.json")
     if _has_symlink_component(bundle_path, source_relative):
         raise ValueError("registered source document must not be a symlink")
     source_payload = (bundle_path / source_relative).read_bytes()
     source = SourceDocument.model_validate_json(source_payload, strict=True)
+    if (
+        source.source.kind != registered_manifest.source.kind
+        or source.source.ref != registered_manifest.source.ref
+        or source.source.bytes != registered_manifest.source.bytes
+    ):
+        raise ValueError("registered source identity does not match manifest source")
+    if registered_manifest.source.kind.value == "local" and (
+        registered_manifest.source.ref != f"sha256:{source.sha256}"
+        or registered_manifest.source.bytes != source.bytes
+    ):
+        raise ValueError("registered source content identity does not match manifest source")
+    return source
+
+
+def _read_registered_segments(
+    bundle_id: str, bundle_path: Path
+) -> tuple[bytes, TranscriptSegmentsDocument]:
+    manifest = _load_registered_manifest(bundle_id, bundle_path)
+    source = _load_registered_source_document(bundle_id, bundle_path, manifest)
     segments_relative = Path(source.transcript.segments)
     if _has_symlink_component(bundle_path, segments_relative):
         raise ValueError("registered transcript pointer must not contain a symlink")

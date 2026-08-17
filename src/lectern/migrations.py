@@ -343,6 +343,12 @@ def _assert_json_document(path: Path, expected: dict[str, Any], role: str) -> No
         raise MigrationError(f"{role} differs from approved transformation")
 
 
+def _portable_command_name(value: str) -> str:
+    """Retain executable identity without retaining its machine-local location."""
+
+    return PurePosixPath(value.replace("\\", "/")).name
+
+
 def _derive_target_documents(
     source: Path,
     manifest: dict[str, Any],
@@ -376,6 +382,12 @@ def _derive_target_documents(
         value = metadata.get(key)
         if isinstance(value, dict):
             cast(dict[str, Any], value).pop("path", None)
+    backend = metadata.get("backend")
+    if isinstance(backend, dict):
+        backend_record = cast(dict[str, Any], backend)
+        argv0 = backend_record.get("argv0")
+        if isinstance(argv0, str):
+            backend_record["argv0"] = _portable_command_name(argv0)
     return manifest, source_document, metadata
 
 
@@ -463,6 +475,11 @@ def _validate_target(
         value = metadata_raw.get(key)
         if isinstance(value, dict) and "path" in value:
             raise MigrationError(f"target {key} metadata still carries a path")
+    backend = metadata_raw.get("backend")
+    if isinstance(backend, dict):
+        argv0 = cast(dict[str, Any], backend).get("argv0")
+        if isinstance(argv0, str) and argv0 != _portable_command_name(argv0):
+            raise MigrationError("target backend argv0 still carries a path")
     return manifest
 
 

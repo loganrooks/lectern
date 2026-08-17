@@ -27,14 +27,14 @@ from enum import StrEnum
 from typing import Any
 
 CANON_VERSION = 1
-SEGMENTER_VERSION = 6
+SEGMENTER_VERSION = 7
 
 # Code-point ranges written one per script rather than as a single "CJK" range,
-# because the shorthand is what caused the mistake this table fixes: kana and
-# Hangul syllables are not ideographs, so a rule written for ideographs silently
-# served Chinese alone while the user-facing scope claimed Japanese and Korean
-# too. Measured before and after: han-only segmentation gave Chinese a hit and
-# Japanese and Korean a miss.
+# because the shorthand is what caused the mistake this table fixes: kana,
+# Hangul jamo, and Hangul syllables are not ideographs, so a rule written for
+# ideographs silently served Chinese alone while the user-facing scope claimed
+# Japanese and Korean too. Measured before and after: han-only segmentation gave
+# Chinese a hit and Japanese and Korean a miss.
 _UNSEGMENTED_RANGES: tuple[tuple[int, int], ...] = (
     (0x3400, 0x4DBF),  # CJK unified ideographs extension A
     (0x4E00, 0x9FFF),  # CJK unified ideographs
@@ -51,7 +51,12 @@ _UNSEGMENTED_RANGES: tuple[tuple[int, int], ...] = (
     (0x3040, 0x309F),  # Hiragana
     (0x30A0, 0x30FF),  # Katakana
     (0xFF65, 0xFF9F),  # Half-width Katakana and marks
+    (0x1100, 0x11FF),  # Hangul Jamo
+    (0x3130, 0x318F),  # Hangul Compatibility Jamo
+    (0xA960, 0xA97F),  # Hangul Jamo Extended-A
     (0xAC00, 0xD7A3),  # Hangul syllables
+    (0xD7B0, 0xD7FF),  # Hangul Jamo Extended-B
+    (0xFFA0, 0xFFDC),  # Half-width Hangul Jamo
 )
 
 
