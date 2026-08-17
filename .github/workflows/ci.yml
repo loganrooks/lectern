@@ -23,6 +23,205 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repair-final-codex-findings:
+    name: repair final Codex findings
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'claude/m5a-local-retrieval'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out pull request head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: make sync
+
+      - name: Apply exact reviewed corrections
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one exact block, found {count}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          migrations = Path("src/lectern/migrations.py")
+          replace_once(
+              migrations,
+              (
+                  '        backend_record = cast(dict[str, Any], backend)\n'
+                  '        argv0 = backend_record.get("argv0")\n'
+              ),
+              (
+                  '        backend_record = cast(dict[str, Any], backend)\n'
+                  '        backend_record.pop("command", None)\n'
+                  '        argv0 = backend_record.get("argv0")\n'
+              ),
+          )
+
+          state = Path("src/lectern/state.py")
+          replace_once(
+              state,
+              (
+                  '    def forget_library_bundle(self, bundle_id: str) -> None:\n'
+                  '        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))\n'
+                  '        self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))\n'
+                  '        self._connection.commit()\n'
+              ),
+              (
+                  '    def forget_library_bundle(self, bundle_id: str) -> None:\n'
+                  '        self._delete_index_rows(bundle_id)\n'
+                  '        self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))\n'
+                  '        self._connection.commit()\n'
+              ),
+          )
+          replace_once(
+              state,
+              (
+                  '    return source\n'
+                  '\n'
+                  '\n'
+                  'def _read_registered_segments(\n'
+              ),
+              (
+                  '    return source\n'
+                  '\n'
+                  '\n'
+                  'def _assert_manifest_artifact_payload(\n'
+                  '    manifest: Manifest, artifact_path: str, payload: bytes\n'
+                  ') -> None:\n'
+                  '    references = [\n'
+                  '        output\n'
+                  '        for stage in manifest.stages.values()\n'
+                  '        for output in stage.outputs\n'
+                  '        if output.path == artifact_path\n'
+                  '    ]\n'
+                  '    if not references:\n'
+                  '        raise ValueError("registered transcript is not declared by the manifest")\n'
+                  '    digest = hashlib.sha256(payload).hexdigest()\n'
+                  '    if any(reference.bytes != len(payload) or reference.sha256 != digest for reference in references):\n'
+                  '        raise ValueError("registered transcript does not match its manifest artifact")\n'
+                  '\n'
+                  '\n'
+                  'def _read_registered_segments(\n'
+              ),
+          )
+          replace_once(
+              state,
+              (
+                  '    segments_payload = segments_path.read_bytes()\n'
+                  '    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)\n'
+              ),
+              (
+                  '    segments_payload = segments_path.read_bytes()\n'
+                  '    _assert_manifest_artifact_payload(\n'
+                  '        manifest, source.transcript.segments, segments_payload\n'
+                  '    )\n'
+                  '    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)\n'
+              ),
+          )
+
+          cli = Path("src/lectern/cli.py")
+          replace_once(
+              cli,
+              (
+                  '        token = args[index]\n'
+                  '        if token == "--state":\n'
+              ),
+              (
+                  '        token = args[index]\n'
+                  '        if token == "--":\n'
+                  '            rest.extend(args[index:])\n'
+                  '            break\n'
+                  '        if token == "--state":\n'
+              ),
+          )
+          replace_once(
+              cli,
+              (
+                  'def _library_search(\n'
+                  '    state: AutomationState, rest: list[str], json_output: bool\n'
+                  ') -> int:\n'
+                  '    literal = True\n'
+                  '    if rest and rest[-1] == "--operators":\n'
+                  '        literal = False\n'
+                  '        rest = rest[:-1]\n'
+              ),
+              (
+                  'def _library_search(\n'
+                  '    state: AutomationState, rest: list[str], json_output: bool\n'
+                  ') -> int:\n'
+                  '    option_terminated = "--" in rest\n'
+                  '    if option_terminated:\n'
+                  '        terminator = rest.index("--")\n'
+                  '        rest = [*rest[:terminator], *rest[terminator + 1 :]]\n'
+                  '    literal = True\n'
+                  '    if not option_terminated and rest and rest[-1] == "--operators":\n'
+                  '        literal = False\n'
+                  '        rest = rest[:-1]\n'
+              ),
+          )
+          cli_text = cli.read_text(encoding="utf-8")
+          old_usage = (
+              'lectern library search [--state PATH] [--json] [--operators] QUERY'
+          )
+          usage_count = cli_text.count(old_usage)
+          if usage_count != 2:
+              raise SystemExit(f"{cli}: expected two search usage strings, found {usage_count}")
+          cli.write_text(
+              cli_text.replace(
+                  old_usage,
+                  'lectern library search [--state PATH] [--json] [--operators] [--] QUERY',
+              ),
+              encoding="utf-8",
+          )
+
+          readme = Path("README.md")
+          replace_once(
+              readme,
+              (
+                  '`lectern library search QUERY --state PATH` searches transcript segments and is\n'
+                  'literal by default; pass `--operators` only when you intentionally want SQLite\n'
+                  'FTS operators. `lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns\n'
+              ),
+              (
+                  '`lectern library search QUERY --state PATH` searches transcript segments and is\n'
+                  'literal by default; pass `--operators` only when you intentionally want SQLite\n'
+                  'FTS operators. When literal query text contains option-like tokens such as\n'
+                  '`--json`, put a standalone `--` before the query.\n'
+                  '`lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns\n'
+              ),
+          )
+          PY
+          uv run ruff format src/lectern/cli.py src/lectern/migrations.py src/lectern/state.py
+
+      - name: Verify complete public gate
+        run: make verify
+
+      - name: Commit verified corrections
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md src/lectern/cli.py src/lectern/migrations.py src/lectern/state.py
+          git commit -m "fix: close final M5a integrity gaps"
+          git push origin "HEAD:${HEAD_REF}"
+
   verify-matrix:
     name: verify (${{ matrix.os }}, py${{ matrix.python-version }})
     if: ${{ github.event_name != 'issue_comment' }}
