@@ -177,9 +177,10 @@ def test_retrieval_binds_source_metadata_to_the_registered_manifest(tmp_path: Pa
 def test_retrieval_rejects_segments_that_do_not_match_the_manifest(tmp_path: Path) -> None:
     state_path, bundle = _registered_bundle(tmp_path)
     segments_path = bundle / "transcript" / "segments.json"
-    segments = json.loads(segments_path.read_text(encoding="utf-8"))
-    assert isinstance(segments, list) and segments
-    segment = cast(dict[str, Any], segments[0])
+    raw_segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    assert isinstance(raw_segments, list) and raw_segments
+    segments = cast(list[dict[str, Any]], raw_segments)
+    segment = segments[0]
     segment_id = cast(int, segment["id"])
     segment["text"] = "forged but schema-valid evidence marker"
     _write_json(segments_path, segments)
