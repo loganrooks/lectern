@@ -49,6 +49,7 @@
   "items": {
     "$ref": "#/$defs/TranscriptSegmentRecord"
   },
+  "minItems": 1,
   "title": "TranscriptSegmentsDocument",
   "type": "array",
   "x-lectern-uniqueBy": "id"

@@ -429,10 +429,14 @@ class TranscriptSegmentsDocument(RootModel[list[TranscriptSegmentRecord]]):
 
     root: list[TranscriptSegmentRecord]
 
-    model_config = {"json_schema_extra": {"x-lectern-uniqueBy": "id"}}
+    model_config = {
+        "json_schema_extra": {"minItems": 1, "x-lectern-uniqueBy": "id"}
+    }
 
     @model_validator(mode="after")
-    def validate_unique_ids(self) -> TranscriptSegmentsDocument:
+    def validate_document(self) -> TranscriptSegmentsDocument:
+        if not self.root:
+            raise ValueError("transcript segments document requires at least one segment")
         identifiers = [segment.id for segment in self.root]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("transcript segment ids must be unique")
