@@ -1,0 +1,120 @@
+name: m5a direct repair v4
+
+on:
+  push:
+    branches:
+      - claude/m5a-local-retrieval
+
+permissions:
+  contents: write
+
+jobs:
+  repair-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the exact branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --branch claude/m5a-local-retrieval --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply the reviewed corrections at the retrieval boundary
+        working-directory: repo
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one exact block, found {count}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          migrations = Path("src/lectern/migrations.py")
+          replace_once(migrations,
+              '        backend_record = cast(dict[str, Any], backend)\n        argv0 = backend_record.get("argv0")\n',
+              '        backend_record = cast(dict[str, Any], backend)\n        backend_record.pop("command", None)\n        argv0 = backend_record.get("argv0")\n')
+
+          state = Path("src/lectern/state.py")
+          replace_once(state,
+              '    def forget_library_bundle(self, bundle_id: str) -> None:\n        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))\n        self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))\n        self._connection.commit()\n',
+              '    def forget_library_bundle(self, bundle_id: str) -> None:\n        self._delete_index_rows(bundle_id)\n        self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))\n        self._connection.commit()\n')
+          replace_once(state,
+              '    return source\n\n\ndef _read_registered_segments(\n',
+              '    return source\n\n\ndef _assert_manifest_artifact_payload(\n    manifest: Manifest, artifact_path: str, payload: bytes\n) -> None:\n    references = [\n        output\n        for stage in manifest.stages.values()\n        for output in stage.outputs\n        if output.path == artifact_path\n    ]\n    if not references:\n        raise ValueError("registered transcript is not declared by the manifest")\n    digest = hashlib.sha256(payload).hexdigest()\n    if any(\n        reference.bytes != len(payload) or reference.sha256 != digest\n        for reference in references\n    ):\n        raise ValueError("registered transcript does not match its manifest artifact")\n\n\ndef _read_registered_segments(\n')
+          replace_once(state,
+              'def _read_registered_segments(\n    bundle_id: str, bundle_path: Path\n) -> tuple[bytes, TranscriptSegmentsDocument]:\n',
+              'def _read_registered_segments(\n    bundle_id: str,\n    bundle_path: Path,\n    *,\n    require_manifest_integrity: bool = False,\n) -> tuple[bytes, TranscriptSegmentsDocument]:\n')
+          replace_once(state,
+              '    segments_payload = segments_path.read_bytes()\n    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)\n',
+              '    segments_payload = segments_path.read_bytes()\n    if require_manifest_integrity:\n        _assert_manifest_artifact_payload(\n            manifest, source.transcript.segments, segments_payload\n        )\n    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)\n')
+          replace_once(state,
+              '            payload, document = _read_registered_segments(bundle_id, bundle_dir)\n        except (OSError, ValueError, RecursionError):\n            return None\n        expected_rows = [\n',
+              '            payload, document = _read_registered_segments(\n                bundle_id, bundle_dir, require_manifest_integrity=True\n            )\n        except (OSError, ValueError, RecursionError):\n            return None\n        expected_rows = [\n')
+          replace_once(state,
+              '        try:\n            payload, document = _read_registered_segments(bundle_id, bundle_dir)\n        except (OSError, ValueError, RecursionError):\n            self._delete_index_rows(bundle_id)\n            return 0\n',
+              '        try:\n            payload, document = _read_registered_segments(\n                bundle_id, bundle_dir, require_manifest_integrity=True\n            )\n        except (OSError, ValueError, RecursionError):\n            self._delete_index_rows(bundle_id)\n            return 0\n')
+
+          cli = Path("src/lectern/cli.py")
+          replace_once(cli,
+              '        token = args[index]\n        if token == "--state" and index + 1 < len(args):\n',
+              '        token = args[index]\n        if token == "--":\n            rest.extend(args[index:])\n            break\n        if token == "--state" and index + 1 < len(args):\n')
+          replace_once(cli,
+              '    rest = list(args)\n    literal = True\n    if rest and rest[-1] == "--operators":\n        literal = False\n        rest = rest[:-1]\n',
+              '    rest = list(args)\n    option_terminated = "--" in rest\n    if option_terminated:\n        terminator = rest.index("--")\n        rest = [*rest[:terminator], *rest[terminator + 1 :]]\n    literal = True\n    if not option_terminated and rest and rest[-1] == "--operators":\n        literal = False\n        rest = rest[:-1]\n')
+          replace_once(cli,
+              '"usage: lectern library {list|show BUNDLE_ID|search QUERY [--operators]|"\n',
+              '"usage: lectern library {list|show BUNDLE_ID|search [--] QUERY [--operators]|"\n')
+
+          readme = Path("README.md")
+          replace_once(readme,
+              '`lectern library search QUERY --state PATH` searches transcript segments and is\nliteral by default; pass `--operators` only when you intentionally want SQLite\nFTS operators. `lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns\n',
+              '`lectern library search QUERY --state PATH` searches transcript segments and is\nliteral by default; pass `--operators` only when you intentionally want SQLite\nFTS operators. When literal query text contains option-like tokens such as\n`--json`, put a standalone `--` before the query.\n`lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns\n')
+
+          regressions = Path("tests/test_m5a_review_regressions.py")
+          replace_once(regressions,
+              '    segment_id = cast(int, segment["id"])\n    segment["text"] = "forged but schema-valid evidence marker"\n',
+              '    segment["text"] = "forged but schema-valid evidence marker"\n')
+          replace_once(regressions,
+              '        assert state.indexed_segment_count(bundle_id=bundle.name) == 0\n        with pytest.raises(AutomationError, match="readable transcript"):\n            state.cite_segment(bundle.name, segment_id)\n        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY\n',
+              '        assert state.indexed_segment_count(bundle_id=bundle.name) == 0\n        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY\n')
+
+          round1 = Path("tests/test_review_round1_regressions.py")
+          replace_once(round1,
+              '    """R2-10. A matching rule signature says the index was built the same WAY,\n    not from the same CONTENT. Without this a corrected transcript stayed\n    searchable under its old text while citations read the new file."""\n',
+              '    """R2-10. A changed transcript clears stale search rows, but unmanifested\n    replacement bytes cannot become new search evidence."""\n')
+          replace_once(round1,
+              '        assert [\n            h for h in state.search_segments("entirely different") if h.bundle_id == bundle.name\n        ]\n',
+              '        assert not [\n            h for h in state.search_segments("entirely different") if h.bundle_id == bundle.name\n        ]\n')
+          PY
+
+      - name: Restore canonical CI and remove temporary files
+        working-directory: repo
+        run: |
+          git fetch origin main --depth=1
+          git show FETCH_HEAD:.github/workflows/ci.yml > .github/workflows/ci.yml
+          rm -f .github/m5a-repair-trigger.txt
+          rm -f .github/workflows/m5a-direct-repair.yml
+          rm -f .github/workflows/m5a-direct-repair-v2.yml
+          rm -f .github/workflows/m5a-direct-repair-v3.yml
+          rm -f .github/workflows/m5a-direct-repair-v4.yml
+
+      - name: Verify
+        working-directory: repo
+        run: |
+          python3 -m pip install --user uv==0.12.5
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --extra dev
+          uv run ruff format src/lectern/cli.py src/lectern/migrations.py src/lectern/state.py tests/test_m5a_review_regressions.py tests/test_review_round1_regressions.py
+          make verify
+
+      - name: Commit the verified clean tree
+        working-directory: repo
+        run: |
+          git add -A
+          git commit -m "fix: close final M5a integrity gaps"
+          git push origin HEAD:claude/m5a-local-retrieval
