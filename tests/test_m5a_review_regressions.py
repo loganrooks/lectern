@@ -1,15 +1,16 @@
 """Regression tests for the final M5a review findings.
 
 These cases exercise only public M5a behavior: migration privacy, multilingual
-literal retrieval, source-to-bundle identity binding, cache reconciliation, and
-artifact validity. They intentionally do not introduce the later M5b read
-surface.
+literal retrieval, source-to-bundle identity binding, artifact integrity, cache
+reconciliation, CLI literal search, and artifact validity. They intentionally do
+not introduce the later M5b read surface.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, cast
 
@@ -109,6 +110,7 @@ def test_migration_reduces_legacy_backend_argv0_to_a_basename(tmp_path: Path) ->
     backend = cast(dict[str, Any], metadata["backend"])
     backend["path"] = str(media.with_suffix(".transcript.txt"))
     backend["argv0"] = str(tmp_path / "Private Tools" / "transcribe")
+    backend["command"] = f"{tmp_path / 'Private Tools' / 'transcribe'} --input {media}"
 
     _write_json(source_path, source)
     _write_json(metadata_path, metadata)
@@ -121,6 +123,7 @@ def test_migration_reduces_legacy_backend_argv0_to_a_basename(tmp_path: Path) ->
     assert migrated_backend["argv0"] == "transcribe"
     assert "/" not in str(migrated_backend["argv0"])
     assert "\\" not in str(migrated_backend["argv0"])
+    assert "command" not in migrated_backend
 
 
 @pytest.mark.parametrize(
@@ -171,6 +174,24 @@ def test_retrieval_binds_source_metadata_to_the_registered_manifest(tmp_path: Pa
         assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
 
 
+def test_retrieval_rejects_segments_that_do_not_match_the_manifest(tmp_path: Path) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    assert isinstance(segments, list) and segments
+    segment = cast(dict[str, Any], segments[0])
+    segment_id = cast(int, segment["id"])
+    segment["text"] = "forged but schema-valid evidence marker"
+    _write_json(segments_path, segments)
+
+    with open_state(state_path) as state:
+        assert state.search_segments("forged evidence") == []
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        with pytest.raises(AutomationError, match="readable transcript"):
+            state.cite_segment(bundle.name, segment_id)
+        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
+
+
 @pytest.mark.parametrize("query", ["++", "???", "🙂"])
 def test_literal_search_falls_back_for_tokenless_queries(tmp_path: Path, query: str) -> None:
     state_path = tmp_path / "state.sqlite"
@@ -200,6 +221,58 @@ def test_cached_fingerprint_uses_the_same_segment_order_as_the_index(tmp_path: P
         assert state.search_segments("first marker")
     with open_state(state_path) as state:
         assert state.refresh_changed_bundles() == []
+
+
+def test_forgetting_a_bundle_removes_its_cached_fingerprint(tmp_path: Path) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge")
+        state.forget_library_bundle(bundle.name)
+
+    with sqlite3.connect(state_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM indexed_bundles WHERE bundle_id = ?", (bundle.name,)
+        ).fetchone()
+    assert row is not None and row[0] == 0
+
+
+@pytest.mark.parametrize(
+    "query_tokens",
+    [
+        ["use", "--json", "output"],
+        ["literal", "--state", "evidence"],
+        ["trailing", "--operators"],
+    ],
+)
+def test_library_search_option_terminator_preserves_literal_cli_tokens(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    query_tokens: list[str],
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment(
+            "cli-literal",
+            0,
+            "use --json output; literal --state evidence; trailing --operators",
+        )
+
+    assert (
+        cli.main(
+            [
+                "library",
+                "search",
+                "--state",
+                str(state_path),
+                "--",
+                *query_tokens,
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "cli-literal" in captured.out
+    assert captured.err == ""
 
 
 def test_transcript_segments_document_rejects_an_empty_array() -> None:
