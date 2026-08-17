@@ -385,6 +385,7 @@ def _derive_target_documents(
     backend = metadata.get("backend")
     if isinstance(backend, dict):
         backend_record = cast(dict[str, Any], backend)
+        backend_record.pop("command", None)
         argv0 = backend_record.get("argv0")
         if isinstance(argv0, str):
             backend_record["argv0"] = _portable_command_name(argv0)

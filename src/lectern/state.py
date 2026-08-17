@@ -704,7 +704,9 @@ class AutomationStateStore:
         self, bundle_id: str, bundle_dir: Path
     ) -> tuple[str, tuple[tuple[int, str, str], ...]] | None:
         try:
-            payload, document = _read_registered_segments(bundle_id, bundle_dir)
+            payload, document = _read_registered_segments(
+                bundle_id, bundle_dir, require_manifest_integrity=True
+            )
         except (OSError, ValueError, RecursionError):
             return None
         expected_rows = [
@@ -730,7 +732,9 @@ class AutomationStateStore:
         """
 
         try:
-            payload, document = _read_registered_segments(bundle_id, bundle_dir)
+            payload, document = _read_registered_segments(
+                bundle_id, bundle_dir, require_manifest_integrity=True
+            )
         except (OSError, ValueError, RecursionError):
             self._delete_index_rows(bundle_id)
             return 0
@@ -967,7 +971,7 @@ class AutomationStateStore:
         self._connection.execute("DELETE FROM indexed_bundles WHERE bundle_id = ?", (bundle_id,))
 
     def forget_library_bundle(self, bundle_id: str) -> None:
-        self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
+        self._delete_index_rows(bundle_id)
         self._connection.execute("DELETE FROM library_bundles WHERE bundle_id = ?", (bundle_id,))
         self._connection.commit()
 
@@ -1499,8 +1503,29 @@ def _load_registered_source_document(
     return source
 
 
+def _assert_manifest_artifact_payload(
+    manifest: Manifest, artifact_path: str, payload: bytes
+) -> None:
+    references = [
+        output
+        for stage in manifest.stages.values()
+        for output in stage.outputs
+        if output.path == artifact_path
+    ]
+    if not references:
+        raise ValueError("registered transcript is not declared by the manifest")
+    digest = hashlib.sha256(payload).hexdigest()
+    if any(
+        reference.bytes != len(payload) or reference.sha256 != digest for reference in references
+    ):
+        raise ValueError("registered transcript does not match its manifest artifact")
+
+
 def _read_registered_segments(
-    bundle_id: str, bundle_path: Path
+    bundle_id: str,
+    bundle_path: Path,
+    *,
+    require_manifest_integrity: bool = False,
 ) -> tuple[bytes, TranscriptSegmentsDocument]:
     manifest = _load_registered_manifest(bundle_id, bundle_path)
     source = _load_registered_source_document(bundle_id, bundle_path, manifest)
@@ -1512,6 +1537,8 @@ def _read_registered_segments(
     if not segments_path.is_relative_to(resolved_bundle):
         raise ValueError("registered transcript pointer escapes the bundle")
     segments_payload = segments_path.read_bytes()
+    if require_manifest_integrity:
+        _assert_manifest_artifact_payload(manifest, source.transcript.segments, segments_payload)
     document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)
     return segments_payload, document
 

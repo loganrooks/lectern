@@ -153,7 +153,9 @@ unsupported` to inspect them.
 
 `lectern library search QUERY --state PATH` searches transcript segments and is
 literal by default; pass `--operators` only when you intentionally want SQLite
-FTS operators. `lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns
+FTS operators. When literal query text contains option-like tokens such as
+`--json`, put a standalone `--` before the query.
+`lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns
 an anchor tied to the cited transcript content.
 
 Search tokenization separates words on whitespace and punctuation for Latin,

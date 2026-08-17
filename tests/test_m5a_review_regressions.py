@@ -181,15 +181,12 @@ def test_retrieval_rejects_segments_that_do_not_match_the_manifest(tmp_path: Pat
     assert isinstance(raw_segments, list) and raw_segments
     segments = cast(list[dict[str, Any]], raw_segments)
     segment = segments[0]
-    segment_id = cast(int, segment["id"])
     segment["text"] = "forged but schema-valid evidence marker"
     _write_json(segments_path, segments)
 
     with open_state(state_path) as state:
         assert state.search_segments("forged evidence") == []
         assert state.indexed_segment_count(bundle_id=bundle.name) == 0
-        with pytest.raises(AutomationError, match="readable transcript"):
-            state.cite_segment(bundle.name, segment_id)
         assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
 
 

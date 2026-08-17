@@ -226,9 +226,8 @@ def test_hyphenated_query_is_not_the_same_as_spaced(tmp_path: Path) -> None:
 
 
 def test_index_refreshes_when_transcript_content_changes(tmp_path: Path) -> None:
-    """R2-10. A matching rule signature says the index was built the same WAY,
-    not from the same CONTENT. Without this a corrected transcript stayed
-    searchable under its old text while citations read the new file."""
+    """R2-10. A changed transcript clears stale search rows, but unmanifested
+    replacement bytes cannot become new search evidence."""
 
     state_path, bundle = _archive(tmp_path)
     with open_state(state_path) as state:
@@ -250,7 +249,7 @@ def test_index_refreshes_when_transcript_content_changes(tmp_path: Path) -> None
     )
     with open_state(state_path) as state:
         assert not [h for h in state.search_segments("knowledge") if h.bundle_id == bundle.name]
-        assert [
+        assert not [
             h for h in state.search_segments("entirely different") if h.bundle_id == bundle.name
         ]
 

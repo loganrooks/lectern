@@ -577,6 +577,9 @@ def _parse_common(args: Sequence[str]) -> tuple[list[str], Path, bool]:
     index = 0
     while index < len(args):
         token = args[index]
+        if token == "--":
+            rest.extend(args[index:])
+            break
         if token == "--state" and index + 1 < len(args):
             state_path = Path(args[index + 1])
             index += 2
@@ -628,8 +631,12 @@ def _library_search(args: Sequence[str], state_path: Path, json_output: bool) ->
         _library_usage()
         return 2
     rest = list(args)
+    option_terminated = "--" in rest
+    if option_terminated:
+        terminator = rest.index("--")
+        rest = [*rest[:terminator], *rest[terminator + 1 :]]
     literal = True
-    if rest and rest[-1] == "--operators":
+    if not option_terminated and rest and rest[-1] == "--operators":
         literal = False
         rest = rest[:-1]
     query = " ".join(rest)
@@ -680,7 +687,7 @@ def _library_cite(args: Sequence[str], state_path: Path, json_output: bool) -> i
 
 def _library_usage() -> None:
     print(
-        "usage: lectern library {list|show BUNDLE_ID|search QUERY [--operators]|"
+        "usage: lectern library {list|show BUNDLE_ID|search [--] QUERY [--operators]|"
         "cite BUNDLE_ID SEGMENT_ID} [--state PATH] [--json]",
         file=sys.stderr,
     )
