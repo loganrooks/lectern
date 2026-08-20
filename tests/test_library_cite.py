@@ -16,6 +16,7 @@ answer delivered confidently.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unicodedata
 from pathlib import Path
@@ -25,6 +26,7 @@ import pytest
 
 from lectern import cli, search
 from lectern.automation import open_state
+from lectern.bundle import MANIFEST_NAME
 from lectern.records import AutomationError
 from lectern.search import AnchorResolution
 
@@ -203,6 +205,15 @@ def test_plain_cite_serializes_distinct_resolvable_same_second_anchors(
             },
         ],
     )
+    segments_payload = (bundle / "transcript" / "segments.json").read_bytes()
+    manifest_path = bundle / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            if output["path"] == "transcript/segments.json":
+                output["sha256"] = hashlib.sha256(segments_payload).hexdigest()
+                output["bytes"] = len(segments_payload)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     capsys.readouterr()
 
     anchors: list[search.Anchor] = []

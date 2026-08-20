@@ -846,7 +846,9 @@ class AutomationStateStore:
             for row in rows
         ]
 
-    def _bundle_segments(self, bundle_id: str) -> list[dict[str, Any]] | None:
+    def _bundle_segments(
+        self, bundle_id: str, *, require_manifest_integrity: bool = False
+    ) -> list[dict[str, Any]] | None:
         row = self._connection.execute(
             "SELECT bundle_path FROM library_bundles WHERE bundle_id = ?", (bundle_id,)
         ).fetchone()
@@ -854,7 +856,9 @@ class AutomationStateStore:
             return None
         bundle_dir = Path(str(row[0]))
         try:
-            _, document = _read_registered_segments(bundle_id, bundle_dir)
+            _, document = _read_registered_segments(
+                bundle_id, bundle_dir, require_manifest_integrity=require_manifest_integrity
+            )
         except (OSError, ValueError, RecursionError):
             return None
         return [item.model_dump(mode="json") for item in document.root]
@@ -875,7 +879,7 @@ class AutomationStateStore:
         where the bundle is registered but its transcript is unreadable.
         """
 
-        segments = self._bundle_segments(bundle_id)
+        segments = self._bundle_segments(bundle_id, require_manifest_integrity=True)
         if segments is None:
             raise AutomationError(f"no readable transcript for bundle: {bundle_id}")
         for segment in segments:

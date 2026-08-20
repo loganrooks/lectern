@@ -22,6 +22,7 @@ from lectern.bundle import MANIFEST_NAME, TranscriptSegmentsDocument
 from lectern.ingest import ingest_local
 from lectern.migrations import prepare_bundle_migration
 from lectern.records import AutomationError, LibraryStatus
+from lectern.search import AnchorResolution
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -181,13 +182,21 @@ def test_retrieval_rejects_segments_that_do_not_match_the_manifest(tmp_path: Pat
     assert isinstance(raw_segments, list) and raw_segments
     segments = cast(list[dict[str, Any]], raw_segments)
     segment = segments[0]
+    segment_id = int(segment["id"])
+
+    with open_state(state_path) as state:
+        anchor, _ = state.cite_segment(bundle.name, segment_id)
+
     segment["text"] = "forged but schema-valid evidence marker"
     _write_json(segments_path, segments)
 
     with open_state(state_path) as state:
-        assert state.search_segments("forged evidence") == []
+        assert state.search_segments("forged but schema-valid evidence marker") == []
         assert state.indexed_segment_count(bundle_id=bundle.name) == 0
-        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
+        assert state.get_library_bundle(bundle.name).status is LibraryStatus.NEEDS_REPROCESSING
+        assert state.resolve_anchor(anchor).outcome is AnchorResolution.MODIFIED
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, segment_id)
 
 
 @pytest.mark.parametrize("query", ["++", "???", "🙂"])
