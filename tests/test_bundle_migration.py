@@ -565,6 +565,60 @@ def test_prepare_refreshes_every_declared_output_identity(tmp_path: Path) -> Non
     assert _tree_state(bundle) == before
 
 
+def test_prepare_follows_declared_transcript_metadata_path(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    source_path = bundle / "source.json"
+    default_metadata_path = bundle / "transcript" / "metadata.json"
+    declared_relative = Path("transcript/alternate/metadata.json")
+    declared_metadata_path = bundle / declared_relative
+    declared_metadata_path.parent.mkdir()
+
+    source = _read_json(source_path)
+    source["transcript"]["metadata"] = declared_relative.as_posix()
+    _write_json(source_path, source)
+
+    metadata = _read_json(default_metadata_path)
+    metadata["backend"]["command"] = "/Users/alice/bin/transcribe --private"
+    metadata["backend"]["argv0"] = "/Users/alice/bin/transcribe"
+    _write_json(declared_metadata_path, metadata)
+    default_before = default_metadata_path.read_bytes()
+
+    manifest = _read_json(manifest_path)
+    metadata_output = next(
+        output
+        for stage in manifest["stages"].values()
+        for output in stage["outputs"]
+        if output["path"] == "transcript/metadata.json"
+    )
+    metadata_output["path"] = declared_relative.as_posix()
+    _rewrite_manifest_hashes(bundle, manifest)
+    _write_json(manifest_path, manifest)
+    before = _tree_state(bundle)
+
+    staging = prepare_bundle_migration(bundle).staging_dir
+
+    migrated_source = _read_json(staging / "source.json")
+    migrated_metadata = _read_json(staging / declared_relative)
+    migrated_manifest = _read_json(staging / MANIFEST_NAME)
+    assert migrated_source["transcript"]["metadata"] == declared_relative.as_posix()
+    assert "path" not in migrated_metadata["source_media"]
+    assert "path" not in migrated_metadata["backend"]
+    assert "command" not in migrated_metadata["backend"]
+    assert migrated_metadata["backend"]["argv0"] == "transcribe"
+    assert (staging / "transcript" / "metadata.json").read_bytes() == default_before
+    migrated_output = next(
+        output
+        for stage in migrated_manifest["stages"].values()
+        for output in stage["outputs"]
+        if output["path"] == declared_relative.as_posix()
+    )
+    assert (migrated_output["sha256"], migrated_output["bytes"]) == _digest(
+        staging / declared_relative
+    )
+    assert _tree_state(bundle) == before
+
+
 def test_prepare_preserves_every_non_target_entry_and_records_snapshots(
     tmp_path: Path,
 ) -> None:
@@ -855,10 +909,12 @@ def test_late_target_document_mutation_cannot_enter_the_final_snapshot(
     calls = 0
 
     def mutate_after_second_preservation_check(
-        target: Path, source_snapshot: migrations.TreeSnapshot
+        target: Path,
+        source_snapshot: migrations.TreeSnapshot,
+        target_documents: set[Any],
     ) -> None:
         nonlocal calls
-        real_assert_preserved(target, source_snapshot)
+        real_assert_preserved(target, source_snapshot, target_documents)
         calls += 1
         if calls == 2:
             (target / "source.json").write_text("{}\n", encoding="utf-8")

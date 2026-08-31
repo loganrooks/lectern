@@ -210,6 +210,17 @@ def _artifact_path(bundle: Path, raw: object) -> Path:
     return path
 
 
+def _transcript_artifact_path(
+    bundle: Path,
+    source_document: dict[str, Any],
+    field: str,
+) -> tuple[PurePosixPath, Path]:
+    transcript = _object_field(source_document, "transcript", "source metadata transcript")
+    raw = transcript.get(field)
+    path = _artifact_path(bundle, raw)
+    return PurePosixPath(cast(str, raw)), path
+
+
 def _assert_no_symlinks(bundle: Path, role: str) -> None:
     if not _role_exists(bundle, f"{role} role") or bundle.is_symlink() or not bundle.is_dir():
         raise MigrationError(f"{role} role must be a real bundle directory")
@@ -377,7 +388,8 @@ def _derive_target_documents(
     if isinstance(sidecar, dict):
         cast(dict[str, Any], sidecar).pop("path", None)
 
-    metadata = _read_object(source / "transcript" / "metadata.json", "transcript metadata")
+    _, metadata_path = _transcript_artifact_path(source, source_document, "metadata")
+    metadata = _read_object(metadata_path, "transcript metadata")
     for key in ("source_media", "backend"):
         value = metadata.get(key)
         if isinstance(value, dict):
@@ -401,10 +413,9 @@ def _refresh_output_records(staging: Path, manifest: dict[str, Any]) -> None:
             record["bytes"] = size
 
 
-_TARGET_DOCUMENTS = {
+_STATIC_TARGET_DOCUMENTS = {
     PurePosixPath(MANIFEST_NAME),
     PurePosixPath("source.json"),
-    PurePosixPath("transcript/metadata.json"),
 }
 
 
@@ -412,11 +423,15 @@ def _without_paths(snapshot: TreeSnapshot, paths: set[PurePosixPath]) -> TreeSna
     return tuple(entry for entry in snapshot if entry.path not in paths)
 
 
-def _assert_preserved_tree(target: Path, source_snapshot: TreeSnapshot) -> None:
+def _assert_preserved_tree(
+    target: Path,
+    source_snapshot: TreeSnapshot,
+    target_documents: set[PurePosixPath],
+) -> None:
     target_snapshot = _tree_snapshot(target, "target")
-    target_ignored = _TARGET_DOCUMENTS | {PurePosixPath(MARKER_NAME)}
+    target_ignored = target_documents | {PurePosixPath(MARKER_NAME)}
     if _without_paths(target_snapshot, target_ignored) != _without_paths(
-        source_snapshot, _TARGET_DOCUMENTS
+        source_snapshot, target_documents
     ):
         raise MigrationError("target changed a non-target source entry")
 
@@ -443,12 +458,12 @@ def _validate_target(
     source_text, source_raw = _read_object_with_text(
         target / "source.json", "target source metadata"
     )
+    _, metadata_path = _transcript_artifact_path(target, source_raw, "metadata")
     metadata_text, metadata_raw = _read_object_with_text(
-        target / "transcript" / "metadata.json", "target transcript metadata"
+        metadata_path, "target transcript metadata"
     )
-    segments_text, _ = _read_json_value(
-        target / "transcript" / "segments.json", "target transcript segments"
-    )
+    _, segments_path = _transcript_artifact_path(target, source_raw, "segments")
+    segments_text, _ = _read_json_value(segments_path, "target transcript segments")
     try:
         manifest = Manifest.model_validate_json(manifest_text, strict=True)
         source_document = SourceDocument.model_validate_json(source_text, strict=True)
@@ -504,17 +519,21 @@ def _validate_prepared_target(
         source_sha256,
         source_bytes,
     )
+    metadata_relative, metadata_path = _transcript_artifact_path(
+        target, expected_source, "metadata"
+    )
+    target_documents = _STATIC_TARGET_DOCUMENTS | {metadata_relative}
 
     def validate_source_bound_target() -> Manifest:
         if not _marker_matches(target, expected_bundle_id):
             raise MigrationError("target migration marker is invalid")
         _assert_json_document(target / "source.json", expected_source, "target source metadata")
         _assert_json_document(
-            target / "transcript" / "metadata.json",
+            metadata_path,
             expected_metadata,
             "target transcript metadata",
         )
-        _assert_preserved_tree(target, source_snapshot)
+        _assert_preserved_tree(target, source_snapshot, target_documents)
         _refresh_output_records(target, expected_manifest)
         _assert_json_document(target / MANIFEST_NAME, expected_manifest, "target manifest")
         manifest = _validate_target(
@@ -523,7 +542,7 @@ def _validate_prepared_target(
             source_sha256=source_sha256,
             source_bytes=source_bytes,
         )
-        _assert_preserved_tree(target, source_snapshot)
+        _assert_preserved_tree(target, source_snapshot, target_documents)
         if not _marker_matches(target, expected_bundle_id):
             raise MigrationError("target migration marker is invalid")
         return manifest
@@ -603,8 +622,9 @@ def prepare_bundle_migration(bundle_dir: Path) -> PreparedBundleMigration:
             source, target, source_sha256, source_bytes
         )
         _write_json(staging / "source.json", expected_source, "source metadata")
+        _, target_metadata_path = _transcript_artifact_path(staging, expected_source, "metadata")
         _write_json(
-            staging / "transcript" / "metadata.json",
+            target_metadata_path,
             expected_metadata,
             "transcript metadata",
         )
