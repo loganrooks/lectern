@@ -58,11 +58,14 @@ from lectern.search import (
     is_unsegmented_script,
     literal_match_expression,
     make_anchor,
+    operator_segment_text,
     resolve_against_segments,
     sample_segment_timings,
     segment_text,
     text_contains_literal,
 )
+
+_SEGMENT_INDEX_COLUMNS = ("bundle_id", "segment_id", "display", "body", "literal")
 
 
 def _restrict_existing_sqlite_sidecar(path: Path) -> None:
@@ -580,6 +583,24 @@ class AutomationStateStore:
         self._connection.execute("PRAGMA user_version = 2")
         self._connection.commit()
 
+    def _create_segment_index(self, *, if_not_exists: bool = False) -> None:
+        existence_clause = "IF NOT EXISTS " if if_not_exists else ""
+        self._connection.execute(
+            f"CREATE VIRTUAL TABLE {existence_clause}segment_index USING fts5("
+            "bundle_id UNINDEXED, segment_id UNINDEXED, display UNINDEXED, body, literal)"
+        )
+
+    def _segment_index_layout_is_current(self) -> bool:
+        columns = tuple(
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(segment_index)").fetchall()
+        )
+        return columns == _SEGMENT_INDEX_COLUMNS
+
+    def _recreate_segment_index(self) -> None:
+        self._connection.execute("DROP TABLE IF EXISTS segment_index")
+        self._create_segment_index()
+
     def _create_schema_v3(self) -> None:
         """Add the retrieval index, and carry every existing bundle into it.
 
@@ -589,15 +610,11 @@ class AutomationStateStore:
         that only ingests new bundles never has anything old to lose.
         """
 
+        self._create_segment_index(if_not_exists=True)
+        if not self._segment_index_layout_is_current():
+            self._recreate_segment_index()
         self._connection.executescript(
             """
-            CREATE VIRTUAL TABLE IF NOT EXISTS segment_index USING fts5(
-                bundle_id UNINDEXED,
-                segment_id UNINDEXED,
-                display UNINDEXED,
-                body
-            );
-
             CREATE TABLE IF NOT EXISTS index_signature (
                 canon_version INTEGER NOT NULL,
                 segmenter_version INTEGER NOT NULL
@@ -646,9 +663,12 @@ class AutomationStateStore:
         signature is what converts that silence into work.
         """
 
-        if self.index_signature_row() == index_signature():
+        if (
+            self.index_signature_row() == index_signature()
+            and self._segment_index_layout_is_current()
+        ):
             return
-        self._connection.execute("DELETE FROM segment_index")
+        self._recreate_segment_index()
         self._write_index_signature()
         self._backfill_segment_index()
         self._connection.commit()
@@ -685,9 +705,9 @@ class AutomationStateStore:
             ).fetchone()
             current_digest, expected_rows = current
             indexed_rows = tuple(
-                (item[0], str(item[1]), str(item[2]))
+                (item[0], str(item[1]), str(item[2]), str(item[3]))
                 for item in self._connection.execute(
-                    "SELECT segment_id, display, body FROM segment_index "
+                    "SELECT segment_id, display, body, literal FROM segment_index "
                     "WHERE bundle_id = ? ORDER BY segment_id",
                     (identifier,),
                 ).fetchall()
@@ -702,7 +722,7 @@ class AutomationStateStore:
 
     def _segments_fingerprint(
         self, bundle_id: str, bundle_dir: Path
-    ) -> tuple[str, tuple[tuple[int, str, str], ...]] | None:
+    ) -> tuple[str, tuple[tuple[int, str, str, str], ...]] | None:
         try:
             payload, document = _read_registered_segments(
                 bundle_id, bundle_dir, require_manifest_integrity=True
@@ -710,7 +730,13 @@ class AutomationStateStore:
         except (OSError, ValueError, RecursionError):
             return None
         expected_rows = [
-            (segment.id, segment.text, segment_text(segment.text)) for segment in document.root
+            (
+                segment.id,
+                segment.text,
+                operator_segment_text(segment.text),
+                segment_text(segment.text),
+            )
+            for segment in document.root
         ]
         expected_rows.sort(key=lambda row: row[0])
         return hashlib.sha256(payload).hexdigest(), tuple(expected_rows)
@@ -740,13 +766,20 @@ class AutomationStateStore:
             return 0
 
         self._connection.execute("DELETE FROM segment_index WHERE bundle_id = ?", (bundle_id,))
-        rows: list[tuple[str, int, str, str]] = []
+        rows: list[tuple[str, int, str, str, str]] = []
         for segment in document.root:
-            # `display` is the text as written; `body` is the segmented form the
-            # tokenizer needs. Returning `body` to a caller printed CJK with a
-            # space between every character and whole transcripts for text-only
-            # bundles -- an internal representation escaping as a user-facing one.
-            rows.append((bundle_id, segment.id, segment.text, segment_text(segment.text)))
+            # `display` is the text as written. `body` retains only the original
+            # token stream for operator syntax; `literal` carries the
+            # expansion-aware stream used for literal candidate lookup.
+            rows.append(
+                (
+                    bundle_id,
+                    segment.id,
+                    segment.text,
+                    operator_segment_text(segment.text),
+                    segment_text(segment.text),
+                )
+            )
         digest = hashlib.sha256(payload).hexdigest()
         self._connection.execute(
             "INSERT INTO indexed_bundles(bundle_id, segments_sha256) VALUES (?, ?) "
@@ -754,7 +787,8 @@ class AutomationStateStore:
             (bundle_id, digest),
         )
         self._connection.executemany(
-            "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
+            "INSERT INTO segment_index(bundle_id, segment_id, display, body, literal) "
+            "VALUES (?, ?, ?, ?, ?)",
             rows,
         )
         return len(rows)
@@ -807,7 +841,7 @@ class AutomationStateStore:
                         rows = self._connection.execute(
                             """
                             SELECT bundle_id, segment_id, display FROM segment_index
-                            WHERE segment_index MATCH ?
+                            WHERE literal MATCH ?
                             ORDER BY rank, rowid LIMIT ? OFFSET ?
                             """,
                             (expression, batch_size, offset),
@@ -829,7 +863,7 @@ class AutomationStateStore:
             rows = self._connection.execute(
                 """
                 SELECT bundle_id, segment_id, display FROM segment_index
-                WHERE segment_index MATCH ? ORDER BY rank LIMIT ?
+                WHERE body MATCH ? ORDER BY rank LIMIT ?
                 """,
                 (expression, limit),
             ).fetchall()
@@ -937,8 +971,15 @@ class AutomationStateStore:
         """
 
         self._connection.execute(
-            "INSERT INTO segment_index(bundle_id, segment_id, display, body) VALUES (?, ?, ?, ?)",
-            (bundle_id, segment_id, text, segment_text(text)),
+            "INSERT INTO segment_index(bundle_id, segment_id, display, body, literal) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                bundle_id,
+                segment_id,
+                text,
+                operator_segment_text(text),
+                segment_text(text),
+            ),
         )
         self._connection.commit()
 

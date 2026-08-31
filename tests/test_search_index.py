@@ -237,6 +237,25 @@ def test_rebuild_on_signature_mismatch(tmp_path: Path) -> None:
         assert state.index_signature_row() == search.index_signature()
 
 
+def test_signature_rebuild_recreates_the_fts_column_layout(tmp_path: Path) -> None:
+    state_path, _ = _ingest(tmp_path)
+    connection = sqlite3.connect(state_path)
+    connection.execute("DROP TABLE segment_index")
+    connection.execute(
+        "CREATE VIRTUAL TABLE segment_index USING fts5("
+        "bundle_id UNINDEXED, segment_id UNINDEXED, display UNINDEXED, body)"
+    )
+    connection.execute("UPDATE index_signature SET segmenter_version = -1")
+    connection.commit()
+    connection.close()
+
+    assert _indexed_segment_count(state_path) > 0
+    connection = sqlite3.connect(state_path)
+    columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(segment_index)")]
+    connection.close()
+    assert columns == ["bundle_id", "segment_id", "display", "body", "literal"]
+
+
 def test_deleting_a_library_row_deletes_its_index_rows(tmp_path: Path) -> None:
     state_path, bundle = _ingest(tmp_path)
     bundle_id = bundle.name
@@ -251,11 +270,14 @@ def test_index_rows_carry_no_filesystem_path(tmp_path: Path) -> None:
     # place for paths to accumulate.
     state_path, _ = _ingest(tmp_path)
     connection = sqlite3.connect(state_path)
-    rows = connection.execute("SELECT bundle_id, segment_id, body FROM segment_index").fetchall()
+    rows = connection.execute(
+        "SELECT bundle_id, segment_id, body, literal FROM segment_index"
+    ).fetchall()
     connection.close()
     assert rows
-    for _, _, body in rows:
+    for _, _, body, literal in rows:
         assert str(tmp_path) not in body
+        assert str(tmp_path) not in literal
 
 
 def test_indexed_text_is_segmented(tmp_path: Path) -> None:
@@ -269,11 +291,13 @@ def test_indexed_text_is_segmented(tmp_path: Path) -> None:
     segments = json.loads((bundle / "transcript" / "segments.json").read_text(encoding="utf-8"))
     connection = sqlite3.connect(state_path)
     stored = connection.execute(
-        "SELECT body FROM segment_index WHERE segment_id = ?", (segments[0]["id"],)
+        "SELECT body, literal FROM segment_index WHERE segment_id = ?",
+        (segments[0]["id"],),
     ).fetchone()
     connection.close()
     assert stored is not None
-    assert stored[0] == search.segment_text(segments[0]["text"])
+    assert stored[0] == search.operator_segment_text(segments[0]["text"])
+    assert stored[1] == search.segment_text(segments[0]["text"])
 
 
 @pytest.mark.parametrize("missing", ["segments", "bundle"])

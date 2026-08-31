@@ -101,9 +101,13 @@ def test_literal_search_supports_casefold_expansion_without_breaking_operator_mo
         state.index_synthetic_segment("casefold-expansion", 0, "Die Straße bleibt")
         literal_hits = state.search_segments("STRASSE")
         operator_hits = state.search_segments("Straße", literal=False)
+        false_phrase_hits = state.search_segments('"bleibt die"', literal=False)
+        literal_column_hits = state.search_segments('literal:"bleibt die"', literal=False)
 
     assert [hit.bundle_id for hit in literal_hits] == ["casefold-expansion"]
     assert [hit.bundle_id for hit in operator_hits] == ["casefold-expansion"]
+    assert false_phrase_hits == []
+    assert literal_column_hits == []
 
 
 def test_search_operator_mode_surfaces_bad_syntax(tmp_path: Path) -> None:

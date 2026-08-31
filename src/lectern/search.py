@@ -13,9 +13,9 @@ Two versioned rules live here:
 carry the version they were made under, so changing the rule re-anchors
 citations instead of silently invalidating every one of them.
 
-`SEGMENTER_VERSION` governs `segment_text`. It is persisted beside the index so
-a mismatch forces a rebuild; an index built under one rule and queried under
-another is the failure this module exists to prevent.
+`SEGMENTER_VERSION` governs the literal and operator token streams. It is
+persisted beside the index so a mismatch forces a rebuild; an index built under
+one rule and queried under another is the failure this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 CANON_VERSION = 1
-SEGMENTER_VERSION = 7
+SEGMENTER_VERSION = 8
 
 # Code-point ranges written one per script rather than as a single "CJK" range,
 # because the shorthand is what caused the mistake this table fixes: kana,
@@ -93,8 +93,20 @@ def text_digest(text: str) -> str:
     return hashlib.sha256(canonical_text(text).encode("utf-8")).hexdigest()
 
 
+def operator_segment_text(text: str) -> str:
+    """Build the original-only token stream exposed to FTS operator syntax."""
+
+    return _space_unsegmented_scripts(canonical_text(text))
+
+
 def segment_text(text: str) -> str:
-    """Space-separate characters of scripts that are written without word spaces.
+    """Build the expansion-aware token stream used for literal candidates.
+
+    Characters in scripts written without word spaces are separated so shorter
+    phrases remain retrievable. Casefold expansions are appended only to this
+    literal stream; operator syntax is evaluated against `operator_segment_text`
+    so a phrase cannot cross from the original representation into its folded
+    copy.
 
     SQLite's `unicode61` tokenizer splits on whitespace and punctuation, which
     means an unsegmented run becomes a single token: the fourteen-character
