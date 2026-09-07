@@ -279,3 +279,15 @@ def test_query_and_index_agree_on_segmentation() -> None:
 
     for case in MULTISCRIPT:
         assert search.segment_text(case["query"]) in search.segment_text(case["text"])
+
+
+@pytest.mark.parametrize("text", ["Ꞵeta", "Ϳota", "Ԩame", "Straße", "CAFÉ"])
+@pytest.mark.parametrize("fold_query", [False, True])
+def test_literal_search_retrieves_exact_and_casefolded_text(
+    tmp_path: Path, text: str, fold_query: bool
+) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        state.index_synthetic_segment("changed-fold", 0, text)
+        query = text.casefold() if fold_query else text
+        assert search.text_contains_literal(text, query)
+        assert [hit.bundle_id for hit in state.search_segments(query)] == ["changed-fold"]

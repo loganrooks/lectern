@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Any
 
 CANON_VERSION = 1
-SEGMENTER_VERSION = 8
+SEGMENTER_VERSION = 9
 
 # Code-point ranges written one per script rather than as a single "CJK" range,
 # because the shorthand is what caused the mistake this table fixes: kana,
@@ -100,13 +100,13 @@ def operator_segment_text(text: str) -> str:
 
 
 def segment_text(text: str) -> str:
-    """Build the expansion-aware token stream used for literal candidates.
+    """Build the canonical-casefolded token stream used for literal candidates.
 
-    Characters in scripts written without word spaces are separated so shorter
-    phrases remain retrievable. Casefold expansions are appended only to this
-    literal stream; operator syntax is evaluated against `operator_segment_text`
-    so a phrase cannot cross from the original representation into its folded
-    copy.
+    Index and query use the same Unicode casefolding, including one-character
+    folds that SQLite's tokenizer does not recognize. Characters in scripts
+    written without word spaces are separated so shorter phrases remain
+    retrievable. Operator syntax uses the separate original-only stream from
+    `operator_segment_text`.
 
     SQLite's `unicode61` tokenizer splits on whitespace and punctuation, which
     means an unsegmented run becomes a single token: the fourteen-character
@@ -127,17 +127,7 @@ def segment_text(text: str) -> str:
     everywhere and always, so that the index and the query agree.
     """
 
-    canonical = canonical_text(text)
-    original = _space_unsegmented_scripts(canonical)
-    if not any(len(character.casefold()) != 1 for character in canonical):
-        return original
-
-    # `unicode61` handles ordinary one-code-point case differences, but not
-    # expansions such as `ß -> ss`. Keep the original stream first so advanced
-    # operator queries retain their existing terms, then add the expanded form
-    # as a second candidate stream for literal retrieval.
-    expanded = _space_unsegmented_scripts(canonical.casefold())
-    return f"{original} {expanded}"
+    return _space_unsegmented_scripts(canonical_text(text).casefold())
 
 
 def _space_unsegmented_scripts(text: str) -> str:
@@ -175,11 +165,7 @@ def literal_match_expression(query: str) -> str:
     means.
     """
 
-    # Literal confirmation uses Unicode casefolding, so the candidate query has
-    # to use the same expansion-aware form. Calling `segment_text` here would
-    # include both the original and expanded streams as one phrase; only the
-    # expanded candidate stream belongs in the MATCH expression.
-    segmented = _space_unsegmented_scripts(canonical_text(query).casefold())
+    segmented = segment_text(query)
     escaped = segmented.replace('"', '""')
     return f'"{escaped}"'
 

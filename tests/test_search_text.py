@@ -128,10 +128,28 @@ def test_unsegmented_scripts_are_enumerated_not_guessed() -> None:
         assert not search.is_unsegmented_script(character)
 
 
-def test_segmentation_leaves_spaced_scripts_untouched() -> None:
-    # Segmentation must be a no-op wherever the tokenizer already works, or it
-    # would trade a fixed problem for a new one.
+def test_segmentation_casefolds_spaced_scripts_without_splitting_words() -> None:
+    # Literal casefolding must not introduce boundaries inside spaced words.
     assert search.segment_text("Phenomenology examines experience") == (
-        "Phenomenology examines experience"
+        "phenomenology examines experience"
     )
     assert search.segment_text("الفلسفة دراسة الوجود") == "الفلسفة دراسة الوجود"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Ꞵeta", "ꞵeta"),
+        ("Ϳota", "ϳota"),
+        ("Ԩame", "ԩame"),
+        ("Straße", "strasse"),
+        ("İota", "i\u0307ota"),
+        ("ΟΣ", "οσ"),
+        ("ﬃ", "ffi"),
+        ("現象", "現 象"),
+    ],
+)
+def test_literal_index_and_query_use_the_same_folded_stream(text: str, expected: str) -> None:
+    assert search.segment_text(text) == expected
+    for query in (text, text.casefold()):
+        assert search.literal_match_expression(query) == '"' + expected + '"'
