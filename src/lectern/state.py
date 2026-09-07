@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, NoReturn, Self, cast
 
 from lectern.bundle import Manifest, SourceDocument, StageState, TranscriptSegmentsDocument
+from lectern.evidence import read_selected_evidence
 from lectern.records import (
     LEGAL_QUEUE_TRANSITION_SOURCE_VALUES,
     LEGAL_QUEUE_TRANSITION_SOURCES,
@@ -900,7 +901,7 @@ class AutomationStateStore:
     def resolve_anchor(self, anchor: Anchor) -> ResolvedAnchor:
         """Report which of the four states this citation is in."""
 
-        segments = self._bundle_segments(anchor.bundle_id)
+        segments = self._bundle_segments(anchor.bundle_id, require_manifest_integrity=False)
         if segments is None:
             return ResolvedAnchor(outcome=AnchorResolution.MISSING)
         return resolve_against_segments(anchor, segments)
@@ -941,7 +942,7 @@ class AutomationStateStore:
             "SELECT bundle_id, bundle_path FROM library_bundles ORDER BY bundle_id"
         ).fetchall():
             bundle_id = str(row[0])
-            segments = self._bundle_segments(bundle_id)
+            segments = self._bundle_segments(bundle_id, require_manifest_integrity=False)
             if segments is None:
                 issues.append(
                     SamplerIssue(
@@ -1497,7 +1498,8 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
         or record.error is not None
     ]
     try:
-        _load_registered_source_document(bundle_id, bundle_path, manifest)
+        evidence = read_selected_evidence(bundle_path, manifest, require_manifest_integrity=True)
+        _assert_registered_source_identity(evidence.source, manifest)
     except (OSError, ValueError, RecursionError):
         return derive_library_status(
             queue_state,
@@ -1521,49 +1523,17 @@ def _load_registered_manifest(bundle_id: str, bundle_path: Path) -> Manifest:
     return manifest
 
 
-def _load_registered_source_document(
-    bundle_id: str,
-    bundle_path: Path,
-    manifest: Manifest | None = None,
-) -> SourceDocument:
-    if bundle_path.is_symlink():
-        raise ValueError("registered bundle root must not be a symlink")
-    registered_manifest = manifest or _load_registered_manifest(bundle_id, bundle_path)
-    source_relative = Path("source.json")
-    if _has_symlink_component(bundle_path, source_relative):
-        raise ValueError("registered source document must not be a symlink")
-    source_payload = (bundle_path / source_relative).read_bytes()
-    source = SourceDocument.model_validate_json(source_payload, strict=True)
+def _assert_registered_source_identity(source: SourceDocument, manifest: Manifest) -> None:
     if (
-        source.source.kind != registered_manifest.source.kind
-        or source.source.ref != registered_manifest.source.ref
-        or source.source.bytes != registered_manifest.source.bytes
+        source.source.kind != manifest.source.kind
+        or source.source.ref != manifest.source.ref
+        or source.source.bytes != manifest.source.bytes
     ):
         raise ValueError("registered source identity does not match manifest source")
-    if registered_manifest.source.kind.value == "local" and (
-        registered_manifest.source.ref != f"sha256:{source.sha256}"
-        or registered_manifest.source.bytes != source.bytes
+    if manifest.source.kind.value == "local" and (
+        manifest.source.ref != f"sha256:{source.sha256}" or manifest.source.bytes != source.bytes
     ):
         raise ValueError("registered source content identity does not match manifest source")
-    return source
-
-
-def _assert_manifest_artifact_payload(
-    manifest: Manifest, artifact_path: str, payload: bytes
-) -> None:
-    references = [
-        output
-        for stage in manifest.stages.values()
-        for output in stage.outputs
-        if output.path == artifact_path
-    ]
-    if not references:
-        raise ValueError("registered transcript is not declared by the manifest")
-    digest = hashlib.sha256(payload).hexdigest()
-    if any(
-        reference.bytes != len(payload) or reference.sha256 != digest for reference in references
-    ):
-        raise ValueError("registered transcript does not match its manifest artifact")
 
 
 def _read_registered_segments(
@@ -1573,19 +1543,11 @@ def _read_registered_segments(
     require_manifest_integrity: bool = False,
 ) -> tuple[bytes, TranscriptSegmentsDocument]:
     manifest = _load_registered_manifest(bundle_id, bundle_path)
-    source = _load_registered_source_document(bundle_id, bundle_path, manifest)
-    segments_relative = Path(source.transcript.segments)
-    if _has_symlink_component(bundle_path, segments_relative):
-        raise ValueError("registered transcript pointer must not contain a symlink")
-    segments_path = (bundle_path / segments_relative).resolve(strict=True)
-    resolved_bundle = bundle_path.resolve(strict=True)
-    if not segments_path.is_relative_to(resolved_bundle):
-        raise ValueError("registered transcript pointer escapes the bundle")
-    segments_payload = segments_path.read_bytes()
-    if require_manifest_integrity:
-        _assert_manifest_artifact_payload(manifest, source.transcript.segments, segments_payload)
-    document = TranscriptSegmentsDocument.model_validate_json(segments_payload, strict=True)
-    return segments_payload, document
+    evidence = read_selected_evidence(
+        bundle_path, manifest, require_manifest_integrity=require_manifest_integrity
+    )
+    _assert_registered_source_identity(evidence.source, manifest)
+    return evidence.segments_payload, evidence.segments
 
 
 def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) -> bool:

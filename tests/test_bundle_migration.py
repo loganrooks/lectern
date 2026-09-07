@@ -1869,3 +1869,80 @@ def test_blank_legacy_retry_preserves_source_while_discarding_owned_staging(
     assert _tree_state(unrelated) == before_unrelated
     assert not prepared.staging_dir.exists()
     assert not bundle.with_name(bundle.name + BACKUP_SUFFIX).exists()
+
+
+@pytest.mark.parametrize("artifact", ["source.json", "transcript/segments.json"])
+@pytest.mark.parametrize("operation", ["prepare", "migrate", "current"])
+def test_migration_requires_selected_evidence_declarations_without_rewriting_trees(
+    tmp_path: Path, artifact: str, operation: str
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    if operation == "current":
+        migrations.migrate_bundle(bundle)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    for stage in manifest["stages"].values():
+        stage["outputs"] = [item for item in stage["outputs"] if item["path"] != artifact]
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    unrelated = bundle.parent / "unrelated-evidence"
+    unrelated.mkdir()
+    (unrelated / "note.txt").write_text("synthetic retained evidence")
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError):
+        if operation == "prepare":
+            prepare_bundle_migration(bundle)
+        else:
+            migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle.parent) == before
+
+
+@pytest.mark.parametrize("artifact", ["source.json", "transcript/segments.json"])
+@pytest.mark.parametrize("current", [False, True])
+def test_migration_refuses_contradictory_evidence_declarations(
+    tmp_path: Path, artifact: str, current: bool
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    if current:
+        migrations.migrate_bundle(bundle)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    _, size = _digest(bundle / artifact)
+    manifest["stages"]["acquire"]["outputs"].append(
+        {"path": artifact, "sha256": "0" * 64, "bytes": size}
+    )
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError, match="integrity"):
+        migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle.parent) == before
+
+
+def test_migration_preserves_valid_alternate_selected_evidence_and_registered_reads(
+    tmp_path: Path,
+) -> None:
+    state_path, bundle, bundle_id, segment_id, _ = registered_legacy_bundle(tmp_path)
+    source = _read_json(bundle / "source.json")
+    original_path = bundle / "transcript/segments.json"
+    segments = _read_json_array(original_path)
+    segments[0]["text"] = " \tעברית synthetic alternate evidence\n日本語 \u3000"
+    alternate = bundle / "transcript/alternate.json"
+    _write_json(alternate, segments)
+    source["transcript"]["segments"] = "transcript/alternate.json"
+    _write_json(bundle / "source.json", source)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    digest, size = _digest(alternate)
+    manifest["stages"]["transcribe"]["outputs"].append(
+        {"path": "transcript/alternate.json", "sha256": digest, "bytes": size}
+    )
+    _rewrite_manifest_hashes(bundle, manifest)
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    before_alternate = alternate.read_bytes()
+    before_original = original_path.read_bytes()
+    migrations.migrate_bundle(bundle)
+    assert migrations.migrate_bundle(bundle).outcome == "already_current"
+    assert alternate.read_bytes() == before_alternate
+    assert original_path.read_bytes() == before_original
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    assert (backup / "transcript/alternate.json").read_bytes() == before_alternate
+    with open_state(state_path) as state:
+        assert state.search_segments("synthetic alternate evidence")[0].bundle_id == bundle_id
+        _, resolved = state.cite_segment(bundle_id, segment_id)
+        assert resolved.current_text == segments[0]["text"]

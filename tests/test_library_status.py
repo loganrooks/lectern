@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -155,3 +157,26 @@ def test_symlinked_bundle_root_requires_reprocessing(tmp_path: Path) -> None:
         assert (
             state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
         )
+
+
+@pytest.mark.parametrize("failure", ["failed", "unsupported", "stage"])
+def test_invalid_selected_evidence_preserves_failure_status_precedence(
+    tmp_path: Path, failure: str
+) -> None:
+    state_path, bundle_id, queue_item_id = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = Path(state.get_library_bundle(bundle_id).bundle_path)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for stage in manifest["stages"].values():
+        stage["outputs"] = [item for item in stage["outputs"] if item["path"] != "source.json"]
+    if failure == "stage":
+        manifest["stages"]["synthesize"]["state"] = "failed"
+    else:
+        with sqlite3.connect(state_path) as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = ? WHERE id = ?", (failure, queue_item_id)
+            )
+    manifest_path.write_text(json.dumps(manifest))
+    with open_state(state_path) as state:
+        assert state.get_library_bundle(bundle_id).status is records.LibraryStatus.FAILED

@@ -17,12 +17,11 @@ from lectern.bundle import (
     MANIFEST_NAME,
     SCHEMA_VERSION,
     Manifest,
-    SourceDocument,
     SourceKind,
     TranscriptMetadataDocument,
-    TranscriptSegmentsDocument,
     atomic_write_text,
 )
+from lectern.evidence import read_selected_evidence
 from lectern.records import redact_paths
 
 LEGACY_SCHEMA_VERSION = "0.1.0"
@@ -455,24 +454,19 @@ def _validate_target(
                 if isinstance(error, str) and error != redact_paths(error):
                     raise MigrationError("target manifest contains a path-bearing stage error")
     _assert_declared_integrity(target, manifest_raw)
-    source_text, source_raw = _read_object_with_text(
-        target / "source.json", "target source metadata"
-    )
+    _, source_raw = _read_object_with_text(target / "source.json", "target source metadata")
     _, metadata_path = _transcript_artifact_path(target, source_raw, "metadata")
     metadata_text, metadata_raw = _read_object_with_text(
         metadata_path, "target transcript metadata"
     )
     _, segments_path = _transcript_artifact_path(target, source_raw, "segments")
-    segments_text, _ = _read_json_value(segments_path, "target transcript segments")
+    _read_json_value(segments_path, "target transcript segments")
     try:
         manifest = Manifest.model_validate_json(manifest_text, strict=True)
-        source_document = SourceDocument.model_validate_json(source_text, strict=True)
+        evidence = read_selected_evidence(target, manifest, require_manifest_integrity=True)
+        source_document = evidence.source
         TranscriptMetadataDocument.model_validate_json(metadata_text, strict=True)
-        TranscriptSegmentsDocument.model_validate_json(
-            segments_text,
-            strict=True,
-        )
-    except (ValueError, RecursionError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise MigrationError("target does not satisfy current artifact models") from exc
     if manifest.bundle_id != expected_bundle_id:
         raise MigrationError("target bundle ID differs from source bundle ID")

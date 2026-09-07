@@ -320,3 +320,85 @@ def test_blank_current_segments_remove_stale_index_and_refuse_citations(
         with pytest.raises(AutomationError, match="no readable transcript"):
             state.cite_segment(bundle.name, segment_id)
         assert state.resolve_anchor(anchor).outcome is not AnchorResolution.EXACT
+
+
+@pytest.mark.parametrize("artifact", ["source.json", "transcript/segments.json"])
+@pytest.mark.parametrize("consumer", ["index", "cite", "status"])
+@pytest.mark.parametrize("contradictory", [False, True])
+def test_strict_evidence_consumers_require_consistent_declarations(
+    tmp_path: Path, artifact: str, consumer: str, contradictory: bool
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    manifest = _read_object(bundle / MANIFEST_NAME)
+    if contradictory:
+        outputs = manifest["stages"]["acquire"]["outputs"]
+        digest, size = _digest(bundle / artifact)
+        outputs.append({"path": artifact, "sha256": "0" * 64, "bytes": size})
+        assert digest != "0" * 64
+    else:
+        for stage in manifest["stages"].values():
+            stage["outputs"] = [item for item in stage["outputs"] if item["path"] != artifact]
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    with open_state(state_path) as state:
+        if consumer == "index":
+            assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+            assert state.search_segments("knowledge") == []
+        elif consumer == "cite":
+            with pytest.raises(AutomationError, match="no readable transcript"):
+                state.cite_segment(bundle.name, 0)
+        else:
+            assert state.get_library_bundle(bundle.name).status is LibraryStatus.NEEDS_REPROCESSING
+
+
+@pytest.mark.parametrize("consumer", ["index", "cite"])
+def test_stale_source_pointer_cannot_select_new_evidence(tmp_path: Path, consumer: str) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    source_path = bundle / "source.json"
+    source = _read_object(source_path)
+    segments = cast(
+        list[dict[str, Any]], json.loads((bundle / "transcript/segments.json").read_text())
+    )
+    segments[0]["text"] = "alternate synthetic evidence marker"
+    alternate = bundle / "transcript/alternate.json"
+    _write_json(alternate, segments)
+    manifest = _read_object(bundle / MANIFEST_NAME)
+    digest, size = _digest(alternate)
+    manifest["stages"]["transcribe"]["outputs"].append(
+        {"path": "transcript/alternate.json", "sha256": digest, "bytes": size}
+    )
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    source["transcript"]["segments"] = "transcript/alternate.json"
+    _write_json(source_path, source)  # Deliberately leave only the source digest stale.
+    with open_state(state_path) as state:
+        if consumer == "index":
+            assert state.search_segments("alternate synthetic evidence marker") == []
+            assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        else:
+            with pytest.raises(AutomationError, match="no readable transcript"):
+                state.cite_segment(bundle.name, 0)
+
+
+@pytest.mark.parametrize("invalid", ["blank", "duplicate", "empty", "missing-text"])
+def test_hash_consistent_invalid_selected_document_is_not_ready(
+    tmp_path: Path, invalid: str
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    path = bundle / "transcript/segments.json"
+    segments = cast(list[dict[str, Any]], json.loads(path.read_text()))
+    if invalid == "blank":
+        segments[0]["text"] = " \u2003\n"
+    elif invalid == "duplicate":
+        segments.append(dict(segments[0]))
+    elif invalid == "empty":
+        segments = []
+    else:
+        segments[0].pop("text")
+    _write_json(path, segments)
+    manifest = _read_object(bundle / MANIFEST_NAME)
+    _refresh_manifest_outputs(bundle, manifest)
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            assert _digest(bundle / output["path"]) == (output["sha256"], output["bytes"])
+    with open_state(state_path) as state:
+        assert state.get_library_bundle(bundle.name).status is LibraryStatus.NEEDS_REPROCESSING

@@ -29,5 +29,23 @@
     "conditions": "single process, warm filesystem cache, temporary filesystem, 1000 registered current-schema bundles, open state plus reconcile unchanged segment files plus one-result literal search",
     "claim_limit": "A synthetic local measurement that exposes reconciliation cost. Not a performance guarantee or a basis for silently changing the automation-state schema.",
     "status": "historical; not re-measured under segmenter version 9"
+  },
+  "current_registered_open_reconcile_search_measurement": {
+    "recorded_at": "2026-09-07",
+    "corpus_bundles": 1000,
+    "corpus_segments": 1000,
+    "total_segments_bytes": 575000,
+    "elapsed_ms": [
+      1260.479,
+      1223.893,
+      1232.377
+    ],
+    "median_elapsed_ms": 1232.377,
+    "canon_version": 1,
+    "segmenter_version": 9,
+    "python": "3.14.2",
+    "sqlite": "3.50.4",
+    "conditions": "Three warm local opens of 1000 valid registered synthetic bundle copies sharing source identity; one short segment per bundle. Includes source/transcript manifest integrity and index reconciliation, then one-result literal search. Excludes initial index build.",
+    "claim_limit": "A separate short-transcript corpus measurement on this machine, not the historical 100MB corpus, a performance guarantee, or a before/after comparison."
   }
 }

@@ -304,3 +304,38 @@ def test_anchor_digests_are_script_independent(case: dict[str, Any]) -> None:
         search.make_anchor("b", 0, 0.0, decomposed).text_sha256
         == search.make_anchor("b", 0, 0.0, case["text"]).text_sha256
     )
+
+
+@pytest.mark.parametrize(
+    "outcome", [AnchorResolution.MODIFIED, AnchorResolution.RELOCATED, AnchorResolution.AMBIGUOUS]
+)
+def test_diagnostics_retain_changed_evidence_when_new_citations_are_refused(
+    tmp_path: Path, outcome: AnchorResolution
+) -> None:
+    state_path, bundle = _archive(tmp_path)
+    original = _segments(bundle)[0]
+    with open_state(state_path) as state:
+        anchor, _ = state.cite_segment(bundle.name, int(original["id"]))
+    if outcome is AnchorResolution.MODIFIED:
+        changed = [{**original, "text": "synthetic changed evidence"}]
+    else:
+        changed = [{**original, "id": 10}]
+        if outcome is AnchorResolution.AMBIGUOUS:
+            changed.append({**original, "id": 11, "start_s": 20.0})
+    _write_segments(bundle, changed)
+    manifest_path = bundle / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    for stage in manifest["stages"].values():
+        stage["outputs"] = [
+            item
+            for item in stage["outputs"]
+            if item["path"] not in {"source.json", "transcript/segments.json"}
+        ]
+    manifest_path.write_text(json.dumps(manifest))
+    with open_state(state_path) as state:
+        resolved = state.resolve_anchor(anchor)
+        assert resolved.outcome is outcome
+        assert resolved.current_text == changed[0]["text"]
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, int(changed[0]["id"]))

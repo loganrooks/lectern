@@ -31,6 +31,14 @@ text, remove or renumber segments, or invent
 replacement evidence. Valid segment text and the segment artifact's bytes are
 preserved exactly, including surrounding whitespace and internal line breaks.
 
+A successful migration or already-current no-op requires manifest declarations
+for both `source.json` and the transcript segments selected by that document.
+Every declaration of either artifact must match its actual bytes and SHA-256
+digest. Missing declarations are refused; migration does not invent them.
+Declared alternate segment paths remain supported. Library readiness, indexing,
+and new citations use this same selected-evidence requirement. Existing-anchor
+diagnostics can still report changed evidence without minting a new citation.
+
 To roll back while Lectern is stopped, move the `1.0.0` directory aside and
 rename `BUNDLE.v0.1.0.bak` to the original bundle name. Do not merge files from
 the two schema versions.
