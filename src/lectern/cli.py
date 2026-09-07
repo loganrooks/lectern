@@ -209,10 +209,10 @@ def _sources(args: Sequence[str]) -> int:
         if command == "preflight-youtube":
             return _sources_preflight_youtube(rest, json_output)
     except AutomationError as exc:
-        print(f"sources: {exc}", file=sys.stderr)
+        print(f"sources: {redact_paths(str(exc))}", file=sys.stderr)
         return 3
     except OSError as exc:
-        print(f"sources: {exc}", file=sys.stderr)
+        print(f"sources: {redact_paths(str(exc))}", file=sys.stderr)
         return 1
     _sources_usage()
     return 2

@@ -5,7 +5,7 @@
       "description": "A produced file, content-addressed for idempotence checks.",
       "properties": {
         "path": {
-          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Path",
           "type": "string"
         },

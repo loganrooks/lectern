@@ -16,6 +16,7 @@ that succeeds.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from lectern import cli
 from lectern.automation import open_state
 from lectern.ingest import ingest_local
 from lectern.records import PATH_REDACTED, redact_paths
+from lectern.sources import local
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 SYNTHETIC_TALK = FIXTURE_DIR / "synthetic_talk.wav"
@@ -313,3 +315,35 @@ def test_migrate_failure_emits_no_filesystem_path(
     captured = capsys.readouterr()
     assert "declared artifact integrity" in captured.err
     _assert_no_path(captured.out + captured.err, folder, "migrate")
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("failure", ["missing-root", "hash-error"])
+def test_source_scan_errors_project_stored_paths(
+    registered: tuple[Path, Path, Path],
+    capsys: CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    json_output: bool,
+    failure: str,
+) -> None:
+    _, folder, state_path = registered
+    if failure == "missing-root":
+        shutil.rmtree(folder)
+        expected_exit = 3
+    else:
+
+        def fail_hash(path: Path) -> tuple[str, int]:
+            raise OSError(13, "synthetic hashing refusal", str(path))
+
+        monkeypatch.setattr(local, "digest_and_size", fail_hash)
+        expected_exit = 1
+    capsys.readouterr()
+    args = ["sources", "scan", "talks", "--state", str(state_path)]
+    if json_output:
+        args.append("--json")
+    assert cli.main(args) == expected_exit
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("sources: ")
+    _assert_no_path(captured.err, folder, "sources scan error")
+    assert PATH_REDACTED in captured.err

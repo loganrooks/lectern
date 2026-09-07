@@ -317,3 +317,21 @@ def test_segment_text_whitespace_boundary_and_exact_preservation() -> None:
         assert document.model_dump()[0]["text"] == text
         assert json.loads(document.model_dump_json())[0]["text"] == text
         assert re.search(pattern, text) is not None, repr(text)
+
+
+@pytest.mark.parametrize("path", ["\x00file", "dir/fi\x00le", "dir/file\x00"])
+def test_artifact_path_rejects_nul_in_runtime_and_schema(path: str) -> None:
+    with pytest.raises(ValueError):
+        ArtifactRef(path=path, sha256="0" * 64, bytes=0)
+    schema = json.loads(export_artifact_schemas()["manifest"])
+    pattern = schema["$defs"]["ArtifactRef"]["properties"]["path"]["pattern"]
+    assert re.search(pattern, path) is None
+
+
+def test_artifact_path_preserves_ordinary_unicode() -> None:
+    path = "資料/עברית-évidence.json"
+    artifact = ArtifactRef(path=path, sha256="0" * 64, bytes=0)
+    assert artifact.path == path
+    schema = json.loads(export_artifact_schemas()["manifest"])
+    pattern = schema["$defs"]["ArtifactRef"]["properties"]["path"]["pattern"]
+    assert re.search(pattern, path) is not None

@@ -36,7 +36,7 @@ _CONTENT_REF = re.compile(CONTENT_REF_PATTERN)
 
 MANIFEST_NAME = "manifest.json"
 BUNDLE_RELATIVE_PATH_PATTERN = (
-    r"^(?![A-Za-z]:)(?![\s\S]*\\)(?![\s\S]*(?:^|/)\.\.?(?:/|$))[^/]+(?:/[^/]+)*$"
+    r"^(?![A-Za-z]:)(?![\s\S]*\u0000)(?![\s\S]*\\)(?![\s\S]*(?:^|/)\.\.?(?:/|$))[^/]+(?:/[^/]+)*$"
 )
 
 
@@ -44,6 +44,7 @@ def _validate_bundle_relative_path(value: str) -> str:
     path = PurePosixPath(value)
     if (
         not value
+        or "\x00" in value
         or "\\" in value
         or path.is_absolute()
         or PureWindowsPath(value).drive

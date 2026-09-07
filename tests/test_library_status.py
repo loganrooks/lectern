@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -180,3 +182,73 @@ def test_invalid_selected_evidence_preserves_failure_status_precedence(
     manifest_path.write_text(json.dumps(manifest))
     with open_state(state_path) as state:
         assert state.get_library_bundle(bundle_id).status is records.LibraryStatus.FAILED
+
+
+def test_status_streams_large_declared_media_and_checks_digest_and_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path, bundle_id, _ = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = Path(state.get_library_bundle(bundle_id).bundle_path)
+    media = bundle / "media/large-synthetic.bin"
+    payload = b"synthetic" * (150_000)
+    media.write_bytes(payload)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stages"]["normalize"]["outputs"].append(
+        {
+            "path": "media/large-synthetic.bin",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "bytes": len(payload),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest))
+    real_read_bytes = Path.read_bytes
+    real_open = Path.open
+    sizes: list[int] = []
+
+    class BoundedReader:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> BoundedReader:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self.stream.close()
+
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= 1024 * 1024
+            sizes.append(size)
+            return self.stream.read(size)
+
+    def guarded_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        stream = cast(Any, real_open(path, *args, **kwargs))
+        return BoundedReader(stream) if path == media and args and args[0] == "rb" else stream
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        assert path != media, "status buffered a whole media artifact"
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    with open_state(state_path) as state:
+        assert state.get_library_bundle(bundle_id).status is records.LibraryStatus.READY
+    capsys.readouterr()
+    for command in (["list"], ["show", bundle_id]):
+        assert cli.main(["library", *command, "--state", str(state_path), "--json"]) == 0
+        capsys.readouterr()
+    assert len(sizes) >= 2
+    with real_open(media, "r+b") as stream:
+        stream.write(b"X")
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )
+    media.write_bytes(payload)
+    manifest["stages"]["normalize"]["outputs"][-1]["bytes"] += 1
+    manifest_path.write_text(json.dumps(manifest))
+    with open_state(state_path) as state:
+        assert (
+            state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
+        )

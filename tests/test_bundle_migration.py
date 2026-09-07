@@ -1983,3 +1983,21 @@ def test_current_noop_refuses_integral_float_representation_without_rewriting_or
     with pytest.raises(MigrationError, match="current artifact models"):
         migrations.migrate_bundle(bundle)
     assert _tree_state(bundle.parent) == before
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_migration_refuses_nul_artifact_path_without_changing_evidence(
+    tmp_path: Path, current: bool
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    if current:
+        migrations.migrate_bundle(bundle)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    manifest["stages"]["normalize"]["outputs"].append(
+        {"path": "media/null\x00artifact", "sha256": "0" * 64, "bytes": 0}
+    )
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError):
+        migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle.parent) == before

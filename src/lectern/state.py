@@ -43,6 +43,7 @@ from lectern.records import (
     SourcePolicy,
     SourceRecord,
     derive_library_status,
+    digest_and_size,
     make_queue_item_id,
     make_source_id,
     metadata_to_json,
@@ -1573,10 +1574,10 @@ def _manifest_outputs_are_materialized(bundle_path: Path, manifest: Manifest) ->
                     or not resolved_candidate.is_file()
                 ):
                     return False
-                payload = resolved_candidate.read_bytes()
+                digest, size = digest_and_size(resolved_candidate)
             except OSError:
                 return False
-            if len(payload) != output.bytes or hashlib.sha256(payload).hexdigest() != output.sha256:
+            if size != output.bytes or digest != output.sha256:
                 return False
     return True
 

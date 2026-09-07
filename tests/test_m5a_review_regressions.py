@@ -539,3 +539,20 @@ def test_manifest_load_retains_ordinary_parent_alias_and_missing_file_behavior(
     assert Manifest.load(alias / bundle.name) == Manifest.load(bundle)
     with pytest.raises(FileNotFoundError):
         Manifest.load(tmp_path / "missing-bundle")
+
+
+@pytest.mark.parametrize("path", ["\x00file", "media/fi\x00le", "media/file\x00"])
+def test_registered_nul_artifact_path_is_nonready_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], path: str
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    manifest = _read_object(bundle / MANIFEST_NAME)
+    manifest["stages"]["normalize"]["outputs"].append(
+        {"path": path, "sha256": "0" * 64, "bytes": 0}
+    )
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    capsys.readouterr()
+    assert cli.main(["library", "list", "--state", str(state_path), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["bundles"][0]["status"] != "ready"
+    assert "Traceback" not in captured.err

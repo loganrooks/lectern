@@ -202,7 +202,7 @@ def _artifact_path(bundle: Path, raw: object) -> Path:
         mode = path.lstat().st_mode
     except FileNotFoundError as exc:
         raise MigrationError("declared bundle artifact is missing or not a regular file") from exc
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise MigrationError("cannot inspect a declared bundle artifact") from exc
     if not stat.S_ISREG(mode):
         raise MigrationError("declared bundle artifact is missing or not a regular file")
