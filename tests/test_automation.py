@@ -1734,3 +1734,108 @@ def test_one_shot_alias_keeps_captured_registry_and_lexical_evidence(
         assert item.relative_path == "A.wav"
         assert queued.state is QueueState.COMPLETED
         assert alias.resolve() == target_a
+
+
+@pytest.mark.parametrize("replay", [False, True], ids=["fresh", "early-replay"])
+@pytest.mark.parametrize("changed_input", ["media", "sidecar"])
+def test_approved_capture_refreshes_latest_source_observation(
+    tmp_path: Path, monkeypatch: MonkeyPatch, replay: bool, changed_input: str
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    sidecar = media.with_suffix(".transcript.txt")
+    original_media = media.read_bytes()
+    original_sidecar = sidecar.read_bytes()
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        approved = state.approve_queue_item(state.scan_source(source.id).queued[0].id)
+        first = None
+        if replay:
+            first = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+            state.approve_queue_item(approved.id)
+        changed = media if changed_input == "media" else sidecar
+        changed.write_bytes(changed.read_bytes() + b"changed B")
+        other = state.scan_source(source.id).queued[0]
+        stale = replace(
+            state.get_source_item(approved.source_item_id),
+            metadata={"synthetic": "preserve"},
+            present=False,
+        )
+        state._upsert_source_item(stale, created_at=stale.created_at)  # pyright: ignore[reportPrivateUsage]
+        state._connection.commit()  # pyright: ignore[reportPrivateUsage]
+        media.write_bytes(original_media)
+        sidecar.write_bytes(original_sidecar)
+        os.utime(media, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        captured_mtime = media.stat().st_mtime_ns
+
+        normalizer = ingest_module._normalize_to_canonical_wav  # pyright: ignore[reportPrivateUsage]
+        normalization_calls = 0
+
+        def consume_a(captured: Path, output: Path) -> None:
+            nonlocal normalization_calls
+            normalization_calls += 1
+            assert captured.read_bytes() == original_media
+            normalizer(captured, output)
+
+        monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", consume_a)
+        result = state.ingest_queue_item(approved.id, tmp_path / "bundles")
+
+        assert normalization_calls == (0 if replay else 1)
+        assert (result.bundle_dir / "media/audio.wav").read_bytes() == original_media
+        assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == original_sidecar
+        if replay:
+            assert first is not None
+            assert result.bundle_dir == first.bundle_dir
+        refreshed = state.get_source_item(stale.id)
+        assert refreshed.sha256 == approved.content_sha256 != stale.sha256
+        assert refreshed.size_bytes == len(original_media)
+        assert refreshed.mtime_ns == captured_mtime
+        assert refreshed.present is True
+        assert refreshed.updated_at != stale.updated_at
+        assert (
+            replace(
+                refreshed,
+                sha256=stale.sha256,
+                size_bytes=stale.size_bytes,
+                mtime_ns=stale.mtime_ns,
+                present=stale.present,
+                updated_at=stale.updated_at,
+            )
+            == stale
+        )
+        assert state.get_queue_item(other.id) == other
+        assert state.get_queue_item(approved.id).content_sha256 == approved.content_sha256
+        assert state.get_library_bundle(result.manifest.bundle_id).status.value == "ready"
+
+
+@pytest.mark.parametrize("mismatch", [False, True], ids=["processing-failure", "mismatch"])
+def test_capture_observation_refresh_boundary(
+    tmp_path: Path, monkeypatch: MonkeyPatch, mismatch: bool
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    original = media.read_bytes()
+    calls = 0
+
+    def fail_normalization(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise IngestError("synthetic processing failure")
+
+    monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", fail_normalization)
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        approved = state.approve_queue_item(state.scan_source(source.id).queued[0].id)
+        media.write_bytes(original + b"changed B")
+        other = state.scan_source(source.id).queued[0]
+        before = state.get_source_item(approved.source_item_id)
+        if not mismatch:
+            media.write_bytes(original)
+        with pytest.raises(AutomationError if mismatch else IngestError):
+            state.ingest_queue_item(approved.id, tmp_path / "bundles")
+        after = state.get_source_item(before.id)
+        assert calls == (0 if mismatch else 1)
+        if mismatch:
+            assert after == before
+        else:
+            assert after.sha256 == approved.content_sha256 != before.sha256
+            assert after.size_bytes == len(original)
+        assert state.get_queue_item(other.id) == other

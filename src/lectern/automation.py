@@ -17,6 +17,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -325,6 +326,17 @@ class AutomationState(AutomationStateStore):
                         expected_approval_sha256=queue_item.content_sha256,
                     )
                 )
+                observed_item = replace(
+                    source_item,
+                    sha256=prepared.approval_sha256,
+                    size_bytes=prepared.media_size,
+                    mtime_ns=prepared.mtime_ns,
+                    present=True,
+                    updated_at=now_timestamp(),
+                )
+                self._upsert_source_item(observed_item, created_at=source_item.created_at)
+                self._connection.commit()
+                source_item = self.get_source_item(source_item.id)
                 planned_bundle_id = prepared.planned_bundle_id()
                 if planned_bundle_id is not None:
                     if planned_bundle_id == queue_item.bundle_id:
