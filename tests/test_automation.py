@@ -9,6 +9,7 @@ import stat
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pytest import MonkeyPatch
@@ -2082,3 +2083,166 @@ def test_collision_returns_registered_root_without_adopting_collision_root(
         )
         assert _bundle_tree(first.bundle_dir) == before_first
         assert _bundle_tree(second.bundle_dir) == before_second
+
+
+@pytest.mark.parametrize("one_shot", [False, True], ids=["queue", "one-shot"])
+@pytest.mark.parametrize(
+    "prior", ["valid", "first", "deleted", "unregistered", "queue", "source", "item"]
+)
+def test_failed_invocation_preserves_only_surviving_owned_completion(
+    tmp_path: Path, one_shot: bool, prior: str
+) -> None:
+    import shutil
+
+    media = copy_fixture(tmp_path / "source")
+    script = _write_transcriber_script(tmp_path / "fail.py", "", exit_code=9)
+    command = f"{sys.executable} {script}"
+    with open_state(tmp_path / "state.sqlite") as state:
+        if prior == "first":
+            source = state.add_local_folder_source("talks", media.parent)
+            queue = state.scan_source(source.id).queued[0]
+        else:
+            result = state.ingest_one_shot(media, tmp_path / "bundles")
+            queue = state.list_queue()[0]
+            if prior == "deleted":
+                shutil.rmtree(result.bundle_dir)
+            elif prior == "unregistered":
+                state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "DELETE FROM library_bundles WHERE bundle_id = ?", (result.manifest.bundle_id,)
+                )
+            elif prior in {"queue", "source", "item"}:
+                foreign = state.ingest_one_shot(
+                    copy_fixture(tmp_path / "foreign", "other.wav"), tmp_path / "other-bundles"
+                )
+                row = state.get_library_bundle(foreign.manifest.bundle_id)
+                field, value = {
+                    "queue": ("queue_item_id", row.queue_item_id),
+                    "source": ("source_id", row.source_id),
+                    "item": ("source_item_id", row.source_item_id),
+                }[prior]
+                state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    f"UPDATE library_bundles SET {field} = ? WHERE bundle_id = ?",
+                    (value, result.manifest.bundle_id),
+                )
+            state._connection.commit()  # pyright: ignore[reportPrivateUsage]
+        trees = _bundle_tree(tmp_path / "bundles")
+        rows = state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT * FROM library_bundles ORDER BY bundle_id"
+        ).fetchall()  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(IngestError):
+            if one_shot:
+                state.ingest_one_shot(media, tmp_path / "bundles", transcriber_command=command)
+            else:
+                state.approve_queue_item(queue.id)
+                state.ingest_queue_item(queue.id, tmp_path / "bundles", transcriber_command=command)
+        after = (
+            next(item for item in state.list_queue() if item.source_item_id == queue.source_item_id)
+            if not (one_shot and prior == "first")
+            else next(item for item in state.list_queue() if item.state is QueueState.FAILED)
+        )
+        assert after.state is (QueueState.COMPLETED if prior == "valid" else QueueState.FAILED)
+        assert after.content_sha256 == queue.content_sha256
+        assert after.attempts == (0 if prior == "valid" else 1)
+        assert (after.last_error is None) == (prior == "valid")
+        assert _bundle_tree(tmp_path / "bundles") == trees
+        assert (
+            state._connection.execute("SELECT * FROM library_bundles ORDER BY bundle_id").fetchall()  # pyright: ignore[reportPrivateUsage]
+            == rows
+        )  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "kind", ["json", "utf8", "integer", "deep", "source-recursion", "manifest-recursion"]
+)
+def test_repair_probe_contains_unreadable_input(
+    tmp_path: Path, monkeypatch: MonkeyPatch, kind: str
+) -> None:
+    from lectern import provenance
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        result = state.ingest_one_shot(copy_fixture(tmp_path / "source"), tmp_path / "bundles")
+    source = result.bundle_dir / "source.json"
+    cases = {
+        "json": b"{bad",
+        "utf8": b"\xff",
+        "integer": b'{"number":' + b"1" * 5000 + b"}",
+        "deep": b"[" * 100_000 + b"0" + b"]" * 100_000,
+    }
+    calls = 0
+    if kind in cases:
+        source.write_bytes(cases[kind])
+    elif kind == "source-recursion":
+        real_read = Path.read_text
+
+        def recursive_read(path: Path, *args: object, **kwargs: Any) -> str:
+            nonlocal calls
+            if path == source:
+                calls += 1
+                raise RecursionError("synthetic source recursion")
+            return real_read(path, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", recursive_read)
+    else:
+
+        def recursive_manifest(cls: type[Manifest], path: Path) -> Manifest:
+            nonlocal calls
+            calls += 1
+            assert path == result.bundle_dir
+            raise RecursionError("synthetic manifest recursion")
+
+        monkeypatch.setattr(Manifest, "load", classmethod(recursive_manifest))
+    before = _bundle_tree(result.bundle_dir)
+    assert provenance.bundle_provenance_needs_repair(result.bundle_dir) is False
+    assert calls == (1 if kind.endswith("recursion") else 0)
+    assert _bundle_tree(result.bundle_dir) == before
+
+
+@pytest.mark.parametrize("one_shot", [False, True])
+@pytest.mark.parametrize(
+    "payload",
+    [b"{bad", b"\xff", b'{"number":' + b"1" * 5000 + b"}", b"[" * 100_000 + b"0" + b"]" * 100_000],
+    ids=["json", "utf8", "integer", "deep"],
+)
+def test_unreadable_source_replay_remains_unchanged_and_nonready(
+    tmp_path: Path, one_shot: bool, payload: bytes
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(media, tmp_path / "bundles")
+        queue = state.list_queue()[0]
+        (first.bundle_dir / "source.json").write_bytes(payload)
+        before = _bundle_tree(first.bundle_dir)
+        if one_shot:
+            result = state.ingest_one_shot(media, tmp_path / "bundles")
+        else:
+            state.approve_queue_item(queue.id)
+            result = state.ingest_queue_item(queue.id, tmp_path / "bundles")
+        assert result.bundle_dir == first.bundle_dir
+        assert _bundle_tree(first.bundle_dir) == before
+        assert (
+            state.get_library_bundle(first.manifest.bundle_id).status.value == "needs-reprocessing"
+        )
+        with pytest.raises((AutomationError, ValueError)):
+            state.cite_segment(first.manifest.bundle_id, 0)
+    with open_state(tmp_path / "state.sqlite") as state:
+        assert state.search_segments("knowledge") == []
+
+
+@pytest.mark.parametrize("ownership", ["valid", "queue", "source", "item"])
+def test_prior_registration_restoration_requires_all_ownership_fields(
+    tmp_path: Path, ownership: str
+) -> None:
+    with open_state(tmp_path / "state.sqlite") as state:
+        result = state.ingest_one_shot(copy_fixture(tmp_path / "source"), tmp_path / "bundles")
+        queue = state.list_queue()[0]
+        previous = state.get_library_bundle(result.manifest.bundle_id)
+        if ownership != "valid":
+            field = {"queue": "queue_item_id", "source": "source_id", "item": "source_item_id"}[
+                ownership
+            ]
+            previous = replace(previous, **{field: "different-owner"})
+        state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "DELETE FROM library_bundles WHERE bundle_id = ?", (result.manifest.bundle_id,)
+        )  # pyright: ignore[reportPrivateUsage]
+        actual = state._restorable_queue_bundle_id(queue, previous)  # pyright: ignore[reportPrivateUsage]
+        assert actual == (result.manifest.bundle_id if ownership == "valid" else None)

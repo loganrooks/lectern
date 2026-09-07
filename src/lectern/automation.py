@@ -365,7 +365,7 @@ class AutomationState(AutomationStateStore):
                     shutil.rmtree(result.bundle_dir, ignore_errors=True)
                     raise
             except AutomationError as exc:
-                self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
             except (IngestError, OSError) as exc:
                 if isinstance(exc, BundleExistsError):
@@ -384,7 +384,7 @@ class AutomationState(AutomationStateStore):
                             queue_item_id=queue_item.id,
                             consent="explicit_queue_approval",
                         )
-                self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
 
             # Commit the completed state and the library record together so a crash can
@@ -406,7 +406,7 @@ class AutomationState(AutomationStateStore):
             except Exception as exc:
                 self._connection.rollback()
                 shutil.rmtree(result.bundle_dir, ignore_errors=True)
-                self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
             completed = self.get_queue_item(queue_item.id)
             try:
@@ -460,7 +460,6 @@ class AutomationState(AutomationStateStore):
                 mtime_ns=prepared.mtime_ns,
             )
             queue_item = self._ensure_one_shot_queue(source, source_item)
-            completed_bundle_id = queue_item.bundle_id
             if planned_bundle_id is not None:
                 completed_result = self._queue_owned_bundle_result(queue_item, planned_bundle_id)
                 if completed_result is not None:
@@ -481,7 +480,7 @@ class AutomationState(AutomationStateStore):
                 if planned_bundle_id is not None:
                     self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
             except AutomationError as exc:
-                self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
             try:
                 result = prepared.ingest(output_root)
@@ -502,15 +501,13 @@ class AutomationState(AutomationStateStore):
                             queue_item_id=queue_item.id,
                             consent="explicit_cli_invocation",
                         )
-                if queue_item.state is not QueueState.COMPLETED:
-                    self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
             try:
                 self._ensure_library_bundle_id_available(result.manifest.bundle_id, queue_item)
             except AutomationError as exc:
                 shutil.rmtree(result.bundle_dir, ignore_errors=True)
-                if queue_item.state is not QueueState.COMPLETED:
-                    self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
 
             # Mirror of the queue-ingest path: completion and its library record share one
@@ -529,8 +526,7 @@ class AutomationState(AutomationStateStore):
             except Exception as exc:
                 self._connection.rollback()
                 shutil.rmtree(result.bundle_dir, ignore_errors=True)
-                if queue_item.state is not QueueState.COMPLETED:
-                    self._record_failed_queue_item(queue_item.id, str(exc))
+                self._record_ingest_failure(queue_item, str(exc))
                 raise
             completed = self.get_queue_item(queue_item.id)
             try:
@@ -548,10 +544,8 @@ class AutomationState(AutomationStateStore):
                 # A rerun of an already-completed item must not lose the earlier success:
                 # restore the prior COMPLETED bundle id rather than recording FAILED with
                 # the new (now deleted) bundle on the row.
-                restore_bundle_id = (
-                    completed_bundle_id
-                    if queue_item.state is QueueState.COMPLETED and completed_bundle_id is not None
-                    else None
+                restore_bundle_id = self._restorable_queue_bundle_id(
+                    queue_item, library_record.previous
                 )
                 self._undo_completed_ingest(
                     queue_item.id,
@@ -647,6 +641,15 @@ class AutomationState(AutomationStateStore):
             manifest=Manifest.load(result.bundle_dir),
         )
 
+    def _record_ingest_failure(self, queue_item: QueueItem, message: str) -> None:
+        prior_id = self._restorable_queue_bundle_id(queue_item)
+        if prior_id is None:
+            self._record_failed_queue_item(queue_item.id, message)
+        else:
+            self._set_queue_state(
+                queue_item.id, QueueState.COMPLETED, bundle_id=prior_id, clear_error=True
+            )
+
     def _restorable_queue_bundle_id(
         self,
         queue_item: QueueItem,
@@ -666,6 +669,8 @@ class AutomationState(AutomationStateStore):
             previous_library_row is not None
             and previous_library_row.bundle_id == queue_item.bundle_id
             and previous_library_row.queue_item_id == queue_item.id
+            and previous_library_row.source_id == queue_item.source_id
+            and previous_library_row.source_item_id == queue_item.source_item_id
             and Path(previous_library_row.bundle_path).is_dir()
         ):
             return queue_item.bundle_id
@@ -673,7 +678,11 @@ class AutomationState(AutomationStateStore):
             library_bundle = self.get_library_bundle(queue_item.bundle_id)
         except AutomationError:
             return None
-        if library_bundle.queue_item_id != queue_item.id:
+        if (
+            library_bundle.queue_item_id != queue_item.id
+            or library_bundle.source_id != queue_item.source_id
+            or library_bundle.source_item_id != queue_item.source_item_id
+        ):
             return None
         if not Path(library_bundle.bundle_path).is_dir():
             return None

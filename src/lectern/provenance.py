@@ -87,7 +87,7 @@ def bundle_provenance_needs_repair(bundle_dir: Path) -> bool:
     source_path = bundle_dir / "source.json"
     try:
         payload_obj = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         # Nothing re-attaching could fix; leave the bundle exactly as found.
         return False
     if not isinstance(payload_obj, dict):
@@ -102,7 +102,7 @@ def bundle_provenance_needs_repair(bundle_dir: Path) -> bool:
     try:
         manifest = Manifest.load(bundle_dir)
         acquire = manifest.stages[StageName.ACQUIRE]
-    except (OSError, KeyError, ValueError):
+    except (OSError, KeyError, ValueError, RecursionError):
         return False
     recorded = next(
         (output.sha256 for output in acquire.outputs if output.path == "source.json"),

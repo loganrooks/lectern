@@ -119,6 +119,11 @@ fields: bundle ID, creation time, and status (`ready`, `incomplete`, `failed`, o
 `needs-reprocessing`).
 
 Use `--json` on source, queue, and library commands for machine-readable output.
+
+A failed ingest rerun still reports its invocation error, but retains the prior
+completion when that exact owned, registered bundle survives. Readiness remains
+separately derived from current evidence. Queue state is not a complete history
+of every invocation.
 The state database is local run state under `.lectern/` by default and should not
 be committed.
 
