@@ -5,6 +5,11 @@ versioned release notes will become stricter once preview support stabilizes.
 
 ## Unreleased
 
+- Bound local planning and processing to a private captured input, checked
+  against existing queue approval before processing. Preserved existing source
+  identities, sidecar consent coverage, replay behavior, and original-media
+  mutation refusal.
+
 - Aligned migration, library readiness, indexing, and new citations on strict
   manifest-backed source and selected-transcript evidence. Missing or
   contradictory declarations are refused while existing-anchor diagnostics

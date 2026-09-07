@@ -11,12 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shlex
 import shutil
 import subprocess
 import tempfile
 import wave
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +33,8 @@ from lectern.bundle import (
     StageRecord,
     StageState,
 )
+from lectern.records import AutomationError, approval_digest
+from lectern.sources.local import transcript_sidecar_path
 
 CANONICAL_SAMPLE_RATE = 16_000
 CANONICAL_CHANNELS = 1
@@ -86,22 +90,182 @@ class TranscriptResult:
         ).hexdigest()
 
 
-def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = None) -> str:
-    """Return the bundle id `ingest_local` will use for source and transcript method."""
+@dataclass(frozen=True)
+class PreparedLocalIngest:
+    """Input facts and operations valid for one private snapshot lifetime."""
 
+    original_path: Path
+    registry_path: Path
+    media_sha256: str
+    media_size: int
+    mtime_ns: int
+    approval_sha256: str
+    _media_path: Path
+    _sidecar_payload: bytes | None
+    _command: str | None
+
+    def planned_bundle_id(self) -> str | None:
+        if self._command is not None or self._sidecar_payload is None:
+            return None
+        transcript = _sidecar_transcript(self.original_path, self._sidecar_payload)
+        digest = _combined_digest(self.media_sha256, transcript.identity_component)
+        return f"{_slug(self.original_path.stem)}-{digest[:12]}"
+
+    def ingest(self, output_root: Path) -> IngestResult:
+        source = self.original_path
+        source_digest, source_size = self.media_sha256, self.media_size
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        temp_root = Path(tempfile.mkdtemp(prefix=".lectern-ingest.", dir=output_root))
+        try:
+            _ensure_bundle_dirs(temp_root)
+            audio_path = temp_root / "media" / "audio.wav"
+            _normalize_to_canonical_wav(self._media_path, audio_path)
+            source_duration = _wav_duration_seconds(audio_path)
+
+            transcript = (
+                _transcribe_with_local_command(self._command, audio_path, source_duration)
+                if self._command is not None
+                else _sidecar_transcript(source, self._sidecar_payload, source_duration)
+            )
+
+            current_source_digest, current_source_size = _digest_and_size(source)
+            if (current_source_digest, current_source_size) != (source_digest, source_size):
+                raise IngestError("source file changed during ingest; retry after changes settle")
+
+            bundle_digest = _combined_digest(source_digest, transcript.identity_component)
+            bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
+            bundle_dir = output_root / bundle_id
+            if bundle_dir.exists():
+                raise IngestError(f"bundle already exists: {bundle_dir}")
+
+            manifest = Manifest(
+                bundle_id=bundle_id,
+                source=Source(
+                    kind=SourceKind.LOCAL,
+                    ref=f"sha256:{source_digest}",
+                    bytes=source_size,
+                    title=source.stem.replace("_", " ").title(),
+                    duration_s=source_duration,
+                ),
+            )
+
+            source_json = temp_root / "source.json"
+            _write_json(
+                source_json,
+                {
+                    "source": manifest.source.model_dump(mode="json"),
+                    "sha256": source_digest,
+                    "bytes": source_size,
+                    "transcript": {
+                        "method": transcript.method,
+                        "metadata": "transcript/metadata.json",
+                        "segments": "transcript/segments.json",
+                        "transcript": "transcript/transcript.md",
+                        "evidence_limit": transcript.evidence_limit,
+                        "remote_services": transcript.remote_services,
+                    },
+                    "transcript_sidecar": transcript.sidecar,
+                },
+            )
+            manifest.stages[StageName.ACQUIRE] = _done_stage(temp_root, [source_json])
+            manifest.stages[StageName.NORMALIZE] = _done_stage(temp_root, [audio_path])
+
+            segments_path = temp_root / "transcript" / "segments.json"
+            transcript_path = temp_root / "transcript" / "transcript.md"
+            metadata_path = temp_root / "transcript" / "metadata.json"
+            _write_json(segments_path, [segment.to_dict() for segment in transcript.segments])
+            transcript_path.write_text(transcript.text.rstrip() + "\n", encoding="utf-8")
+            _write_json(
+                metadata_path,
+                _transcript_metadata(
+                    transcript=transcript,
+                    source=source,
+                    source_digest=source_digest,
+                    normalized_audio=audio_path,
+                ),
+            )
+            manifest.stages[StageName.TRANSCRIBE] = _done_stage(
+                temp_root,
+                [segments_path, transcript_path, metadata_path],
+            )
+
+            summary_path = temp_root / "analysis" / "summary.md"
+            summary_path.write_text(_summary_lite(transcript), encoding="utf-8")
+            manifest.stages[StageName.SYNTHESIZE] = _done_stage(temp_root, [summary_path])
+
+            manifest.save(temp_root)
+            temp_root.replace(bundle_dir)
+            return IngestResult(bundle_dir=bundle_dir, manifest=Manifest.load(bundle_dir))
+        except BaseException:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            raise
+
+
+@contextmanager
+def prepare_local_ingest(
+    source_path: Path,
+    *,
+    transcriber_command: str | None = None,
+    source_root: Path | None = None,
+    expected_approval_sha256: str | None,
+) -> Generator[PreparedLocalIngest]:
     source = source_path.expanduser()
     if not source.is_file():
         raise IngestError(f"source file does not exist: {source}")
-
-    source_digest = _sha256(source)
+    registry_path = source.resolve()
     command = _explicit_transcriber_command(transcriber_command)
-    if command is not None:
-        raise IngestError(
-            "bundle id for --transcriber-command cannot be planned before transcription"
+    with tempfile.TemporaryDirectory(prefix="lectern-input-") as temporary:
+        snapshot = Path(temporary) / source.name
+        digest = hashlib.sha256()
+        size = 0
+        with registry_path.open("rb") as incoming:
+            mtime_ns = os.fstat(incoming.fileno()).st_mtime_ns
+            descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as outgoing:
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                    outgoing.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+        sidecar = transcript_sidecar_path(source, root=source_root)
+        sidecar_payload = sidecar.read_bytes() if sidecar is not None else None
+        media_digest = digest.hexdigest()
+        sidecar_digest = (
+            hashlib.sha256(sidecar_payload).hexdigest() if sidecar_payload is not None else None
         )
-    sidecar = _read_transcript_sidecar(source)
-    bundle_digest = _combined_digest(source_digest, sidecar.identity_component)
-    return f"{_slug(source.stem)}-{bundle_digest[:12]}"
+        composite = approval_digest(media_digest, sidecar_digest)
+        if expected_approval_sha256 is not None and composite != expected_approval_sha256:
+            raise AutomationError("source file changed since queue approval; rescan before ingest")
+        yield PreparedLocalIngest(
+            original_path=source,
+            registry_path=registry_path,
+            media_sha256=media_digest,
+            media_size=size,
+            mtime_ns=mtime_ns,
+            approval_sha256=composite,
+            _media_path=snapshot,
+            _sidecar_payload=sidecar_payload,
+            _command=command,
+        )
+
+
+def plan_local_bundle_id(source_path: Path, transcriber_command: str | None = None) -> str:
+    """Return the bundle id for a private capture of the source and sidecar."""
+
+    with prepare_local_ingest(
+        source_path, transcriber_command=transcriber_command, expected_approval_sha256=None
+    ) as prepared:
+        if _explicit_transcriber_command(transcriber_command) is not None:
+            raise IngestError(
+                "bundle id for --transcriber-command cannot be planned before transcription"
+            )
+        planned = prepared.planned_bundle_id()
+        if planned is None:
+            raise IngestError(
+                "no local transcription backend is configured for this file; "
+                "provide a .transcript.txt sidecar or pass --transcriber-command"
+            )
+        return planned
 
 
 def can_plan_local_bundle_id(source_path: Path, transcriber_command: str | None = None) -> bool:
@@ -119,116 +283,15 @@ def ingest_local(
     *,
     transcriber_command: str | None = None,
 ) -> IngestResult:
-    source = source_path.expanduser()
-    if not source.is_file():
-        raise IngestError(f"source file does not exist: {source}")
-    source_digest, source_size = _digest_and_size(source)
-
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    temp_root = Path(tempfile.mkdtemp(prefix=".lectern-ingest.", dir=output_root))
-    try:
-        _ensure_bundle_dirs(temp_root)
-        audio_path = temp_root / "media" / "audio.wav"
-        _normalize_to_canonical_wav(source, audio_path)
-        source_duration = _wav_duration_seconds(audio_path)
-
-        transcript = _resolve_transcript(
-            source=source,
-            normalized_audio=audio_path,
-            duration_s=source_duration,
-            transcriber_command=transcriber_command,
-        )
-
-        current_source_digest, current_source_size = _digest_and_size(source)
-        if (current_source_digest, current_source_size) != (source_digest, source_size):
-            raise IngestError("source file changed during ingest; retry after changes settle")
-
-        bundle_digest = _combined_digest(source_digest, transcript.identity_component)
-        bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
-        bundle_dir = output_root / bundle_id
-        if bundle_dir.exists():
-            raise IngestError(f"bundle already exists: {bundle_dir}")
-
-        manifest = Manifest(
-            bundle_id=bundle_id,
-            source=Source(
-                kind=SourceKind.LOCAL,
-                ref=f"sha256:{source_digest}",
-                bytes=source_size,
-                title=source.stem.replace("_", " ").title(),
-                duration_s=source_duration,
-            ),
-        )
-
-        source_json = temp_root / "source.json"
-        _write_json(
-            source_json,
-            {
-                "source": manifest.source.model_dump(mode="json"),
-                "sha256": source_digest,
-                "bytes": source_size,
-                "transcript": {
-                    "method": transcript.method,
-                    "metadata": "transcript/metadata.json",
-                    "segments": "transcript/segments.json",
-                    "transcript": "transcript/transcript.md",
-                    "evidence_limit": transcript.evidence_limit,
-                    "remote_services": transcript.remote_services,
-                },
-                "transcript_sidecar": transcript.sidecar,
-            },
-        )
-        manifest.stages[StageName.ACQUIRE] = _done_stage(temp_root, [source_json])
-        manifest.stages[StageName.NORMALIZE] = _done_stage(temp_root, [audio_path])
-
-        segments_path = temp_root / "transcript" / "segments.json"
-        transcript_path = temp_root / "transcript" / "transcript.md"
-        metadata_path = temp_root / "transcript" / "metadata.json"
-        _write_json(segments_path, [segment.to_dict() for segment in transcript.segments])
-        transcript_path.write_text(transcript.text.rstrip() + "\n", encoding="utf-8")
-        _write_json(
-            metadata_path,
-            _transcript_metadata(
-                transcript=transcript,
-                source=source,
-                source_digest=source_digest,
-                normalized_audio=audio_path,
-            ),
-        )
-        manifest.stages[StageName.TRANSCRIBE] = _done_stage(
-            temp_root,
-            [segments_path, transcript_path, metadata_path],
-        )
-
-        summary_path = temp_root / "analysis" / "summary.md"
-        summary_path.write_text(_summary_lite(transcript), encoding="utf-8")
-        manifest.stages[StageName.SYNTHESIZE] = _done_stage(temp_root, [summary_path])
-
-        manifest.save(temp_root)
-        temp_root.replace(bundle_dir)
-        return IngestResult(bundle_dir=bundle_dir, manifest=Manifest.load(bundle_dir))
-    except Exception:
-        shutil.rmtree(temp_root, ignore_errors=True)
-        raise
+    with prepare_local_ingest(
+        source_path, transcriber_command=transcriber_command, expected_approval_sha256=None
+    ) as prepared:
+        return prepared.ingest(output_root)
 
 
 def _ensure_bundle_dirs(bundle_dir: Path) -> None:
     for relative in ("media", "transcript", "analysis", "log"):
         (bundle_dir / relative).mkdir(parents=True, exist_ok=True)
-
-
-def _resolve_transcript(
-    *,
-    source: Path,
-    normalized_audio: Path,
-    duration_s: float | None,
-    transcriber_command: str | None,
-) -> TranscriptResult:
-    command = _explicit_transcriber_command(transcriber_command)
-    if command is not None:
-        return _transcribe_with_local_command(command, normalized_audio, duration_s)
-    return _read_transcript_sidecar(source, duration_s=duration_s)
 
 
 def _explicit_transcriber_command(transcriber_command: str | None) -> str | None:
@@ -238,40 +301,40 @@ def _explicit_transcriber_command(transcriber_command: str | None) -> str | None
     return None
 
 
-def _read_transcript_sidecar(source: Path, duration_s: float | None = None) -> TranscriptResult:
+def _sidecar_transcript(
+    source: Path, payload: bytes | None, duration_s: float | None = None
+) -> TranscriptResult:
+    if payload is None:
+        raise IngestError(
+            "no local transcription backend is configured for this file; "
+            "provide a .transcript.txt sidecar or pass --transcriber-command"
+        )
     transcript_path = source.with_suffix(".transcript.txt")
-    if transcript_path.is_file():
-        digest, size = _digest_and_size(transcript_path)
-        try:
-            transcript = transcript_path.read_text(encoding="utf-8").strip()
-        except UnicodeDecodeError as exc:
-            raise IngestError(f"fixture transcript is not valid UTF-8: {transcript_path}") from exc
-        if transcript:
-            return TranscriptResult(
-                text=transcript,
-                segments=(
-                    TranscriptSegment(
-                        id=0,
-                        start_s=0.0,
-                        end_s=duration_s,
-                        text=transcript,
-                        source="fixture_transcript",
-                    ),
+    digest, size = hashlib.sha256(payload).hexdigest(), len(payload)
+    try:
+        transcript = payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").strip()
+    except UnicodeDecodeError as exc:
+        raise IngestError(f"fixture transcript is not valid UTF-8: {transcript_path}") from exc
+    if transcript:
+        return TranscriptResult(
+            text=transcript,
+            segments=(
+                TranscriptSegment(
+                    id=0,
+                    start_s=0.0,
+                    end_s=duration_s,
+                    text=transcript,
+                    source="fixture_transcript",
                 ),
-                method="fixture_transcript_sidecar",
-                backend={"kind": "sidecar", "sha256": digest},
-                evidence_limit="fixture transcript passthrough; no ASR quality claim",
-                remote_services=_remote_services(
-                    transcriber_network_posture="not_applicable_sidecar"
-                ),
-                identity={"method": "fixture_transcript_sidecar", "sha256": digest},
-                sidecar={"sha256": digest, "bytes": size},
-            )
-        raise IngestError(f"fixture transcript is empty: {transcript_path}")
-    raise IngestError(
-        "no local transcription backend is configured for this file; "
-        "provide a .transcript.txt sidecar or pass --transcriber-command"
-    )
+            ),
+            method="fixture_transcript_sidecar",
+            backend={"kind": "sidecar", "sha256": digest},
+            evidence_limit="fixture transcript passthrough; no ASR quality claim",
+            remote_services=_remote_services(transcriber_network_posture="not_applicable_sidecar"),
+            identity={"method": "fixture_transcript_sidecar", "sha256": digest},
+            sidecar={"sha256": digest, "bytes": size},
+        )
+    raise IngestError(f"fixture transcript is empty: {transcript_path}")
 
 
 def _transcribe_with_local_command(
@@ -612,10 +675,6 @@ def _artifact_ref(bundle_dir: Path, path: Path) -> ArtifactRef:
 
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
-def _sha256(path: Path) -> str:
-    return _digest_and_size(path)[0]
 
 
 def _digest_text(value: str) -> str:

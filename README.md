@@ -92,6 +92,14 @@ providers, and does not claim transcript faithfulness. A user-supplied command
 runs with the user's privileges; Lectern cannot prove that command never opens a
 network connection.
 
+Before planning or processing, Lectern captures a private temporary media copy
+and the sidecar bytes, if present. Queued ingest checks those captured inputs
+against the existing approval before normalization or transcription; planning,
+replay selection, and processing use the same capture. Approval still covers a
+present sidecar when an explicit command supplies the transcript instead.
+This binds the input Lectern supplies, not the behavior or faithfulness of an
+arbitrary user command. It does not authenticate previously generated bundles.
+
 Lectern also has an early local automation spine for folder sources. It records
 source and queue state in local SQLite, scans local folders without network
 access, requires explicit queue approval before ingesting a discovered item, and

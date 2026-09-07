@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import stat
 import sys
 import tomllib
 import wave
@@ -157,7 +158,8 @@ def test_local_ingest_uses_normalized_audio_duration(
     normalized_duration_s = 0.25
 
     def fake_normalize(source_path: Path, output: Path) -> None:
-        assert source_path == source
+        assert source_path.name == source.name
+        assert source_path.read_bytes() == source.read_bytes()
         _write_test_wav(output, normalized_duration_s)
 
     monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", fake_normalize)
@@ -585,3 +587,171 @@ def _edit_distance(left: list[str], right: list[str]) -> int:
             )
         previous = current
     return previous[-1]
+
+
+def test_ingest_consumes_original_media_despite_aba_change_at_normalizer(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    source = tmp_path / "Original_Name.wav"
+    original = SYNTHETIC_TALK.read_bytes()
+    source.write_bytes(original)
+    source.with_suffix(".transcript.txt").write_bytes(SYNTHETIC_TRANSCRIPT.read_bytes())
+    changed = original[:-1] + bytes([original[-1] ^ 1])
+    normalize = ingest_module._normalize_to_canonical_wav  # pyright: ignore[reportPrivateUsage]
+    consumed: list[bytes] = []
+
+    def mutate_and_normalize(input_path: Path, output: Path) -> None:
+        source.write_bytes(changed)
+        try:
+            consumed.append(input_path.read_bytes())
+            normalize(input_path, output)
+        finally:
+            source.write_bytes(original)
+
+    monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", mutate_and_normalize)
+    result = ingest_local(source, tmp_path / "bundles")
+    assert consumed == [original]
+    assert (result.bundle_dir / "media/audio.wav").read_bytes() == original
+    assert source.read_bytes() == original
+
+
+def test_sidecar_digest_and_decoding_consume_one_payload(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    source = tmp_path / "talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    sidecar = source.with_suffix(".transcript.txt")
+    original = b"original synthetic sidecar evidence\n"
+    sidecar.write_bytes(original)
+    read_payload = Path.read_bytes
+    injections: list[Path] = []
+
+    def mutate_after_capture(path: Path) -> bytes:
+        result = read_payload(path)
+        if path == sidecar:
+            injections.append(path)
+            sidecar.write_bytes(b"unapproved replacement evidence\n")
+        return result
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_after_capture)
+    result = ingest_local(source, tmp_path / "bundles")
+    assert injections == [sidecar]
+    assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == original
+    document = json.loads((result.bundle_dir / "source.json").read_text())
+    assert document["transcript_sidecar"]["sha256"] == hashlib.sha256(original).hexdigest()
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "interrupt"])
+def test_input_snapshot_is_private_and_cleaned_with_bundle_staging(
+    tmp_path: Path, monkeypatch: MonkeyPatch, outcome: str
+) -> None:
+    source = tmp_path / "Lexical_Name.WAV"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    source.with_suffix(".transcript.txt").write_bytes(SYNTHETIC_TRANSCRIPT.read_bytes())
+    normalize = ingest_module._normalize_to_canonical_wav  # pyright: ignore[reportPrivateUsage]
+    snapshots: list[Path] = []
+
+    def inspect_input(input_path: Path, output: Path) -> None:
+        snapshots.append(input_path)
+        assert input_path != source
+        assert input_path.name == source.name
+        assert stat.S_IMODE(input_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(input_path.parent.stat().st_mode) == 0o700
+        if outcome == "error":
+            raise IngestError("synthetic processing error")
+        if outcome == "interrupt":
+            raise KeyboardInterrupt
+        normalize(input_path, output)
+
+    monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", inspect_input)
+    output_root = tmp_path / "bundles"
+    if outcome == "success":
+        result = ingest_local(source, output_root)
+        assert result.manifest.bundle_id.startswith("lexical-name-")
+        assert result.manifest.source.title == "Lexical Name"
+        assert str(snapshots[0].parent) not in (result.bundle_dir / "source.json").read_text()
+    else:
+        expected = IngestError if outcome == "error" else KeyboardInterrupt
+        with pytest.raises(expected):
+            ingest_local(source, output_root)
+        assert list(output_root.iterdir()) == []
+    assert len(snapshots) == 1
+    assert not snapshots[0].parent.exists()
+
+
+def test_prepared_input_preserves_existing_approval_and_bundle_id_goldens(tmp_path: Path) -> None:
+    from lectern.records import approval_digest
+
+    assert (
+        approval_digest("a" * 64, None)
+        == "b6d5ba858af33ce93dd3aad7a576d435f9b6c934c1963ac8a3a2e299c7188d9f"
+    )
+    assert (
+        approval_digest("a" * 64, "b" * 64)
+        == "ff068c8932014de8ec3f40edd205772f59a48fec87a65023c637ddc4dd74250d"
+    )
+    with ingest_module.prepare_local_ingest(
+        SYNTHETIC_TALK, expected_approval_sha256=None
+    ) as prepared:
+        assert (
+            prepared.approval_sha256
+            == "71081ac54e089f9f6b5d4f6148c9cd64b4e7a85f039e0341aad6cd35905679db"
+        )
+        assert prepared.media_size == 95010
+        assert prepared.planned_bundle_id() == "synthetic-talk-8241c0556389"
+        result = prepared.ingest(tmp_path / "bundles")
+        assert result.manifest.bundle_id == prepared.planned_bundle_id()
+
+
+@pytest.mark.parametrize("payload", [b"  first\r\nsecond\r\n  ", b"  first\rsecond\r  "])
+def test_captured_sidecar_retains_universal_newline_and_raw_digest_semantics(
+    tmp_path: Path, payload: bytes
+) -> None:
+    source = tmp_path / "talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    source.with_suffix(".transcript.txt").write_bytes(payload)
+    result = ingest_local(source, tmp_path / "bundles")
+    assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == b"first\nsecond\n"
+    record = json.loads((result.bundle_dir / "source.json").read_text())
+    assert record["transcript_sidecar"] == {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+    }
+
+
+def test_rejected_capture_cleans_private_input_before_yield(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    from lectern.records import AutomationError
+
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    monkeypatch.setattr(ingest_module.tempfile, "tempdir", str(snapshots))
+    with (
+        pytest.raises(AutomationError, match="changed since queue approval"),
+        ingest_module.prepare_local_ingest(SYNTHETIC_TALK, expected_approval_sha256="0" * 64),
+    ):
+        raise AssertionError("mismatching capture exposed processing capabilities")
+    assert list(snapshots.iterdir()) == []
+
+
+def test_prepared_sidecar_retains_rooted_and_unrooted_symlink_policy(tmp_path: Path) -> None:
+    from lectern.records import AutomationError
+
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "talk.wav"
+    source.write_bytes(SYNTHETIC_TALK.read_bytes())
+    external = tmp_path / "external.transcript.txt"
+    external.write_bytes(b"synthetic external sidecar\n")
+    source.with_suffix(".transcript.txt").symlink_to(external)
+    with (
+        pytest.raises(AutomationError, match="inside the source root"),
+        ingest_module.prepare_local_ingest(
+            source, source_root=root, expected_approval_sha256=None, transcriber_command="unused"
+        ),
+    ):
+        raise AssertionError("rooted sidecar policy was bypassed")
+    with ingest_module.prepare_local_ingest(source, expected_approval_sha256=None) as prepared:
+        result = prepared.ingest(tmp_path / "bundles")
+    assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == external.read_bytes()

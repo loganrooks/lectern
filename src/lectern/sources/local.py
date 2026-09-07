@@ -6,7 +6,6 @@ item" is the media bytes plus any transcript sidecar beside them.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +16,7 @@ from lectern.records import (
     AutomationError,
     SourceItem,
     SourceRecord,
+    approval_digest,
     digest_and_size,
     make_source_item_id,
     now_timestamp,
@@ -151,24 +151,20 @@ def _transcript_sidecar_escapes_root(path: Path, root: Path) -> bool:
     return False
 
 
+def transcript_sidecar_path(path: Path, *, root: Path | None = None) -> Path | None:
+    sidecar = path.with_suffix(".transcript.txt")
+    if not sidecar.is_file():
+        return None
+    if root is not None and _transcript_sidecar_escapes_root(path, root):
+        raise AutomationError("transcript sidecar must be inside the source root")
+    return sidecar
+
+
 def approval_digest_and_media_size(path: Path, *, root: Path | None = None) -> tuple[str, int]:
     media_digest, media_size = digest_and_size(path)
-    sidecar = path.with_suffix(".transcript.txt")
-    digest = hashlib.sha256()
-    digest.update(b"media")
-    digest.update(b"\0")
-    digest.update(media_digest.encode("ascii"))
-    digest.update(b"\0")
-    if sidecar.is_file():
-        if root is not None and _transcript_sidecar_escapes_root(path, root):
-            raise AutomationError("transcript sidecar must be inside the source root")
-        sidecar_digest, _ = digest_and_size(sidecar)
-        digest.update(b"transcript-sidecar")
-        digest.update(b"\0")
-        digest.update(sidecar_digest.encode("ascii"))
-    else:
-        digest.update(b"transcript-sidecar-absent")
-    return digest.hexdigest(), media_size
+    sidecar = transcript_sidecar_path(path, root=root)
+    sidecar_digest = digest_and_size(sidecar)[0] if sidecar is not None else None
+    return approval_digest(media_digest, sidecar_digest), media_size
 
 
 class LocalFolderAdapter:

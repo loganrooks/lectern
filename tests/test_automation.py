@@ -14,6 +14,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from lectern import automation
+from lectern import ingest as ingest_module
 from lectern import state as state_module
 from lectern.automation import (
     STATE_SCHEMA_VERSION,
@@ -1554,3 +1555,182 @@ def test_illegal_retry_leaves_no_open_write_transaction(tmp_path: Path) -> None:
         connection = getattr(state, "_connection")  # noqa: B009
         assert connection.in_transaction is False
         assert state.get_queue_item(queue_item_id).state is QueueState.COMPLETED
+
+
+def test_queue_uses_approved_sidecar_when_original_changes_at_processing(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    sidecar = media.with_suffix(".transcript.txt")
+    original = sidecar.read_bytes()
+    original_ingest = ingest_module.PreparedLocalIngest.ingest
+    injections: list[bool] = []
+
+    def change_then_ingest(
+        prepared: ingest_module.PreparedLocalIngest, output_root: Path
+    ) -> ingest_module.IngestResult:
+        injections.append(True)
+        sidecar.write_bytes(b"unapproved processing-boundary evidence\n")
+        return original_ingest(prepared, output_root)
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        state.scan_source(source.id)
+        queued = state.list_queue()[0]
+        state.approve_queue_item(queued.id)
+        monkeypatch.setattr(ingest_module.PreparedLocalIngest, "ingest", change_then_ingest)
+        result = state.ingest_queue_item(queued.id, tmp_path / "bundles")
+        assert injections == [True]
+        assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == original
+        assert state.get_queue_item(queued.id).content_sha256 == queued.content_sha256
+
+
+@pytest.mark.parametrize("change", ["appears", "disappears", "changes-during-capture"])
+def test_queue_snapshot_mismatch_refuses_before_processing(
+    tmp_path: Path, monkeypatch: MonkeyPatch, change: str
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    sidecar = media.with_suffix(".transcript.txt")
+    if change == "appears":
+        sidecar.unlink()
+    capture_read = Path.read_bytes
+    injections: list[bool] = []
+
+    def change_and_read(path: Path) -> bytes:
+        if path == sidecar:
+            injections.append(True)
+            sidecar.write_bytes(b"changed while capturing synthetic sidecar\n")
+        return capture_read(path)
+
+    def forbidden_normalize(input_path: Path, output: Path) -> None:
+        raise AssertionError("processing began before approval comparison")
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        queued = state.scan_source(source.id).queued[0]
+        state.approve_queue_item(queued.id)
+        if change == "appears":
+            sidecar.write_bytes(b"new sidecar\n")
+        elif change == "disappears":
+            sidecar.unlink()
+        else:
+            monkeypatch.setattr(Path, "read_bytes", change_and_read)
+        monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", forbidden_normalize)
+        with pytest.raises(AutomationError, match="changed since queue approval"):
+            state.ingest_queue_item(queued.id, tmp_path / "bundles", transcriber_command="unused")
+        if change == "changes-during-capture":
+            assert injections == [True]
+        assert state.get_queue_item(queued.id).state is QueueState.FAILED
+        assert not (tmp_path / "bundles").exists()
+
+
+def test_one_shot_registry_uses_captured_identity_after_planning_mutation(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    original_sidecar = media.with_suffix(".transcript.txt").read_bytes()
+    expected_digest, expected_size = automation.approval_digest_and_media_size(media)
+    original_planner = ingest_module.PreparedLocalIngest.planned_bundle_id
+    injections: list[bool] = []
+
+    def mutate_after_plan(prepared: ingest_module.PreparedLocalIngest) -> str | None:
+        result = original_planner(prepared)
+        injections.append(True)
+        media.with_suffix(".transcript.txt").write_bytes(b"new after planned snapshot\n")
+        return result
+
+    monkeypatch.setattr(ingest_module.PreparedLocalIngest, "planned_bundle_id", mutate_after_plan)
+    with open_state(tmp_path / "state.sqlite") as state:
+        result = state.ingest_one_shot(media, tmp_path / "bundles")
+        queue_item = state.list_queue()[0]
+        item = state.get_source_item(queue_item.source_item_id)
+        assert injections == [True]
+        assert item.sha256 == queue_item.content_sha256 == expected_digest
+        assert item.size_bytes == expected_size
+        assert item.absolute_path == str(media.resolve())
+        assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == original_sidecar
+
+
+@pytest.mark.parametrize("sidecar_present", [False, True])
+def test_command_approval_includes_even_an_unused_sidecar(
+    tmp_path: Path, sidecar_present: bool
+) -> None:
+    media = copy_media_without_sidecar(tmp_path / "source")
+    if sidecar_present:
+        media.with_suffix(".transcript.txt").write_bytes(b"\xff unused sidecar bytes")
+    expected_digest, _ = automation.approval_digest_and_media_size(media)
+    transcriber = _write_transcriber_script(
+        tmp_path / "transcriber.py", '{"text":"command evidence"}'
+    )
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        queued = state.scan_source(source.id).queued[0]
+        state.approve_queue_item(queued.id)
+        result = state.ingest_queue_item(
+            queued.id, tmp_path / "bundles", transcriber_command=f"{sys.executable} {transcriber}"
+        )
+        assert state.get_queue_item(queued.id).content_sha256 == expected_digest
+        assert state.get_queue_item(queued.id).state is QueueState.COMPLETED
+        assert (
+            json.loads((result.bundle_dir / "source.json").read_text())["transcript_sidecar"]
+            is None
+        )
+        assert (result.bundle_dir / "transcript/transcript.md").read_text() == "command evidence\n"
+
+
+@pytest.mark.parametrize("pivot", [False, True])
+def test_one_shot_alias_keeps_captured_registry_and_lexical_evidence(
+    tmp_path: Path, monkeypatch: MonkeyPatch, pivot: bool
+) -> None:
+    root = tmp_path.resolve()
+    target_a, target_b = root / "A.wav", root / "B.wav"
+    original = SYNTHETIC_TALK.read_bytes()
+    target_a.write_bytes(original)
+    target_b.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    alias = root / "Selected.wav"
+    alias.symlink_to(target_a)
+    selected_text = b"synthetic Selected sidecar\n"
+    alias.with_suffix(".transcript.txt").write_bytes(selected_text)
+    target_a.with_suffix(".transcript.txt").write_bytes(b"different target A sidecar\n")
+    planner = ingest_module.PreparedLocalIngest.planned_bundle_id
+    normalizer = ingest_module._normalize_to_canonical_wav  # pyright: ignore[reportPrivateUsage]
+    events: list[str] = []
+
+    def pivot_after_capture(prepared: ingest_module.PreparedLocalIngest) -> str | None:
+        planned = planner(prepared)
+        if pivot:
+            alias.unlink()
+            alias.symlink_to(target_b)
+            events.append("pivoted to B")
+        return planned
+
+    def restore_at_processing(captured: Path, output: Path) -> None:
+        assert captured.name == "Selected.wav"
+        assert captured.read_bytes() == original
+        if pivot:
+            assert alias.resolve() == target_b
+            alias.unlink()
+            alias.symlink_to(target_a)
+        events.append("consumed A")
+        normalizer(captured, output)
+
+    monkeypatch.setattr(ingest_module.PreparedLocalIngest, "planned_bundle_id", pivot_after_capture)
+    monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", restore_at_processing)
+    with open_state(root / "state.sqlite") as state:
+        result = state.ingest_one_shot(alias, root / "bundles")
+        queued = state.list_queue()[0]
+        item = state.get_source_item(queued.source_item_id)
+        source = state.get_source(queued.source_id)
+        assert events == (["pivoted to B", "consumed A"] if pivot else ["consumed A"])
+        assert (result.bundle_dir / "media/audio.wav").read_bytes() == original
+        assert (result.bundle_dir / "transcript/transcript.md").read_bytes() == selected_text
+        assert result.manifest.bundle_id.startswith("selected-")
+        assert result.manifest.source.title == "Selected"
+        assert Path(source.root_path) == target_a
+        assert Path(item.absolute_path) == target_a
+        assert source.id == automation.make_source_id("one-shot", str(target_a))
+        assert source.name.startswith("one-shot:A.wav:")
+        assert item.id == automation.make_source_item_id(source.id, "A.wav")
+        assert item.relative_path == "A.wav"
+        assert queued.state is QueueState.COMPLETED
+        assert alias.resolve() == target_a
