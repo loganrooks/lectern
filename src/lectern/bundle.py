@@ -355,7 +355,12 @@ class TranscriptSegmentRecord(ArtifactModel):
     id: SegmentId
     start_s: FiniteFloat
     end_s: FiniteFloat | None = None
-    text: str
+    # Explicit Python str.isspace set: \S differs across regex engines. A search
+    # for one character outside this class rejects blanks without altering text.
+    text: str = Field(
+        pattern=r"[^\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a"
+        r"\u2028\u2029\u202f\u205f\u3000]"
+    )
     source: str
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -281,3 +282,38 @@ def test_no_artifact_schema_admits_a_filesystem_path() -> None:
             assert "path" not in model_schema.get("properties", {}), (
                 f"{name}: {model_name} still declares a path field"
             )
+
+
+@pytest.mark.parametrize("text", ["", " \t\r\n", "\u00a0\u2003\u3000"])
+def test_segments_reject_blank_text_in_model_and_exported_schema(text: str) -> None:
+    row = {"id": 0, "start_s": 0.0, "text": text, "source": "fixture"}
+    with pytest.raises(ValueError, match="pattern"):
+        TranscriptSegmentsDocument.model_validate([row])
+    schema = json.loads(export_artifact_schemas()["transcript-segments"])
+    pattern = schema["$defs"]["TranscriptSegmentRecord"]["properties"]["text"]["pattern"]
+    assert re.search(pattern, text) is None
+
+
+def test_segment_text_whitespace_boundary_and_exact_preservation() -> None:
+    schema = json.loads(export_artifact_schemas()["transcript-segments"])
+    pattern = schema["$defs"]["TranscriptSegmentRecord"]["properties"]["text"]["pattern"]
+    whitespace = [chr(code) for code in range(sys.maxunicode + 1) if chr(code).isspace()]
+    for text in whitespace + ["".join(whitespace)]:
+        row = {"id": 7, "start_s": 1.0, "text": text, "source": "fixture"}
+        with pytest.raises(ValueError):
+            TranscriptSegmentsDocument.model_validate([row])
+        assert re.search(pattern, text) is None, repr(text)
+    for text in [
+        " \tעברית\nالعربية 日本語 🙂\u3000",
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\u2060",
+        "\ufeff",
+    ]:
+        assert text.strip()
+        row = {"id": 7, "start_s": 1.0, "text": text, "source": "fixture"}
+        document = TranscriptSegmentsDocument.model_validate([row])
+        assert document.model_dump()[0]["text"] == text
+        assert json.loads(document.model_dump_json())[0]["text"] == text
+        assert re.search(pattern, text) is not None, repr(text)

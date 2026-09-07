@@ -5,6 +5,12 @@ versioned release notes will become stricter once preview support stabilizes.
 
 ## Unreleased
 
+- Established nonblank transcript segment validity in the pre-release `1.0.0`
+  contract, with matching runtime and exported schema constraints. Migration
+  rejects blank evidence without changing the original bundle; valid text is
+  preserved exactly. Registered readers remove invalid documents from retrieval
+  and refuse new citations.
+
 - Changed local manifest `source.ref` from a filesystem path to a content
   identity, raised the manifest schema to `1.0.0`, and added the explicit
   `lectern migrate BUNDLE` procedure with a retained `0.1.0` backup.

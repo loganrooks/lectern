@@ -40,6 +40,14 @@ The current `0.1.0` to `1.0.0` bundle procedure is documented in
 [docs/MIGRATIONS.md](docs/MIGRATIONS.md). Manifest `1.0.0` does not mean the
 Lectern package has reached `1.0.0`.
 
+The pre-release `1.0.0` contract requires nonblank transcript segment text:
+at least one character must fall outside Python's Unicode whitespace set.
+This requirement was tightened in place while establishing that contract.
+Otherwise valid text is preserved exactly. Current readers reject documents
+containing blank segments for indexing and citation creation; existing derived
+index entries are removed when registered bundles are refreshed. Migration
+refuses such legacy documents without rewriting their evidence.
+
 ### Automation State Schema
 
 The automation state schema version is recorded in the store's SQLite

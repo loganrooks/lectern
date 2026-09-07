@@ -1803,3 +1803,69 @@ def test_library_search_and_cite_survive_same_path_migration(tmp_path: Path) -> 
         after_anchor, resolved = state.cite_segment(bundle_id, segment_id)
         assert after_anchor == before_anchor
         assert resolved.outcome is AnchorResolution.EXACT
+
+
+@pytest.mark.parametrize("text", ["", " \t\r\n", "\u001c\u0085\u2003\u3000"])
+@pytest.mark.parametrize("operation", ["prepare", "migrate"])
+def test_blank_legacy_segments_are_refused_without_changing_roles(
+    tmp_path: Path, text: str, operation: str
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = _read_json_array(segments_path)
+    segments[0]["text"] = text
+    _write_json(segments_path, segments)
+    _repair_manifest_after_artifact_change(bundle)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            assert _digest(bundle / output["path"]) == (output["sha256"], output["bytes"])
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError, match="artifact models"):
+        if operation == "prepare":
+            prepare_bundle_migration(bundle)
+        else:
+            migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle.parent) == before
+
+
+def test_valid_legacy_segment_text_and_bytes_survive_migration(tmp_path: Path) -> None:
+    bundle = legacy_bundle(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = _read_json_array(segments_path)
+    segments[0]["text"] = " \tעברית\nالعربية 日本語 🙂\u3000"
+    segments_path.write_text(json.dumps(segments, ensure_ascii=False, indent=3) + "\n")
+    _repair_manifest_after_artifact_change(bundle)
+    before = segments_path.read_bytes()
+    ids = [segment["id"] for segment in segments]
+    migrations.migrate_bundle(bundle)
+    assert segments_path.read_bytes() == before
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    assert (backup / "transcript" / "segments.json").read_bytes() == before
+    assert [segment["id"] for segment in _read_json_array(segments_path)] == ids
+
+
+def test_blank_legacy_retry_preserves_source_while_discarding_owned_staging(
+    tmp_path: Path,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    prepared = prepare_bundle_migration(bundle)
+    assert prepared.staging_dir.is_dir()
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = _read_json_array(segments_path)
+    segments[0]["text"] = " \u2003\n"
+    _write_json(segments_path, segments)
+    _repair_manifest_after_artifact_change(bundle)
+    unrelated = bundle.parent / "unrelated-evidence"
+    unrelated.mkdir()
+    (unrelated / "note.txt").write_text("synthetic retained evidence")
+    before_source = _tree_state(bundle)
+    before_unrelated = _tree_state(unrelated)
+
+    with pytest.raises(MigrationError, match="artifact models"):
+        migrations.migrate_bundle(bundle)
+
+    assert _tree_state(bundle) == before_source
+    assert _tree_state(unrelated) == before_unrelated
+    assert not prepared.staging_dir.exists()
+    assert not bundle.with_name(bundle.name + BACKUP_SUFFIX).exists()

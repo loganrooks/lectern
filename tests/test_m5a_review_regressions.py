@@ -285,3 +285,38 @@ def test_library_search_option_terminator_preserves_literal_cli_tokens(
 def test_transcript_segments_document_rejects_an_empty_array() -> None:
     with pytest.raises(ValueError, match="at least one segment"):
         TranscriptSegmentsDocument.model_validate([])
+
+
+@pytest.mark.parametrize("text", ["", " \t\r\n", "\u001c\u0085\u2003\u3000"])
+def test_blank_current_segments_remove_stale_index_and_refuse_citations(
+    tmp_path: Path, text: str
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = cast(list[dict[str, Any]], json.loads(segments_path.read_text()))
+    segment_id = int(segments[0]["id"])
+    with open_state(state_path) as state:
+        anchor, _ = state.cite_segment(bundle.name, segment_id)
+        assert state.indexed_segment_count(bundle_id=bundle.name) > 0
+    segments[0]["text"] = text
+    _write_json(segments_path, segments)
+    manifest = _read_object(bundle / MANIFEST_NAME)
+    _refresh_manifest_outputs(bundle, manifest)
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            assert _digest(bundle / output["path"]) == (output["sha256"], output["bytes"])
+    # Model a persisted pre-tightening blank entry; registered readers must clear
+    # this derived cache even though the SQLite layout/version is unchanged.
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE segment_index SET display = ?, body = ?, literal = ? "
+            "WHERE bundle_id = ? AND segment_id = ?",
+            (text, text, text, bundle.name, segment_id),
+        )
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge") == []
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, segment_id)
+        assert state.resolve_anchor(anchor).outcome is not AnchorResolution.EXACT
