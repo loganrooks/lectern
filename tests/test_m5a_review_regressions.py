@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, cast
@@ -18,7 +19,7 @@ import pytest
 
 from lectern import cli
 from lectern.automation import open_state
-from lectern.bundle import MANIFEST_NAME, TranscriptSegmentsDocument
+from lectern.bundle import MANIFEST_NAME, Manifest, TranscriptSegmentsDocument
 from lectern.ingest import ingest_local
 from lectern.migrations import prepare_bundle_migration
 from lectern.records import AutomationError, LibraryStatus
@@ -402,3 +403,139 @@ def test_hash_consistent_invalid_selected_document_is_not_ready(
             assert _digest(bundle / output["path"]) == (output["sha256"], output["bytes"])
     with open_state(state_path) as state:
         assert state.get_library_bundle(bundle.name).status is LibraryStatus.NEEDS_REPROCESSING
+
+
+@pytest.mark.parametrize("link_kind", ["external", "in-bundle", "dangling", "root"])
+@pytest.mark.parametrize("guard_read", [False, True])
+def test_registered_manifest_symlinks_are_refused_before_reading_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str, guard_read: bool
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    original_manifest = manifest_path.read_bytes()
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge")
+        anchor, resolved = state.cite_segment(bundle.name, 0)
+        assert resolved.outcome is AnchorResolution.EXACT
+        assert state.get_library_bundle(bundle.name).status is LibraryStatus.READY
+
+    backing_bundle = bundle
+    if link_kind == "root":
+        target = bundle.with_name("original-bundle")
+        bundle.rename(target)
+        bundle.symlink_to(target, target_is_directory=True)
+        link = bundle
+        backing_bundle = target
+    else:
+        target = (
+            bundle / "original-manifest.json"
+            if link_kind == "in-bundle"
+            else tmp_path / "external-manifest.json"
+        )
+        if link_kind != "dangling":
+            target.write_bytes(original_manifest)
+        manifest_path.unlink()
+        manifest_path.symlink_to(target)
+        link = manifest_path
+    before_files = {
+        path.relative_to(backing_bundle): path.read_bytes()
+        for path in backing_bundle.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    link_target = link.readlink()
+    real_read_text = Path.read_text
+
+    def reject_manifest_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == manifest_path:
+            raise AssertionError("registered loader read a symlink manifest target")
+        return real_read_text(path, *args, **kwargs)
+
+    if guard_read:
+        monkeypatch.setattr(Path, "read_text", reject_manifest_read)
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge") == []
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, 0)
+        assert state.resolve_anchor(anchor).outcome is AnchorResolution.MISSING
+    assert link.is_symlink()
+    assert link.readlink() == link_target
+    assert {
+        path.relative_to(backing_bundle): path.read_bytes()
+        for path in backing_bundle.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    } == before_files
+    if link_kind == "dangling":
+        assert not target.exists()
+    elif link_kind != "root":
+        assert target.read_bytes() == original_manifest
+
+
+def test_registered_nonregular_manifest_is_refused_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    manifest_path.unlink()
+    os.mkfifo(manifest_path)
+    before = manifest_path.stat()
+    real_read_text = Path.read_text
+
+    def reject_manifest_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == manifest_path:
+            raise AssertionError("registered loader attempted to read a FIFO manifest")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_manifest_read)
+    with open_state(state_path) as state:
+        assert state.search_segments("knowledge") == []
+        assert state.indexed_segment_count(bundle_id=bundle.name) == 0
+        assert state.get_library_bundle(bundle.name).status is not LibraryStatus.READY
+        with pytest.raises(AutomationError, match="no readable transcript"):
+            state.cite_segment(bundle.name, 0)
+    after = manifest_path.stat()
+    assert (after.st_mode, after.st_ino) == (before.st_mode, before.st_ino)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_library_show_refuses_nonregular_manifest_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    state_path, bundle = _registered_bundle(tmp_path)
+    manifest_path = bundle / MANIFEST_NAME
+    external = tmp_path / "external-manifest.json"
+    payload = manifest_path.read_bytes()
+    manifest_path.unlink()
+    if kind == "symlink":
+        external.write_bytes(payload)
+        manifest_path.symlink_to(external)
+    else:
+        os.mkfifo(manifest_path)
+    real_read_text = Path.read_text
+
+    def reject_manifest_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == manifest_path:
+            raise AssertionError("library show attempted an unsafe manifest read")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_manifest_read)
+    capsys.readouterr()
+    assert cli.main(["library", "show", bundle.name, "--state", str(state_path), "--json"]) != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(tmp_path) not in captured.err
+    if kind == "symlink":
+        assert manifest_path.is_symlink()
+        assert external.read_bytes() == payload
+
+
+def test_manifest_load_retains_ordinary_parent_alias_and_missing_file_behavior(
+    tmp_path: Path,
+) -> None:
+    _, bundle = _registered_bundle(tmp_path)
+    alias = tmp_path / "ordinary-parent-alias"
+    alias.symlink_to(bundle.parent, target_is_directory=True)
+    assert Manifest.load(alias / bundle.name) == Manifest.load(bundle)
+    with pytest.raises(FileNotFoundError):
+        Manifest.load(tmp_path / "missing-bundle")

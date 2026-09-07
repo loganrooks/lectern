@@ -1481,12 +1481,14 @@ def _library_status_from_row(row: sqlite3.Row) -> LibraryStatus:
     except (IndexError, KeyError, ValueError):
         return LibraryStatus.INCOMPLETE
 
+    bundle_id = str(row["bundle_id"])
+    bundle_path = Path(str(row["bundle_path"]))
     try:
-        bundle_id = str(row["bundle_id"])
-        bundle_path = Path(str(row["bundle_path"]))
         manifest = _load_registered_manifest(bundle_id, bundle_path)
     except (OSError, ValueError, RecursionError):
-        return derive_library_status(queue_state, (), manifest_available=False)
+        return derive_library_status(
+            queue_state, (), manifest_available=False, source_changed=bundle_path.is_symlink()
+        )
 
     materialized_stages = [
         record.state.value

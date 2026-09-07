@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -255,7 +256,12 @@ class Manifest(ArtifactModel):
         promise in SUPPORT.md means anything at the point of use.
         """
 
-        payload: object = json.loads((bundle_dir / MANIFEST_NAME).read_text())
+        manifest_path = bundle_dir / MANIFEST_NAME
+        if bundle_dir.is_symlink() or manifest_path.is_symlink():
+            raise ValueError("bundle root and manifest must not be symlinks")
+        if not stat.S_ISREG(manifest_path.stat().st_mode):
+            raise ValueError("bundle manifest must be a regular file")
+        payload: object = json.loads(manifest_path.read_text())
         if not isinstance(payload, dict):
             raise ValueError(
                 "bundle manifest must be a JSON object with an explicit schema version"
