@@ -610,7 +610,7 @@ class AutomationState(AutomationStateStore):
             return None
         try:
             manifest = Manifest.load(bundle_dir)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
         if manifest.bundle_id != candidate_id:
             return None

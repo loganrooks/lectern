@@ -1954,6 +1954,8 @@ def test_generic_collision_text_does_not_authorize_replay(
         "missing",
         "manifest-id",
         "malformed",
+        "recursive",
+        "injected-recursion",
         "missing-manifest",
         "symlink-manifest",
     ],
@@ -1995,7 +1997,13 @@ def test_typed_candidate_refusal_never_falls_back_to_selected_b(
             first.bundle_dir.rename(tmp_path / "held-a")
         else:
             manifest_path = first.bundle_dir / MANIFEST_NAME
-            if damage == "malformed":
+            if damage == "recursive":
+                manifest_path.write_text("[" * 100_000 + "0" + "]" * 100_000)
+                with pytest.raises((ValueError, RecursionError)):
+                    Manifest.load(first.bundle_dir)
+            elif damage == "injected-recursion":
+                pass
+            elif damage == "malformed":
                 manifest_path.write_text("{invalid JSON")
             elif damage == "missing-manifest":
                 manifest_path.unlink()
@@ -2009,6 +2017,18 @@ def test_typed_candidate_refusal_never_falls_back_to_selected_b(
                 manifest_path.write_text(json.dumps(payload))
         connection.commit()
         before = _bundle_tree(tmp_path / "bundles")
+        manifest_calls = 0
+        real_load = Manifest.load
+
+        def recursive_load(cls: type[Manifest], bundle_dir: Path) -> Manifest:
+            nonlocal manifest_calls
+            if bundle_dir == first.bundle_dir:
+                manifest_calls += 1
+                raise RecursionError("synthetic candidate manifest recursion")
+            return real_load(bundle_dir)
+
+        if damage == "injected-recursion":
+            monkeypatch.setattr(Manifest, "load", classmethod(recursive_load))
 
         def collide(
             prepared: ingest_module.PreparedLocalIngest, output: Path
@@ -2027,6 +2047,7 @@ def test_typed_candidate_refusal_never_falls_back_to_selected_b(
                     queue.id, tmp_path / "bundles", transcriber_command="unused"
                 )
         assert calls == 1
+        assert manifest_calls == (1 if damage == "injected-recursion" else 0)
         assert state.get_queue_item(queue.id).bundle_id == selected.manifest.bundle_id
         assert _bundle_tree(tmp_path / "bundles") == before
 

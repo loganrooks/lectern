@@ -114,6 +114,10 @@ uv run lectern queue ingest <queue-item-id>
 uv run lectern library list
 ```
 
+Plain `library list` and `library show <bundle-id>` rows contain three tab-separated
+fields: bundle ID, creation time, and status (`ready`, `incomplete`, `failed`, or
+`needs-reprocessing`).
+
 Use `--json` on source, queue, and library commands for machine-readable output.
 The state database is local run state under `.lectern/` by default and should not
 be committed.

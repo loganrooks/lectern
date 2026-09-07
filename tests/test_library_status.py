@@ -252,3 +252,47 @@ def test_status_streams_large_declared_media_and_checks_digest_and_size(
         assert (
             state.get_library_bundle(bundle_id).status is records.LibraryStatus.NEEDS_REPROCESSING
         )
+
+
+@pytest.mark.parametrize("status", ["ready", "incomplete", "failed", "needs-reprocessing"])
+@pytest.mark.parametrize("command", ["list", "show"])
+def test_plain_library_rows_include_actual_status_and_preserve_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], status: str, command: str
+) -> None:
+    state_path, bundle_id, queue_id = _archive(tmp_path)
+    with open_state(state_path) as state:
+        bundle = state.get_library_bundle(bundle_id)
+        if status == "incomplete":
+            state.approve_queue_item(queue_id)
+        elif status == "failed":
+            manifest = Manifest.load(Path(bundle.bundle_path))
+            manifest.stages[StageName.SYNTHESIZE].state = StageState.FAILED
+            manifest.stages[StageName.SYNTHESIZE].error = "synthetic failure"
+            manifest.save(Path(bundle.bundle_path))
+        elif status == "needs-reprocessing":
+            artifact = Path(bundle.bundle_path) / "transcript/segments.json"
+            artifact.write_bytes(artifact.read_bytes() + b" ")
+        observed = state.get_library_bundle(bundle_id)
+        assert observed.status.value == status
+        expected_bundle = observed.to_dict()
+        expected_manifest = Manifest.load(Path(bundle.bundle_path)).model_dump(mode="json")
+    capsys.readouterr()
+    args = [
+        "library",
+        command,
+        *([bundle_id] if command == "show" else []),
+        "--state",
+        str(state_path),
+    ]
+    assert cli.main(args) == 0
+    plain = capsys.readouterr()
+    assert plain.err == ""
+    assert plain.out == f"{bundle_id}\t{bundle.created_at}\t{status}\n"
+    assert cli.main([*args, "--json"]) == 0
+    structured = capsys.readouterr()
+    assert structured.err == ""
+    assert json.loads(structured.out) == (
+        {"bundles": [expected_bundle]}
+        if command == "list"
+        else {"bundle": expected_bundle, "manifest": expected_manifest}
+    )

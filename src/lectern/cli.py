@@ -548,7 +548,7 @@ def _library_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
         _print_json({"bundles": [bundle.to_dict() for bundle in bundles]})
     else:
         for bundle in bundles:
-            print(f"{bundle.bundle_id}\t{bundle.created_at}")
+            print(f"{bundle.bundle_id}\t{bundle.created_at}\t{bundle.status.value}")
     return 0
 
 
@@ -566,7 +566,7 @@ def _library_show(args: Sequence[str], state_path: Path, json_output: bool) -> i
     if json_output:
         _print_json(payload)
     else:
-        print(f"{bundle.bundle_id}\t{bundle.created_at}")
+        print(f"{bundle.bundle_id}\t{bundle.created_at}\t{bundle.status.value}")
     return 0
 
 
