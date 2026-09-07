@@ -446,9 +446,12 @@ def test_local_command_identical_output_keeps_bundle_identity_stable(tmp_path: P
     output_root = tmp_path / "bundles"
 
     first = ingest_local(source, output_root, transcriber_command=command)
-    with pytest.raises(IngestError, match="bundle already exists"):
+    with pytest.raises(ingest_module.BundleExistsError, match="bundle already exists") as collision:
         ingest_local(source, output_root, transcriber_command=command)
 
+    assert collision.value.bundle_id == first.manifest.bundle_id
+    assert collision.value.bundle_dir == first.bundle_dir
+    assert str(collision.value) == f"bundle already exists: {first.bundle_dir}"
     assert first.bundle_dir.is_dir()
 
 

@@ -1839,3 +1839,225 @@ def test_capture_observation_refresh_boundary(
             assert after.sha256 == approved.content_sha256 != before.sha256
             assert after.size_bytes == len(original)
         assert state.get_queue_item(other.id) == other
+
+
+def _bundle_tree(path: Path) -> dict[str, bytes]:
+    return {
+        str(item.relative_to(path)): item.read_bytes() for item in path.rglob("*") if item.is_file()
+    }
+
+
+@pytest.mark.parametrize("one_shot", [False, True], ids=["queue", "one-shot"])
+@pytest.mark.parametrize("planned_a", [False, True], ids=["command-a", "planned-a"])
+def test_replay_selects_retained_a_after_b(tmp_path: Path, one_shot: bool, planned_a: bool) -> None:
+    media = copy_fixture(tmp_path / "source")
+    script = tmp_path / "transcriber.py"
+    counter = tmp_path / "calls"
+    command = f"{sys.executable} {script}"
+
+    def configure(text: str) -> None:
+        script.write_text(
+            "from pathlib import Path\n"
+            f"with Path({str(counter)!r}).open('a') as calls: calls.write('called\\n')\n"
+            f"print({json.dumps({'text': text})!r})\n",
+            encoding="utf-8",
+        )
+
+    with open_state(tmp_path / "state.sqlite") as state:
+        queue_id: str | None = None
+        if not one_shot:
+            source = state.add_local_folder_source("talks", media.parent)
+            queue_id = state.scan_source(source.id).queued[0].id
+
+        def run(command_arg: str | None) -> ingest_module.IngestResult:
+            if one_shot:
+                return state.ingest_one_shot(
+                    media, tmp_path / "bundles", transcriber_command=command_arg
+                )
+            assert queue_id is not None
+            state.approve_queue_item(queue_id)
+            return state.ingest_queue_item(
+                queue_id, tmp_path / "bundles", transcriber_command=command_arg
+            )
+
+        configure("Command A transcript.")
+        first = run(None if planned_a else command)
+        first_tree = _bundle_tree(first.bundle_dir)
+        configure("Command B transcript.")
+        second = run(command)
+        assert first.manifest.bundle_id != second.manifest.bundle_id
+        assert "Command B transcript." in (
+            second.bundle_dir / "transcript/transcript.md"
+        ).read_text(encoding="utf-8")
+        second_tree = _bundle_tree(second.bundle_dir)
+        rows = state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT * FROM library_bundles ORDER BY bundle_id"
+        ).fetchall()
+        configure("Command A transcript.")
+        replay = run(None if planned_a else command)
+
+        assert replay.bundle_dir == first.bundle_dir
+        selected = state.list_queue()[0]
+        assert selected.bundle_id == first.manifest.bundle_id
+        assert selected.state is QueueState.COMPLETED
+        assert selected.last_error is None
+        assert _bundle_tree(first.bundle_dir) == first_tree
+        assert _bundle_tree(second.bundle_dir) == second_tree
+        assert (
+            state._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT * FROM library_bundles ORDER BY bundle_id"
+            ).fetchall()
+            == rows
+        )
+        assert counter.read_text().splitlines() == ["called"] * (1 if planned_a else 3)
+
+
+@pytest.mark.parametrize("one_shot", [False, True], ids=["queue", "one-shot"])
+def test_generic_collision_text_does_not_authorize_replay(
+    tmp_path: Path, monkeypatch: MonkeyPatch, one_shot: bool
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    calls = 0
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(media, tmp_path / "bundles")
+        queue = state.list_queue()[0]
+        before = _bundle_tree(first.bundle_dir)
+
+        def spoof(
+            prepared: ingest_module.PreparedLocalIngest, output: Path
+        ) -> ingest_module.IngestResult:
+            nonlocal calls
+            calls += 1
+            raise IngestError(f"bundle already exists: {first.bundle_dir}")
+
+        monkeypatch.setattr(ingest_module.PreparedLocalIngest, "ingest", spoof)
+        with pytest.raises(IngestError, match="bundle already exists"):
+            if one_shot:
+                state.ingest_one_shot(media, tmp_path / "bundles", transcriber_command="unused")
+            else:
+                state.approve_queue_item(queue.id)
+                state.ingest_queue_item(
+                    queue.id, tmp_path / "bundles", transcriber_command="unused"
+                )
+        assert calls == 1
+        assert _bundle_tree(first.bundle_dir) == before
+
+
+@pytest.mark.parametrize("one_shot", [False, True], ids=["queue", "one-shot"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "unregistered",
+        "queue",
+        "source",
+        "item",
+        "missing",
+        "manifest-id",
+        "malformed",
+        "missing-manifest",
+        "symlink-manifest",
+    ],
+)
+def test_typed_candidate_refusal_never_falls_back_to_selected_b(
+    tmp_path: Path, monkeypatch: MonkeyPatch, one_shot: bool, damage: str
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    script = _write_transcriber_script(
+        tmp_path / "transcriber.py", json.dumps({"text": "B output"})
+    )
+    calls = 0
+    with open_state(tmp_path / "state.sqlite") as state:
+        first = state.ingest_one_shot(media, tmp_path / "bundles")
+        selected = state.ingest_one_shot(
+            media, tmp_path / "bundles", transcriber_command=f"{sys.executable} {script}"
+        )
+        queue = state.list_queue()[0]
+        foreign = state.ingest_one_shot(
+            copy_fixture(tmp_path / "foreign", "other.wav"), tmp_path / "foreign-bundles"
+        )
+        foreign_row = state.get_library_bundle(foreign.manifest.bundle_id)
+        connection = state._connection  # pyright: ignore[reportPrivateUsage]
+        if damage == "unregistered":
+            connection.execute(
+                "DELETE FROM library_bundles WHERE bundle_id = ?", (first.manifest.bundle_id,)
+            )
+        elif damage in {"queue", "source", "item"}:
+            field, value = {
+                "queue": ("queue_item_id", foreign_row.queue_item_id),
+                "source": ("source_id", foreign_row.source_id),
+                "item": ("source_item_id", foreign_row.source_item_id),
+            }[damage]
+            connection.execute(
+                f"UPDATE library_bundles SET {field} = ? WHERE bundle_id = ?",
+                (value, first.manifest.bundle_id),
+            )
+        elif damage == "missing":
+            first.bundle_dir.rename(tmp_path / "held-a")
+        else:
+            manifest_path = first.bundle_dir / MANIFEST_NAME
+            if damage == "malformed":
+                manifest_path.write_text("{invalid JSON")
+            elif damage == "missing-manifest":
+                manifest_path.unlink()
+            elif damage == "symlink-manifest":
+                external = tmp_path / "external-manifest.json"
+                manifest_path.rename(external)
+                manifest_path.symlink_to(external)
+            else:
+                payload = json.loads(manifest_path.read_text())
+                payload["bundle_id"] = "different-manifest-id"
+                manifest_path.write_text(json.dumps(payload))
+        connection.commit()
+        before = _bundle_tree(tmp_path / "bundles")
+
+        def collide(
+            prepared: ingest_module.PreparedLocalIngest, output: Path
+        ) -> ingest_module.IngestResult:
+            nonlocal calls
+            calls += 1
+            raise ingest_module.BundleExistsError(first.manifest.bundle_id, first.bundle_dir)
+
+        monkeypatch.setattr(ingest_module.PreparedLocalIngest, "ingest", collide)
+        with pytest.raises(ingest_module.BundleExistsError):
+            if one_shot:
+                state.ingest_one_shot(media, tmp_path / "bundles", transcriber_command="unused")
+            else:
+                state.approve_queue_item(queue.id)
+                state.ingest_queue_item(
+                    queue.id, tmp_path / "bundles", transcriber_command="unused"
+                )
+        assert calls == 1
+        assert state.get_queue_item(queue.id).bundle_id == selected.manifest.bundle_id
+        assert _bundle_tree(tmp_path / "bundles") == before
+
+
+@pytest.mark.parametrize("one_shot", [False, True], ids=["queue", "one-shot"])
+def test_collision_returns_registered_root_without_adopting_collision_root(
+    tmp_path: Path, one_shot: bool
+) -> None:
+    media = copy_fixture(tmp_path / "source")
+    script = _write_transcriber_script(
+        tmp_path / "transcriber.py", json.dumps({"text": "Same output"})
+    )
+    command = f"{sys.executable} {script}"
+    with open_state(tmp_path / "state.sqlite") as state:
+        source = state.add_local_folder_source("talks", media.parent)
+        queue = state.scan_source(source.id).queued[0]
+
+        def run(root: Path) -> ingest_module.IngestResult:
+            if one_shot:
+                return state.ingest_one_shot(media, root, transcriber_command=command)
+            state.approve_queue_item(queue.id)
+            return state.ingest_queue_item(queue.id, root, transcriber_command=command)
+
+        first = run(tmp_path / "root1")
+        second = run(tmp_path / "root2")
+        before_first = _bundle_tree(first.bundle_dir)
+        before_second = _bundle_tree(second.bundle_dir)
+        replay = run(tmp_path / "root1")
+        assert replay.bundle_dir == second.bundle_dir != first.bundle_dir
+        assert state.get_library_bundle(first.manifest.bundle_id).bundle_path == str(
+            second.bundle_dir
+        )
+        assert _bundle_tree(first.bundle_dir) == before_first
+        assert _bundle_tree(second.bundle_dir) == before_second

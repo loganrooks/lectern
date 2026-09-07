@@ -46,6 +46,15 @@ class IngestError(RuntimeError):
     """Raised when local ingest cannot complete under current constraints."""
 
 
+class BundleExistsError(IngestError):
+    """The computed output identity already has a destination on disk."""
+
+    def __init__(self, bundle_id: str, bundle_dir: Path) -> None:
+        self.bundle_id = bundle_id
+        self.bundle_dir = bundle_dir
+        super().__init__(f"bundle already exists: {bundle_dir}")
+
+
 @dataclass(frozen=True)
 class IngestResult:
     """Completed ingest run."""
@@ -137,7 +146,7 @@ class PreparedLocalIngest:
             bundle_id = f"{_slug(source.stem)}-{bundle_digest[:12]}"
             bundle_dir = output_root / bundle_id
             if bundle_dir.exists():
-                raise IngestError(f"bundle already exists: {bundle_dir}")
+                raise BundleExistsError(bundle_id, bundle_dir)
 
             manifest = Manifest(
                 bundle_id=bundle_id,

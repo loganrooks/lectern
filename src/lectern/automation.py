@@ -23,6 +23,7 @@ from typing import Any
 
 from lectern.bundle import Manifest
 from lectern.ingest import (
+    BundleExistsError,
     IngestError,
     IngestResult,
     prepare_local_ingest,
@@ -339,22 +340,23 @@ class AutomationState(AutomationStateStore):
                 source_item = self.get_source_item(source_item.id)
                 planned_bundle_id = prepared.planned_bundle_id()
                 if planned_bundle_id is not None:
-                    if planned_bundle_id == queue_item.bundle_id:
-                        completed_result = self._queue_owned_bundle_result(queue_item)
-                        if completed_result is not None:
-                            self._set_queue_state(
-                                queue_item.id,
-                                QueueState.COMPLETED,
-                                bundle_id=planned_bundle_id,
-                                clear_error=True,
-                            )
-                            return self._repaired_replay_result(
-                                completed_result,
-                                source=source,
-                                source_item=source_item,
-                                queue_item_id=queue_item.id,
-                                consent="explicit_queue_approval",
-                            )
+                    completed_result = self._queue_owned_bundle_result(
+                        queue_item, planned_bundle_id
+                    )
+                    if completed_result is not None:
+                        self._set_queue_state(
+                            queue_item.id,
+                            QueueState.COMPLETED,
+                            bundle_id=planned_bundle_id,
+                            clear_error=True,
+                        )
+                        return self._repaired_replay_result(
+                            completed_result,
+                            source=source,
+                            source_item=source_item,
+                            queue_item_id=queue_item.id,
+                            consent="explicit_queue_approval",
+                        )
                     self._ensure_bundle_id_available(planned_bundle_id, queue_item, output_root)
                 result = prepared.ingest(output_root)
                 try:
@@ -366,17 +368,13 @@ class AutomationState(AutomationStateStore):
                 self._record_failed_queue_item(queue_item.id, str(exc))
                 raise
             except (IngestError, OSError) as exc:
-                if (
-                    isinstance(exc, IngestError)
-                    and queue_item.bundle_id is not None
-                    and _bundle_exists_error_matches(exc, queue_item.bundle_id)
-                ):
-                    completed_result = self._queue_owned_bundle_result(queue_item)
+                if isinstance(exc, BundleExistsError):
+                    completed_result = self._queue_owned_bundle_result(queue_item, exc.bundle_id)
                     if completed_result is not None:
                         self._set_queue_state(
                             queue_item.id,
                             QueueState.COMPLETED,
-                            bundle_id=queue_item.bundle_id,
+                            bundle_id=exc.bundle_id,
                             clear_error=True,
                         )
                         return self._repaired_replay_result(
@@ -463,14 +461,15 @@ class AutomationState(AutomationStateStore):
             )
             queue_item = self._ensure_one_shot_queue(source, source_item)
             completed_bundle_id = queue_item.bundle_id
-            if (
-                planned_bundle_id is not None
-                and queue_item.state is QueueState.COMPLETED
-                and completed_bundle_id is not None
-                and completed_bundle_id == planned_bundle_id
-            ):
-                completed_result = self._completed_bundle_result(completed_bundle_id)
+            if planned_bundle_id is not None:
+                completed_result = self._queue_owned_bundle_result(queue_item, planned_bundle_id)
                 if completed_result is not None:
+                    self._set_queue_state(
+                        queue_item.id,
+                        QueueState.COMPLETED,
+                        bundle_id=planned_bundle_id,
+                        clear_error=True,
+                    )
                     return self._repaired_replay_result(
                         completed_result,
                         source=source,
@@ -487,13 +486,15 @@ class AutomationState(AutomationStateStore):
             try:
                 result = prepared.ingest(output_root)
             except (IngestError, OSError) as exc:
-                if (
-                    isinstance(exc, IngestError)
-                    and completed_bundle_id is not None
-                    and _bundle_exists_error_matches(exc, completed_bundle_id)
-                ):
-                    completed_result = self._completed_bundle_result(completed_bundle_id)
+                if isinstance(exc, BundleExistsError):
+                    completed_result = self._queue_owned_bundle_result(queue_item, exc.bundle_id)
                     if completed_result is not None:
+                        self._set_queue_state(
+                            queue_item.id,
+                            QueueState.COMPLETED,
+                            bundle_id=exc.bundle_id,
+                            clear_error=True,
+                        )
                         return self._repaired_replay_result(
                             completed_result,
                             source=source,
@@ -592,35 +593,28 @@ class AutomationState(AutomationStateStore):
             "duplicate-content multi-source provenance is not implemented"
         )
 
-    def _completed_bundle_result(self, bundle_id: str) -> IngestResult | None:
-        try:
-            library_bundle = self.get_library_bundle(bundle_id)
-        except AutomationError:
+    def _queue_owned_bundle_result(
+        self, queue_item: QueueItem, candidate_id: str
+    ) -> IngestResult | None:
+        library_bundle = self._existing_library_bundle(candidate_id)
+        if library_bundle is None:
+            return None
+        if (
+            library_bundle.queue_item_id != queue_item.id
+            or library_bundle.source_id != queue_item.source_id
+            or library_bundle.source_item_id != queue_item.source_item_id
+        ):
             return None
         bundle_dir = Path(library_bundle.bundle_path)
         if not bundle_dir.is_dir():
             return None
-        return IngestResult(
-            bundle_dir=bundle_dir,
-            manifest=Manifest.load(bundle_dir),
-        )
-
-    def _queue_owned_bundle_result(self, queue_item: QueueItem) -> IngestResult | None:
-        if queue_item.bundle_id is None:
-            return None
         try:
-            library_bundle = self.get_library_bundle(queue_item.bundle_id)
-        except AutomationError:
+            manifest = Manifest.load(bundle_dir)
+        except (OSError, ValueError):
             return None
-        if library_bundle.queue_item_id != queue_item.id:
+        if manifest.bundle_id != candidate_id:
             return None
-        bundle_dir = Path(library_bundle.bundle_path)
-        if not bundle_dir.is_dir():
-            return None
-        return IngestResult(
-            bundle_dir=bundle_dir,
-            manifest=Manifest.load(bundle_dir),
-        )
+        return IngestResult(bundle_dir=bundle_dir, manifest=manifest)
 
     def _repaired_replay_result(
         self,
@@ -753,9 +747,3 @@ def state_summary(path: Path) -> dict[str, Any]:
             "queue": len(state.list_queue()),
             "library": len(state.list_library()),
         }
-
-
-def _bundle_exists_error_matches(exc: IngestError, bundle_id: str) -> bool:
-    prefix = "bundle already exists: "
-    message = str(exc)
-    return message.startswith(prefix) and Path(message.removeprefix(prefix)).name == bundle_id
