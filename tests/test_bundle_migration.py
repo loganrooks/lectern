@@ -2216,3 +2216,209 @@ def test_cli_migration_projects_path_bearing_id_without_rewriting_identity(
     before = _tree_state(bundle.parent)
     assert migrations.migrate_bundle(bundle).bundle_id == raw_id
     assert _tree_state(bundle.parent) == before
+
+
+@pytest.mark.parametrize("phase", ["backup", "publication", "forward", "restoration"])
+def test_late_empty_destination_never_replaces_unrelated_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    original = _tree_state(bundle)
+    prepared = prepare_bundle_migration(bundle)
+    if phase in {"forward", "restoration"}:
+        bundle.rename(prepared.backup_dir)
+        if phase == "restoration":
+            shutil.rmtree(prepared.staging_dir)
+    target = prepared.backup_dir if phase == "backup" else bundle
+    real_rename = migrations._rename  # pyright: ignore[reportPrivateUsage]
+    inserted: list[tuple[int, int, int]] = []
+
+    def race(source: Path, destination: Path) -> None:
+        if destination == target and not inserted:
+            destination.mkdir(mode=0o750)
+            record = destination.lstat()
+            inserted.append((record.st_dev, record.st_ino, record.st_mode))
+        real_rename(source, destination)
+
+    monkeypatch.setattr(migrations, "_rename", race)
+    with pytest.raises(MigrationError):
+        migrations.migrate_bundle(bundle)
+    assert len(inserted) == 1
+    record = target.lstat()
+    assert (record.st_dev, record.st_ino, record.st_mode) == inserted[0]
+    assert list(target.iterdir()) == []
+    assert _tree_state(bundle if phase == "backup" else prepared.backup_dir) == original
+    if phase != "restoration":
+        assert (prepared.staging_dir / MARKER_NAME).is_file()
+
+
+@pytest.mark.parametrize("destination_kind", ["absent", "directory", "file", "symlink"])
+def test_native_rename_excludes_existing_unicode_destination(
+    tmp_path: Path, destination_kind: str
+) -> None:
+    source = tmp_path / "原本"
+    destination = tmp_path / "目標"
+    source.mkdir(mode=0o750)
+    (source / "evidence").write_bytes(b"original")
+    if destination_kind == "directory":
+        destination.mkdir(mode=0o700)
+    elif destination_kind == "file":
+        destination.write_bytes(b"unrelated")
+    elif destination_kind == "symlink":
+        destination.symlink_to(tmp_path / "absent")
+    before = _tree_state(tmp_path)
+    identity = source.lstat()
+    if destination_kind == "absent":
+        migrations._rename(source, destination)  # pyright: ignore[reportPrivateUsage]
+        assert not source.exists()
+        after = destination.lstat()
+        assert (after.st_dev, after.st_ino, after.st_mode) == (
+            identity.st_dev,
+            identity.st_ino,
+            identity.st_mode,
+        )
+        assert (destination / "evidence").read_bytes() == b"original"
+    else:
+        occupied = destination.lstat()
+        with pytest.raises(FileExistsError):
+            migrations._rename(source, destination)  # pyright: ignore[reportPrivateUsage]
+        assert _tree_state(tmp_path) == before
+        after = destination.lstat()
+        assert (after.st_dev, after.st_ino, after.st_mode) == (
+            occupied.st_dev,
+            occupied.st_ino,
+            occupied.st_mode,
+        )
+        assert source.lstat().st_ino == identity.st_ino
+
+
+@pytest.mark.parametrize(
+    "platform,symbol,flag", [("darwin", "renameatx_np", 4), ("linux", "renameat2", 1)]
+)
+@pytest.mark.parametrize("error", [0, 17, 13, 38, 22, 45])
+def test_exclusive_rename_abi_errno_and_descriptor_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    symbol: str,
+    flag: int,
+    error: int,
+) -> None:
+    import ctypes
+    import errno
+    from types import SimpleNamespace
+
+    # Use host errno values even when simulating the other platform's ABI.
+    error = {38: errno.ENOSYS, 45: errno.ENOTSUP}.get(error, error)
+    source = tmp_path / "原本"
+    destination = tmp_path / "目標"
+    source.mkdir()
+    calls: list[int] = []
+
+    class Native:
+        argtypes: list[Any] = []
+        restype: Any = None
+
+        def __call__(self, from_fd: int, old: bytes, to_fd: int, new: bytes, flags: int) -> int:
+            assert from_fd == to_fd
+            assert stat.S_ISDIR(os.fstat(from_fd).st_mode)
+            assert (old, new, flags) == (
+                os.fsencode(source.name),
+                os.fsencode(destination.name),
+                flag,
+            )
+            calls.append(from_fd)
+            ctypes.set_errno(error)
+            return -1 if error else 0
+
+    native = Native()
+
+    def load(name: object, *, use_errno: bool) -> Any:
+        assert name is None and use_errno is True
+        return SimpleNamespace(**{symbol: native})
+
+    def no_fallback(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("nonexclusive fallback was invoked")
+
+    monkeypatch.setattr(migrations.sys, "platform", platform)
+    monkeypatch.setattr(ctypes, "CDLL", load)
+    monkeypatch.setattr(os, "rename", no_fallback)
+    monkeypatch.setattr(os, "replace", no_fallback)
+    monkeypatch.setattr(shutil, "copytree", no_fallback)
+    monkeypatch.setattr(shutil, "rmtree", no_fallback)
+    if error:
+        expected = (
+            MigrationError if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP} else OSError
+        )
+        with pytest.raises(expected) as raised:
+            migrations._rename(source, destination)  # pyright: ignore[reportPrivateUsage]
+        assert str(tmp_path) not in str(raised.value)
+        if isinstance(raised.value, OSError):
+            assert raised.value.errno == error
+    else:
+        migrations._rename(source, destination)  # pyright: ignore[reportPrivateUsage]
+    assert native.argtypes == [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    assert native.restype is ctypes.c_int
+    assert len(calls) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(calls[0])
+    assert closed.value.errno == errno.EBADF
+    assert source.is_dir() and not destination.exists()
+
+
+@pytest.mark.parametrize("failure", ["platform", "symbol", "load", "nul", "nonsibling"])
+def test_exclusive_rename_unavailable_or_invalid_never_opens_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    if failure == "nul":
+        destination = tmp_path / "destination\x00truncated"
+    elif failure == "nonsibling":
+        destination = tmp_path / "other" / "destination"
+    loads = 0
+
+    def load(*args: Any, **kwargs: Any) -> Any:
+        nonlocal loads
+        loads += 1
+        if failure == "load":
+            raise OSError("synthetic loader failure")
+        return SimpleNamespace()
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid or unsupported operation reached filesystem mutation")
+
+    monkeypatch.setattr(
+        migrations.sys, "platform", "unsupported" if failure == "platform" else "linux"
+    )
+    monkeypatch.setattr(ctypes, "CDLL", load)
+    monkeypatch.setattr(os, "open", unexpected)
+    monkeypatch.setattr(os, "rename", unexpected)
+    with pytest.raises(MigrationError) as raised:
+        migrations._rename(source, destination)  # pyright: ignore[reportPrivateUsage]
+    assert str(tmp_path) not in str(raised.value)
+    assert loads == (1 if failure in {"symbol", "load"} else 0)
+
+
+def test_current_migration_does_not_load_publication_primitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+
+    def unavailable(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("no-op loaded a publication primitive")
+
+    monkeypatch.setattr(ctypes, "CDLL", unavailable)
+    assert migrations.migrate_bundle(bundle).outcome == "already_current"

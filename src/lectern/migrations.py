@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import copy
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
@@ -669,7 +672,37 @@ def prepare_bundle_migration(bundle_dir: Path) -> PreparedBundleMigration:
 
 
 def _rename(source: Path, destination: Path) -> None:
-    source.rename(destination)
+    """Publish a sibling role without replacing even a late-created destination."""
+    if source.parent != destination.parent or not source.name or not destination.name:
+        raise MigrationError("migration publication requires sibling roles")
+    if "\x00" in str(source) or "\x00" in str(destination):
+        raise MigrationError("migration publication path contains a NUL character")
+    if sys.platform == "darwin":
+        symbol, flag = "renameatx_np", 4  # RENAME_EXCL
+    elif sys.platform == "linux":
+        symbol, flag = "renameat2", 1  # RENAME_NOREPLACE
+    else:
+        raise MigrationError("atomic no-replace publication is unsupported on this platform")
+    try:
+        native = getattr(ctypes.CDLL(None, use_errno=True), symbol)
+    except (AttributeError, OSError) as exc:
+        raise MigrationError("atomic no-replace publication is unavailable") from exc
+    native.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    native.restype = ctypes.c_int
+    parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        result = native(
+            parent_fd, os.fsencode(source.name), parent_fd, os.fsencode(destination.name), flag
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise MigrationError(
+                    "atomic no-replace publication is unsupported by this filesystem"
+                )
+            raise OSError(error, os.strerror(error))
+    finally:
+        os.close(parent_fd)
 
 
 def _rename_to_absent(source: Path, destination: Path, role: str) -> None:

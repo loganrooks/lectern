@@ -70,3 +70,19 @@ Migration result output redacts path-bearing bundle IDs using the existing path
 projection. This display value need not be reversible: the internal result ID,
 on-disk manifest identity and retained backup identity remain unchanged. Ordinary
 bundle IDs are displayed unchanged.
+
+
+Publication and recovery require atomic no-replace directory rename support:
+macOS `renameatx_np` with `RENAME_EXCL`, or Linux `renameat2` with
+`RENAME_NOREPLACE`, on a filesystem supporting the flag. If the platform, native
+interface, kernel or filesystem lacks that capability, migration refuses without
+falling back to an overwriting rename. Already-current validation does not load
+this publication interface. Preparation may already have created owned staging.
+
+A destination that appears after the absence check is preserved, even when it is
+an empty directory. If source publication and restoration are blocked by an
+occupied source role, the original backup and marked staging remain available;
+migration does not remove the conflicting role to restore the source. Follow the
+existing recovery procedure after resolving that unrelated entry. Keep other
+Lectern writers quiescent as required above. This does not protect against hostile
+parent/source replacement or promise network-filesystem or power-loss durability.
