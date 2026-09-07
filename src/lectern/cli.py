@@ -626,6 +626,17 @@ def _queue_usage() -> None:
     )
 
 
+def _plain_search_field(value: str) -> str:
+    """Keep one search field on one terminal row without changing its evidence."""
+
+    return "".join(
+        f"\\u{ord(character):04x}"
+        if ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F or character in "\u2028\u2029"
+        else character
+        for character in value
+    )
+
+
 def _library_search(args: Sequence[str], state_path: Path, json_output: bool) -> int:
     if not args:
         _library_usage()
@@ -655,7 +666,9 @@ def _library_search(args: Sequence[str], state_path: Path, json_output: bool) ->
         if not hits:
             print("no matches")
         for hit in hits:
-            print(f"{hit.bundle_id}\t{hit.segment_id}\t{hit.snippet}")
+            bundle_id = _plain_search_field(hit.bundle_id)
+            snippet = _plain_search_field(hit.snippet)
+            print(f"{bundle_id}\t{hit.segment_id}\t{snippet}")
     return 0
 
 

@@ -291,3 +291,65 @@ def test_literal_search_retrieves_exact_and_casefolded_text(
         query = text.casefold() if fold_query else text
         assert search.text_contains_literal(text, query)
         assert [hit.bundle_id for hit in state.search_segments(query)] == ["changed-fold"]
+
+
+@pytest.mark.parametrize("field", ["snippet", "bundle_id"])
+def test_plain_search_escapes_row_controls_without_changing_evidence(
+    tmp_path: Path, capsys: CaptureFixture[str], field: str
+) -> None:
+    controls = "".join(chr(code) for code in [*range(32), *range(127, 160), 0x2028, 0x2029])
+    multilingual = "日本語 العربية עברית"
+    raw = f"needle{controls}{multilingual}"
+    bundle_id = raw if field == "bundle_id" else "plain-bundle"
+    snippet = raw if field == "snippet" else f"needle {multilingual}"
+    state_path = tmp_path / "state.sqlite"
+    with open_state(state_path) as state:
+        state.index_synthetic_segment(bundle_id, 0, snippet)
+        hit = state.search_segments("needle")[0]
+        assert hit.bundle_id == bundle_id
+        assert hit.snippet == snippet
+
+    args = ["library", "search", "needle", "--state", str(state_path)]
+    assert cli.main(args) == 0
+    plain = capsys.readouterr().out
+    assert len(plain.splitlines()) == 1
+    assert plain.count("\t") == 2
+    rendered_fields = plain.removesuffix("\n").split("\t")
+    rendered = rendered_fields[0 if field == "bundle_id" else 2]
+    assert all(character not in rendered for character in controls)
+    assert multilingual in rendered
+    for escape in (
+        r"\u0000",
+        r"\u0009",
+        r"\u000a",
+        r"\u000d",
+        r"\u001b",
+        r"\u007f",
+        r"\u0085",
+        r"\u009b",
+        r"\u2028",
+        r"\u2029",
+    ):
+        assert escape in rendered
+
+    assert cli.main([*args, "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["bundle_id"] == bundle_id
+    assert result["snippet"] == snippet
+    with open_state(state_path) as state:
+        hit = state.search_segments("needle")[0]
+        assert hit.bundle_id == bundle_id
+        assert hit.snippet == snippet
+
+
+def test_plain_registered_search_without_controls_retains_existing_output(
+    tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    state_path = _archive(tmp_path)
+    with open_state(state_path) as state:
+        hits = state.search_segments("knowledge")
+    assert hits
+    expected = "".join(f"{hit.bundle_id}\t{hit.segment_id}\t{hit.snippet}\n" for hit in hits)
+    capsys.readouterr()
+    assert cli.main(["library", "search", "knowledge", "--state", str(state_path)]) == 0
+    assert capsys.readouterr().out == expected
