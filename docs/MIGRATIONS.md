@@ -65,3 +65,8 @@ Contradictions are refused, not repaired. The generated `metadata.artifacts` map
 need not equal the source document's current selected-artifact pointers. These
 checks establish consistency of retained claims, not historical authenticity or
 transcript faithfulness; the existing source/backup/staging recovery rules apply.
+
+Migration result output redacts path-bearing bundle IDs using the existing path
+projection. This display value need not be reversible: the internal result ID,
+on-disk manifest identity and retained backup identity remain unchanged. Ordinary
+bundle IDs are displayed unchanged.

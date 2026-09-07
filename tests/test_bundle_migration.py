@@ -2175,3 +2175,44 @@ def test_migration_preserves_distinct_original_and_normalized_identity(
         _read_json(bundle / "transcript/metadata.json")["normalized_audio"]
         == metadata["normalized_audio"]
     )
+
+
+@pytest.mark.parametrize(
+    "raw_id",
+    ["/Users/synthetic/private-talk", r"C:\Users\synthetic\private-talk", "ordinary-bundle-id"],
+)
+@pytest.mark.parametrize("mode", ["migrated", "already_current", "recovered"])
+def test_cli_migration_projects_path_bearing_id_without_rewriting_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], raw_id: str, mode: str
+) -> None:
+    from lectern.records import PATH_REDACTED
+
+    bundle = legacy_bundle(tmp_path)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    manifest["bundle_id"] = raw_id
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    legacy_before = _tree_state(bundle)
+    if mode == "already_current":
+        assert migrations.migrate_bundle(bundle).bundle_id == raw_id
+    elif mode == "recovered":
+        prepared = prepare_bundle_migration(bundle)
+        bundle.rename(prepared.backup_dir)
+    capsys.readouterr()
+    assert cli.main(["migrate", str(bundle)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    expected_id = raw_id if raw_id == "ordinary-bundle-id" else PATH_REDACTED
+    assert json.loads(captured.out) == {
+        "bundle_id": expected_id,
+        "source_version": "1.0.0" if mode == "already_current" else "0.1.0",
+        "target_version": "1.0.0",
+        "outcome": mode,
+        "backup_retained": True,
+    }
+    assert Manifest.load(bundle).bundle_id == raw_id
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    assert _tree_state(backup) == legacy_before
+    assert not bundle.with_name(bundle.name + STAGING_SUFFIX).exists()
+    before = _tree_state(bundle.parent)
+    assert migrations.migrate_bundle(bundle).bundle_id == raw_id
+    assert _tree_state(bundle.parent) == before

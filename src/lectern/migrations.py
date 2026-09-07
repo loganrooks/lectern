@@ -72,7 +72,7 @@ class BundleMigrationResult:
 
     def to_public_dict(self) -> dict[str, str | bool]:
         return {
-            "bundle_id": self.bundle_id,
+            "bundle_id": redact_paths(self.bundle_id),
             "source_version": self.source_version,
             "target_version": self.target_version,
             "outcome": self.outcome,
