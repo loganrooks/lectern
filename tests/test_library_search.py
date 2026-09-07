@@ -353,3 +353,18 @@ def test_plain_registered_search_without_controls_retains_existing_output(
     capsys.readouterr()
     assert cli.main(["library", "search", "knowledge", "--state", str(state_path)]) == 0
     assert capsys.readouterr().out == expected
+
+
+@pytest.mark.parametrize("start", [0x3105, 0x31A0, 0x31F0, 0x1AFF0, 0x1B000, 0x1B100, 0x1B150])
+@pytest.mark.parametrize("operator", [False, True], ids=["literal", "operator-refusal"])
+def test_bopomofo_and_kana_block_literal_search(tmp_path: Path, start: int, operator: bool) -> None:
+    text = "".join(chr(start + offset) for offset in range(3))
+    with open_state(tmp_path / "state.sqlite") as state:
+        state.index_synthetic_segment("script-range", 0, text)
+        if operator:
+            with pytest.raises(ValueError, match="operator-mode search does not support"):
+                state.search_segments(f"{text[0]} OR {text[1]}", literal=False)
+        else:
+            assert [(hit.bundle_id, hit.segment_id) for hit in state.search_segments(text[:2])] == [
+                ("script-range", 0)
+            ]

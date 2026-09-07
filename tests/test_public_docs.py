@@ -53,11 +53,13 @@ def test_readme_states_multilingual_search_scope_and_limits() -> None:
     readme = normalized(read_doc("README.md"))
 
     assert "Latin, Greek, Cyrillic, Arabic, and Hebrew" in readme
-    assert "Chinese, Japanese, and Korean" in readme
-    assert "bounded precision" in readme
-    assert "two-character CJK" in readme
-    assert "word-boundary-accurate CJK" in readme
+    assert "bounded character segmentation" in readme
+    assert "Han, kana, Hangul and Bopomofo" in readme
+    assert "not exhaustive support for every language, orthography or Unicode script" in readme
+    assert "Two-character terms can match inside longer runs" in readme
+    assert "substring false positives and no word-boundary accuracy" in readme
     assert "stemming is not provided" in readme
-    assert "operator-mode queries do not support CJK" in readme
+    assert "Operator-mode queries refuse these character ranges" in readme
+    assert "use literal search for them" in readme
     assert "reconciles registered transcript files on each command open" in readme
     assert "literal by default" in readme

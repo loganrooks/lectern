@@ -175,20 +175,25 @@ temporal bounds and ordering. Displayed timestamps truncate to whole seconds
 and retain a negative sign when the recorded time is negative.
 
 Search tokenization separates words on whitespace and punctuation for Latin,
-Greek, Cyrillic, Arabic, and Hebrew, including right-to-left text. Chinese,
-Japanese, and Korean text is indexed and retrievable with bounded precision.
-Current limits include two-character CJK terms, substring false positives
-inside CJK runs, and no word-boundary-accurate CJK search; stemming is not
-provided. The current operator-mode queries do not support CJK; use literal
-search for those scripts. Later search work may add ranking or semantic retrieval; the
-current literal search and citation commands are available now.
+Greek, Cyrillic, Arabic, and Hebrew, including right-to-left text. Literal search
+uses bounded character segmentation for the listed Han, kana, Hangul and Bopomofo
+ranges: CJK unified/compatibility ideographs and their supported extensions;
+Hiragana, Katakana, half-width Katakana, Katakana Phonetic Extensions, Kana
+Supplement, Kana Extended-A/B and Small Kana Extension; Hangul syllables and
+Jamo ranges; and Bopomofo and Bopomofo Extended. This is not exhaustive support
+for every language, orthography or Unicode script. Two-character terms can match
+inside longer runs, with substring false positives and no word-boundary accuracy;
+stemming is not provided. Operator-mode queries refuse these character ranges;
+use literal search for them. Later search work may add ranking or semantic
+retrieval; the current literal search and citation commands are available now.
 
 The [recorded M5a latency datum](docs/benchmarks/m5a-search-latency.json)
 captures one synthetic 1,000-bundle measurement and its conditions; it is not
 a performance guarantee. The state store currently reconciles registered
 transcript files on each command open to keep search results aligned with
-changed or missing bundle content. The datum records that open-path cost
-separately from the SQLite query-only timing.
+changed or missing bundle content. The datum keeps separately labeled historical open/reconcile measurements
+alongside the current SQLite query-only timing; the open-path measurements were
+not rerun for the current segmenter version.
 
 ## Current Limits
 

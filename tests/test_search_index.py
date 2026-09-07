@@ -451,3 +451,45 @@ def test_registered_casefold_search_preserves_evidence_and_rebuilds_old_index(
         if old_signature:
             assert state.index_signature_row()["segmenter_version"] != 8
     assert segments_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize("start", [0x3105, 0x31A0, 0x31F0, 0x1AFF0, 0x1B000, 0x1B100, 0x1B150])
+def test_version_nine_script_index_rebuild_preserves_evidence(tmp_path: Path, start: int) -> None:
+    text = "".join(chr(start + offset) for offset in range(3))
+    state_path, bundle = _ingest(tmp_path)
+    segments_path = bundle / "transcript" / "segments.json"
+    segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    segments[0]["text"] = text
+    segments_path.write_text(json.dumps(segments), encoding="utf-8")
+    payload = segments_path.read_bytes()
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for stage in manifest["stages"].values():
+        for output in stage["outputs"]:
+            if output["path"] == "transcript/segments.json":
+                output["sha256"] = hashlib.sha256(payload).hexdigest()
+                output["bytes"] = len(payload)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with open_state(state_path) as state:
+        before_anchor, before_resolution = state.cite_segment(bundle.name, segments[0]["id"])
+        assert before_resolution.current_text == text
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("UPDATE index_signature SET segmenter_version = 9")
+        connection.execute(
+            "UPDATE segment_index SET literal = ? WHERE bundle_id = ?",
+            (text, bundle.name),
+        )
+        assert connection.execute(
+            "SELECT literal FROM segment_index WHERE bundle_id = ?", (bundle.name,)
+        ).fetchall() == [(text,)]
+    with open_state(state_path) as state:
+        hits = state.search_segments(text[:2])
+        assert [(hit.bundle_id, hit.segment_id) for hit in hits] == [
+            (bundle.name, segments[0]["id"])
+        ]
+        after_anchor, after_resolution = state.cite_segment(bundle.name, segments[0]["id"])
+        assert after_anchor == before_anchor
+        assert after_resolution.current_text == text
+        assert state.resolve_anchor(before_anchor).outcome is search.AnchorResolution.EXACT
+        assert state.index_signature_row() == {"canon_version": 1, "segmenter_version": 10}
+    assert segments_path.read_bytes() == payload
