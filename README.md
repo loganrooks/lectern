@@ -156,7 +156,11 @@ literal by default; pass `--operators` only when you intentionally want SQLite
 FTS operators. When literal query text contains option-like tokens such as
 `--json`, put a standalone `--` before the query.
 `lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns
-an anchor tied to the cited transcript content.
+an anchor tied to the cited transcript content. An `exact` resolution means the
+segment ID and content digest agree; it does not establish that the timestamp is
+within the recording or playable. The separate anchor-correctness sampler checks
+temporal bounds and ordering. Displayed timestamps truncate to whole seconds
+and retain a negative sign when the recorded time is negative.
 
 Search tokenization separates words on whitespace and punctuation for Latin,
 Greek, Cyrillic, Arabic, and Hebrew, including right-to-left text. Chinese,

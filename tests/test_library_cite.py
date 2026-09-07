@@ -339,3 +339,26 @@ def test_diagnostics_retain_changed_evidence_when_new_citations_are_refused(
         assert state.indexed_segment_count(bundle_id=bundle.name) == 0
         with pytest.raises(AutomationError, match="no readable transcript"):
             state.cite_segment(bundle.name, int(changed[0]["id"]))
+
+
+@pytest.mark.parametrize(
+    ("start_s", "expected"),
+    [
+        (-1.5, "[t=-00:01]"),
+        (-0.1, "[t=-00:00]"),
+        (-60.9, "[t=-01:00]"),
+        (-3661.9, "[t=-1:01:01]"),
+        (0.0, "[t=00:00]"),
+        (0.1, "[t=00:00]"),
+        (60.9, "[t=01:00]"),
+        (3661.9, "[t=1:01:01]"),
+    ],
+)
+def test_anchor_rendering_preserves_signed_time_without_changing_identity(
+    start_s: float, expected: str
+) -> None:
+    anchor = search.make_anchor("synthetic-time", 7, start_s, "synthetic evidence")
+    before = anchor.to_dict()
+    assert anchor.rendered() == expected
+    assert anchor.to_dict() == before
+    assert json.loads(json.dumps(anchor.to_dict()))["start_s"] == start_s

@@ -39,6 +39,17 @@ Declared alternate segment paths remain supported. Library readiness, indexing,
 and new citations use this same selected-evidence requirement. Existing-anchor
 diagnostics can still report changed evidence without minting a new citation.
 
+Migration transforms supported machine-location fields; it is not arbitrary
+content anonymization. User-authored transcript text and source labels are
+preserved even when they contain POSIX- or Windows-style paths.
+
+Migration validates target models more strictly than the compatibility reader.
+It can refuse integral floating-point representations such as `12.0` for an
+integer field even when `Manifest.load` accepts `12.0` as the equivalent
+value `12`.
+This also applies to validation of an already-current no-op; refusal preserves
+the original evidence rather than silently rewriting its numeric representation.
+
 To roll back while Lectern is stopped, move the `1.0.0` directory aside and
 rename `BUNDLE.v0.1.0.bak` to the original bundle name. Do not merge files from
 the two schema versions.

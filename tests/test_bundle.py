@@ -190,3 +190,28 @@ def test_atomic_write_temporary_is_restricted_before_content(
     assert observed == [0o600]
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert target.read_text(encoding="utf-8") == '{"a": 1}\n'
+
+
+@pytest.mark.parametrize("raw_bytes", [12, 12.0])
+def test_manifest_load_preserves_integral_local_byte_compatibility(
+    tmp_path: Path, raw_bytes: int | float
+) -> None:
+    path = make_manifest().save(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["source"]["bytes"] = raw_bytes
+    path.write_text(json.dumps(payload))
+    original = path.read_bytes()
+    assert Manifest.load(tmp_path).source.bytes == 12
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("raw_bytes", [12.5, "12", True])
+def test_manifest_load_refuses_fractional_or_coercive_local_bytes(
+    tmp_path: Path, raw_bytes: object
+) -> None:
+    path = make_manifest().save(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["source"]["bytes"] = raw_bytes
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValidationError):
+        Manifest.load(tmp_path)

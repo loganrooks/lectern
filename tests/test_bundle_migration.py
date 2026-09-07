@@ -1946,3 +1946,40 @@ def test_migration_preserves_valid_alternate_selected_evidence_and_registered_re
         assert state.search_segments("synthetic alternate evidence")[0].bundle_id == bundle_id
         _, resolved = state.cite_segment(bundle_id, segment_id)
         assert resolved.current_text == segments[0]["text"]
+
+
+@pytest.mark.parametrize("label", ["/Users/alice/Research Talks", r"C:\Users\Alice\Research Talks"])
+def test_migration_preserves_user_authored_path_shaped_source_labels(
+    tmp_path: Path, label: str
+) -> None:
+    _, bundle, _, _, _ = registered_legacy_bundle(tmp_path)
+    source_path = bundle / "source.json"
+    source = _read_json(source_path)
+    source["provenance"]["source_name"] = label
+    _write_json(source_path, source)
+    _repair_manifest_after_artifact_change(bundle)
+    original = _tree_state(bundle)
+    prepared = prepare_bundle_migration(bundle)
+    assert _read_json(prepared.staging_dir / "source.json")["provenance"]["source_name"] == label
+    assert _tree_state(bundle) == original
+    migrations.migrate_bundle(bundle)
+    assert _read_json(source_path)["provenance"]["source_name"] == label
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    assert _tree_state(backup) == original
+
+
+def test_current_noop_refuses_integral_float_representation_without_rewriting_original(
+    tmp_path: Path,
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    migrations.migrate_bundle(bundle)
+    path = bundle / MANIFEST_NAME
+    manifest = _read_json(path)
+    integer_size = manifest["source"]["bytes"]
+    manifest["source"]["bytes"] = float(integer_size)
+    _write_json(path, manifest)
+    assert Manifest.load(bundle).source.bytes == integer_size
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError, match="current artifact models"):
+        migrations.migrate_bundle(bundle)
+    assert _tree_state(bundle.parent) == before

@@ -212,12 +212,13 @@ class Anchor:
     def rendered(self) -> str:
         """The human-facing form. What is shown, never what is stored."""
 
-        total = max(0, int(self.start_s))
+        sign = "-" if self.start_s < 0 else ""
+        total = int(abs(self.start_s))
         hours, remainder = divmod(total, 3600)
         minutes, seconds = divmod(remainder, 60)
         if hours:
-            return f"[t={hours:d}:{minutes:02d}:{seconds:02d}]"
-        return f"[t={minutes:02d}:{seconds:02d}]"
+            return f"[t={sign}{hours:d}:{minutes:02d}:{seconds:02d}]"
+        return f"[t={sign}{minutes:02d}:{seconds:02d}]"
 
     def to_dict(self) -> dict[str, Any]:
         return {
