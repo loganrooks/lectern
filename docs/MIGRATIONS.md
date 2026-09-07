@@ -53,3 +53,15 @@ the original evidence rather than silently rewriting its numeric representation.
 To roll back while Lectern is stopped, move the `1.0.0` directory aside and
 rename `BUNDLE.v0.1.0.bak` to the original bundle name. Do not merge files from
 the two schema versions.
+
+Transcript metadata must agree with source evidence: `source_media.sha256` must
+match `source.json`'s original-media SHA, and a supplied non-null `source_media.bytes`
+must match its byte size (including an explicit zero). Omitted or null size remains
+valid. Independently, `normalized_audio` must name a contained regular file whose
+SHA and size match its metadata; original and normalized media identities can
+differ. These checks follow the selected metadata path and the named normalized
+artifact, without imposing a fixed filename or new declaration membership.
+Contradictions are refused, not repaired. The generated `metadata.artifacts` map
+need not equal the source document's current selected-artifact pointers. These
+checks establish consistency of retained claims, not historical authenticity or
+transcript faithfulness; the existing source/backup/staging recovery rules apply.

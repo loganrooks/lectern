@@ -2001,3 +2001,149 @@ def test_migration_refuses_nul_artifact_path_without_changing_evidence(
     with pytest.raises(MigrationError):
         migrations.migrate_bundle(bundle)
     assert _tree_state(bundle.parent) == before
+
+
+def _contradict_metadata_identity(bundle: Path, contradiction: str) -> None:
+    path = bundle / "transcript/metadata.json"
+    metadata = _read_json(path)
+    source = _read_json(bundle / "source.json")
+    if contradiction == "source-sha":
+        metadata["source_media"]["sha256"] = "0" * 64
+    elif contradiction == "source-size":
+        metadata["source_media"]["bytes"] = source["bytes"] + 1
+    elif contradiction == "source-zero":
+        metadata["source_media"]["bytes"] = 0
+    elif contradiction == "normalized-sha":
+        metadata["normalized_audio"]["sha256"] = "0" * 64
+    elif contradiction == "normalized-size":
+        metadata["normalized_audio"]["bytes"] += 1
+    else:
+        metadata["normalized_audio"]["path"] = "media/absent.wav"
+    _write_json(path, metadata)
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    _rewrite_manifest_hashes(bundle, manifest)
+    _write_json(bundle / MANIFEST_NAME, manifest)
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [
+        "source-sha",
+        "source-size",
+        "source-zero",
+        "normalized-sha",
+        "normalized-size",
+        "normalized-missing",
+    ],
+)
+@pytest.mark.parametrize(
+    "mode", ["prepare", "direct", "current", "staging", "forward", "current-marker"]
+)
+def test_migration_refuses_metadata_identity_contradictions(
+    tmp_path: Path, contradiction: str, mode: str
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    unrelated = bundle.parent / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "keep").write_bytes(b"unrelated evidence")
+    backup = bundle.with_name(bundle.name + BACKUP_SUFFIX)
+    staging = bundle.with_name(bundle.name + STAGING_SUFFIX)
+    if mode == "current":
+        migrations.migrate_bundle(bundle)
+    if mode in {"staging", "forward", "current-marker"}:
+        prepared = prepare_bundle_migration(bundle)
+        _contradict_metadata_identity(prepared.staging_dir, contradiction)
+    _contradict_metadata_identity(bundle, contradiction)
+    legacy_before = _tree_state(bundle)
+    if mode in {"forward", "current-marker"}:
+        bundle.rename(backup)
+        if mode == "current-marker":
+            staging.rename(bundle)
+    before = _tree_state(bundle.parent)
+    with pytest.raises(MigrationError) as error:
+        (prepare_bundle_migration if mode == "prepare" else migrations.migrate_bundle)(bundle)
+    assert str(tmp_path) not in str(error.value)
+    assert (unrelated / "keep").read_bytes() == b"unrelated evidence"
+    if mode == "forward":
+        assert _tree_state(bundle) == legacy_before
+        assert not backup.exists()
+    elif mode in {"prepare", "direct", "staging"}:
+        assert _tree_state(bundle) == legacy_before
+        assert not staging.exists()
+        assert not backup.exists()
+    else:
+        assert _tree_state(bundle.parent) == before
+
+
+@pytest.mark.parametrize("source_size", ["absent", "null", "matching"])
+@pytest.mark.parametrize("alternate", [False, True])
+def test_migration_metadata_optional_size_and_named_paths(
+    tmp_path: Path, source_size: str, alternate: bool
+) -> None:
+    bundle = legacy_bundle(tmp_path)
+    source = _read_json(bundle / "source.json")
+    metadata = _read_json(bundle / "transcript/metadata.json")
+    if source_size == "absent":
+        metadata["source_media"].pop("bytes", None)
+    else:
+        metadata["source_media"]["bytes"] = None if source_size == "null" else source["bytes"]
+    metadata_path = bundle / "transcript/metadata.json"
+    manifest = _read_json(bundle / MANIFEST_NAME)
+    if alternate:
+        metadata_path = bundle / "transcript/alternate-metadata.json"
+        source["transcript"]["metadata"] = "transcript/alternate-metadata.json"
+        _write_json(bundle / "source.json", source)
+        named_audio = bundle / "media/alternate.wav"
+        named_audio.write_bytes((bundle / metadata["normalized_audio"]["path"]).read_bytes())
+        metadata["normalized_audio"]["path"] = "media/alternate.wav"
+        # Named normalized identity does not add a declaration-membership requirement.
+        manifest["stages"]["transcribe"]["outputs"].append(
+            {"path": "transcript/alternate-metadata.json", "sha256": "0" * 64, "bytes": 0}
+        )
+    _write_json(metadata_path, metadata)
+    _rewrite_manifest_hashes(bundle, manifest)
+    _write_json(bundle / MANIFEST_NAME, manifest)
+    original = _tree_state(bundle)
+    assert migrations.migrate_bundle(bundle).outcome == "migrated"
+    assert _tree_state(bundle.with_name(bundle.name + BACKUP_SUFFIX)) == original
+    current = _read_json(metadata_path)
+    assert current["source_media"].get("bytes") == metadata["source_media"].get("bytes")
+    assert ("bytes" in current["source_media"]) == ("bytes" in metadata["source_media"])
+    assert current["normalized_audio"] == metadata["normalized_audio"]
+    before = _tree_state(bundle)
+    assert migrations.migrate_bundle(bundle).outcome == "already_current"
+    assert _tree_state(bundle) == before
+
+
+@pytest.mark.parametrize("command", [False, True], ids=["sidecar", "command"])
+def test_migration_preserves_distinct_original_and_normalized_identity(
+    tmp_path: Path, command: bool
+) -> None:
+    import wave
+
+    media = tmp_path / "original.wav"
+    with wave.open(str(media), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(8000)
+        audio.writeframes(b"\x00\x00" * 8000)
+    media.with_suffix(".transcript.txt").write_text("Synthetic transcript.")
+    script = tmp_path / "transcriber.py"
+    script.write_text('print(\'{"text": "Synthetic command transcript."}\')\n')
+    bundle = ingest_local(
+        media,
+        tmp_path / "bundles",
+        transcriber_command=f"{sys.executable} {script}" if command else None,
+    ).bundle_dir
+    metadata = _read_json(bundle / "transcript/metadata.json")
+    assert metadata["source_media"]["sha256"] == _digest(media)[0]
+    assert metadata["source_media"]["sha256"] != metadata["normalized_audio"]["sha256"]
+    assert "bytes" not in metadata["source_media"]
+    assert migrations.migrate_bundle(bundle).outcome == "already_current"
+    if not command:
+        _write_legacy_shape(bundle, media)
+        assert migrations.migrate_bundle(bundle).outcome == "migrated"
+    assert (
+        _read_json(bundle / "transcript/metadata.json")["normalized_audio"]
+        == metadata["normalized_audio"]
+    )

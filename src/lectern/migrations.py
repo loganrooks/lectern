@@ -465,7 +465,9 @@ def _validate_target(
         manifest = Manifest.model_validate_json(manifest_text, strict=True)
         evidence = read_selected_evidence(target, manifest, require_manifest_integrity=True)
         source_document = evidence.source
-        TranscriptMetadataDocument.model_validate_json(metadata_text, strict=True)
+        metadata_document = TranscriptMetadataDocument.model_validate_json(
+            metadata_text, strict=True
+        )
     except (OSError, ValueError, RecursionError) as exc:
         raise MigrationError("target does not satisfy current artifact models") from exc
     if manifest.bundle_id != expected_bundle_id:
@@ -474,6 +476,17 @@ def _validate_target(
         raise MigrationError("target manifest and source metadata disagree")
     if source_document.sha256 != source_sha256 or source_document.bytes != source_bytes:
         raise MigrationError("target source identity differs from source evidence")
+    if metadata_document.source_media.sha256 != source_document.sha256 or (
+        metadata_document.source_media.bytes is not None
+        and metadata_document.source_media.bytes != source_document.bytes
+    ):
+        raise MigrationError(
+            "target transcript metadata source identity disagrees with source evidence"
+        )
+    normalized = metadata_document.normalized_audio
+    normalized_digest, normalized_size = _digest(_artifact_path(target, normalized.path))
+    if normalized.sha256 != normalized_digest or normalized.bytes != normalized_size:
+        raise MigrationError("target normalized audio identity disagrees with its named artifact")
     if manifest.source.kind is SourceKind.LOCAL:
         expected_ref = f"sha256:{source_sha256}"
         if manifest.source.ref != expected_ref or manifest.source.bytes != source_bytes:
