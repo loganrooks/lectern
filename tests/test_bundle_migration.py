@@ -2117,9 +2117,18 @@ def test_migration_metadata_optional_size_and_named_paths(
 
 @pytest.mark.parametrize("command", [False, True], ids=["sidecar", "command"])
 def test_migration_preserves_distinct_original_and_normalized_identity(
-    tmp_path: Path, command: bool
+    tmp_path: Path, command: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import wave
+
+    from lectern import ingest as ingest_module
+
+    real_which = shutil.which
+
+    def without_ffmpeg(name: str, *args: Any, **kwargs: Any) -> str | None:
+        return None if name == "ffmpeg" else real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", without_ffmpeg)
 
     media = tmp_path / "original.wav"
     with wave.open(str(media), "wb") as audio:
@@ -2127,6 +2136,22 @@ def test_migration_preserves_distinct_original_and_normalized_identity(
         audio.setsampwidth(2)
         audio.setframerate(8000)
         audio.writeframes(b"\x00\x00" * 8000)
+    original_bytes = media.read_bytes()
+    normalization_calls = 0
+
+    def normalize_synthetic(captured: Path, output: Path) -> None:
+        nonlocal normalization_calls
+        normalization_calls += 1
+        assert captured != media
+        assert captured.read_bytes() == original_bytes
+        assert shutil.which("ffmpeg") is None
+        with wave.open(str(output), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b"\x00\x00" * 16000)
+
+    monkeypatch.setattr(ingest_module, "_normalize_to_canonical_wav", normalize_synthetic)
     media.with_suffix(".transcript.txt").write_text("Synthetic transcript.")
     script = tmp_path / "transcriber.py"
     script.write_text('print(\'{"text": "Synthetic command transcript."}\')\n')
@@ -2135,7 +2160,10 @@ def test_migration_preserves_distinct_original_and_normalized_identity(
         tmp_path / "bundles",
         transcriber_command=f"{sys.executable} {script}" if command else None,
     ).bundle_dir
+    assert normalization_calls == 1
     metadata = _read_json(bundle / "transcript/metadata.json")
+    assert metadata["normalized_audio"]["sha256"] == _digest(bundle / "media/audio.wav")[0]
+    assert metadata["normalized_audio"]["bytes"] == _digest(bundle / "media/audio.wav")[1]
     assert metadata["source_media"]["sha256"] == _digest(media)[0]
     assert metadata["source_media"]["sha256"] != metadata["normalized_audio"]["sha256"]
     assert "bytes" not in metadata["source_media"]
