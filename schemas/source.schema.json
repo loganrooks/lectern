@@ -1,0 +1,332 @@
+{
+  "$defs": {
+    "ContentIdentity": {
+      "additionalProperties": false,
+      "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
+      "properties": {
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "ContentIdentity",
+      "type": "object"
+    },
+    "RemoteServices": {
+      "additionalProperties": false,
+      "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
+      "properties": {
+        "allowed": {
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "lectern_invoked": {
+          "title": "Lectern Invoked",
+          "type": "boolean"
+        },
+        "requires_explicit_per_item_consent": {
+          "title": "Requires Explicit Per Item Consent",
+          "type": "boolean"
+        },
+        "transcriber_network_posture": {
+          "title": "Transcriber Network Posture",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed",
+        "scope",
+        "lectern_invoked",
+        "requires_explicit_per_item_consent",
+        "transcriber_network_posture"
+      ],
+      "title": "RemoteServices",
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "local"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "bytes": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "bytes"
+            ]
+          }
+        }
+      ],
+      "description": "Provenance. `local` sources trigger the privacy hard rule (ADR-0002).",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "ref": {
+          "title": "Ref",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Channel"
+        },
+        "published": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Published"
+        },
+        "duration_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration S"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "SourceKind": {
+      "enum": [
+        "youtube",
+        "local",
+        "url"
+      ],
+      "title": "SourceKind",
+      "type": "string"
+    },
+    "SourceProvenance": {
+      "additionalProperties": false,
+      "description": "The automation record appended to `source.json` on a completed ingest.\n\nAbsent on a bare one-shot ingest and present after queue completion, so it is\noptional here \u2014 but declared, because dropping it on round trip would discard\nthe state schema version, the source and queue identities, the consent record,\nthe policy, and the remote-service posture. Those are exactly the fields a\nlater audit would need and would find missing.",
+      "properties": {
+        "state_schema_version": {
+          "title": "State Schema Version",
+          "type": "integer"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "source_kind": {
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "source_name": {
+          "title": "Source Name",
+          "type": "string"
+        },
+        "source_item_id": {
+          "title": "Source Item Id",
+          "type": "string"
+        },
+        "queue_item_id": {
+          "title": "Queue Item Id",
+          "type": "string"
+        },
+        "queue_state": {
+          "title": "Queue State",
+          "type": "string"
+        },
+        "policy": {
+          "title": "Policy",
+          "type": "string"
+        },
+        "consent": {
+          "title": "Consent",
+          "type": "string"
+        },
+        "remote_services": {
+          "$ref": "#/$defs/RemoteServices"
+        }
+      },
+      "required": [
+        "state_schema_version",
+        "source_id",
+        "source_kind",
+        "source_name",
+        "source_item_id",
+        "queue_item_id",
+        "queue_state",
+        "policy",
+        "consent",
+        "remote_services"
+      ],
+      "title": "SourceProvenance",
+      "type": "object"
+    },
+    "TranscriptPointer": {
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "title": "Method",
+          "type": "string"
+        },
+        "metadata": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Metadata",
+          "type": "string"
+        },
+        "segments": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Segments",
+          "type": "string"
+        },
+        "transcript": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Transcript",
+          "type": "string"
+        },
+        "evidence_limit": {
+          "title": "Evidence Limit",
+          "type": "string"
+        },
+        "remote_services": {
+          "$ref": "#/$defs/RemoteServices"
+        }
+      },
+      "required": [
+        "method",
+        "metadata",
+        "segments",
+        "transcript",
+        "evidence_limit",
+        "remote_services"
+      ],
+      "title": "TranscriptPointer",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`source.json`.",
+  "properties": {
+    "source": {
+      "$ref": "#/$defs/Source"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sha256",
+      "type": "string"
+    },
+    "bytes": {
+      "minimum": 0,
+      "title": "Bytes",
+      "type": "integer"
+    },
+    "transcript": {
+      "$ref": "#/$defs/TranscriptPointer"
+    },
+    "transcript_sidecar": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceProvenance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "source",
+    "sha256",
+    "bytes",
+    "transcript"
+  ],
+  "title": "SourceDocument",
+  "type": "object"
+}

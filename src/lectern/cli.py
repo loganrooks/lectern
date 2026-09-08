@@ -23,15 +23,43 @@ from lectern.automation import (
     preflight_state_store,
     preflight_youtube_playlist,
 )
-from lectern.bundle import export_json_schema
+from lectern.bundle import Manifest, export_artifact_schemas, export_json_schema
 from lectern.ingest import IngestError
+from lectern.migrations import MigrationError, migrate_bundle
+from lectern.records import redact_paths
+
+# Commands that return stored data to a caller, and therefore must emit no
+# filesystem path in either rendering.
+#
+# This tuple is the CLI's own declaration of its outward surface, and it exists
+# to be compared against the path-projection tests. Without it, that coverage is
+# an allowlist of the commands someone thought of, and a command added later
+# inherits no assertion at all — which is how four commands came to be returning
+# absolute paths under a design that claimed none did.
+#
+# Commands that only accept input (`sources add-folder`), report on a path the
+# caller just supplied (`doctor`, `sources preflight`), or write a file the
+# caller named (`schema export`, `ingest`) are deliberately absent: they
+# disclose nothing the caller did not already type.
+OUTWARD_COMMANDS = (
+    "sources list",
+    "sources scan",
+    "queue list",
+    "queue show",
+    "library list",
+    "library show",
+    "library search",
+    "library cite",
+    "migrate",
+)
 
 USAGE = """usage: lectern [--version] <command>
 
 commands:
   doctor         check required local tools and state-store access
   ingest         ingest local media into a bundle
-  library        list or show ingested bundles from local state
+  library        list, search, or cite ingested bundles from local state
+  migrate        migrate one bundle to the current manifest schema
   queue          inspect and update discovery queue items
   schema export  print or write the manifest JSON Schema
   sources        manage local source registry and scans
@@ -66,6 +94,16 @@ def _doctor() -> int:
 
 
 def _export_schema(args: Sequence[str]) -> int:
+    if len(args) == 2 and args[0] == "--all-into":
+        # Every artifact type, not only the manifest. Written as a directory
+        # because "schemas for every written artifact type" is a set, and
+        # exporting them one at a time invites the set to fall out of date.
+        directory = Path(args[1])
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, schema_text in export_artifact_schemas().items():
+            (directory / f"{name}.schema.json").write_text(schema_text, encoding="utf-8")
+        print(f"wrote {len(export_artifact_schemas())} schemas to {directory}")
+        return 0
     schema = export_json_schema()
     if not args:
         print(schema, end="")
@@ -76,7 +114,10 @@ def _export_schema(args: Sequence[str]) -> int:
         output.write_text(schema, encoding="utf-8")
         print(f"wrote {output}")
         return 0
-    print("usage: lectern schema export [--output PATH]", file=sys.stderr)
+    print(
+        "usage: lectern schema export [--output PATH | --all-into DIR]",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -168,10 +209,10 @@ def _sources(args: Sequence[str]) -> int:
         if command == "preflight-youtube":
             return _sources_preflight_youtube(rest, json_output)
     except AutomationError as exc:
-        print(f"sources: {exc}", file=sys.stderr)
+        print(f"sources: {redact_paths(str(exc))}", file=sys.stderr)
         return 3
     except OSError as exc:
-        print(f"sources: {exc}", file=sys.stderr)
+        print(f"sources: {redact_paths(str(exc))}", file=sys.stderr)
         return 1
     _sources_usage()
     return 2
@@ -198,7 +239,7 @@ def _sources_add_folder(args: Sequence[str], state_path: Path, json_output: bool
     if json_output:
         _print_json(source.to_dict())
     else:
-        print(f"{source.id}\t{source.policy.value}\t{source.root_path}")
+        print(f"{source.id}\t{source.policy.value}\t{source.name}")
     return 0
 
 
@@ -223,7 +264,7 @@ def _sources_add_youtube_playlist(args: Sequence[str], state_path: Path, json_ou
     if json_output:
         _print_json(source.to_dict())
     else:
-        print(f"{source.id}\t{source.policy.value}\t{source.root_path}")
+        print(f"{source.id}\t{source.policy.value}\t{source.name}")
     return 0
 
 
@@ -237,7 +278,7 @@ def _sources_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
         _print_json({"sources": [source.to_dict() for source in sources]})
     else:
         for source in sources:
-            print(f"{source.id}\t{source.name}\t{source.policy.value}\t{source.root_path}")
+            print(f"{source.id}\t{source.name}\t{source.policy.value}")
     return 0
 
 
@@ -483,11 +524,15 @@ def _library(args: Sequence[str]) -> int:
             return _library_list(rest, state_path, json_output)
         if command == "show":
             return _library_show(rest, state_path, json_output)
+        if command == "search":
+            return _library_search(rest, state_path, json_output)
+        if command == "cite":
+            return _library_cite(rest, state_path, json_output)
     except AutomationError as exc:
-        print(f"library: {exc}", file=sys.stderr)
+        print(f"library: {redact_paths(str(exc))}", file=sys.stderr)
         return 3
     except OSError as exc:
-        print(f"library: {exc}", file=sys.stderr)
+        print(f"library: {redact_paths(str(exc))}", file=sys.stderr)
         return 1
     _library_usage()
     return 2
@@ -503,7 +548,7 @@ def _library_list(args: Sequence[str], state_path: Path, json_output: bool) -> i
         _print_json({"bundles": [bundle.to_dict() for bundle in bundles]})
     else:
         for bundle in bundles:
-            print(f"{bundle.bundle_id}\t{bundle.bundle_path}")
+            print(f"{bundle.bundle_id}\t{bundle.created_at}\t{bundle.status.value}")
     return 0
 
 
@@ -513,15 +558,15 @@ def _library_show(args: Sequence[str], state_path: Path, json_output: bool) -> i
         return 2
     with open_state(state_path) as state:
         bundle = state.get_library_bundle(args[0])
-    manifest = {}
-    manifest_path = Path(bundle.bundle_path) / "manifest.json"
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = Manifest.load(Path(bundle.bundle_path)).model_dump(mode="json")
+    except (ValueError, RecursionError) as exc:
+        raise AutomationError(str(exc)) from exc
     payload = {"bundle": bundle.to_dict(), "manifest": manifest}
     if json_output:
         _print_json(payload)
     else:
-        print(f"{bundle.bundle_id}\t{bundle.bundle_path}")
+        print(f"{bundle.bundle_id}\t{bundle.created_at}\t{bundle.status.value}")
     return 0
 
 
@@ -532,6 +577,9 @@ def _parse_common(args: Sequence[str]) -> tuple[list[str], Path, bool]:
     index = 0
     while index < len(args):
         token = args[index]
+        if token == "--":
+            rest.extend(args[index:])
+            break
         if token == "--state" and index + 1 < len(args):
             state_path = Path(args[index + 1])
             index += 2
@@ -578,8 +626,97 @@ def _queue_usage() -> None:
     )
 
 
+def _plain_search_field(value: str) -> str:
+    """Keep one search field on one terminal row without changing its evidence."""
+
+    return "".join(
+        f"\\u{ord(character):04x}"
+        if ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F or character in "\u2028\u2029"
+        else character
+        for character in value
+    )
+
+
+def _library_search(args: Sequence[str], state_path: Path, json_output: bool) -> int:
+    if not args:
+        _library_usage()
+        return 2
+    rest = list(args)
+    option_terminated = "--" in rest
+    if option_terminated:
+        terminator = rest.index("--")
+        rest = [*rest[:terminator], *rest[terminator + 1 :]]
+    literal = True
+    if not option_terminated and rest and rest[-1] == "--operators":
+        literal = False
+        rest = rest[:-1]
+    query = " ".join(rest)
+    with open_state(state_path) as state:
+        try:
+            hits = state.search_segments(query, literal=literal)
+        except ValueError as exc:
+            print(f"library: {exc}", file=sys.stderr)
+            return 2
+    if json_output:
+        _print_json({"results": [hit.to_dict() for hit in hits]})
+    else:
+        # No results is an answer, not an error. Saying so explicitly keeps
+        # "nothing found" distinguishable from "search is broken", which silence
+        # would not.
+        if not hits:
+            print("no matches")
+        for hit in hits:
+            bundle_id = _plain_search_field(hit.bundle_id)
+            snippet = _plain_search_field(hit.snippet)
+            print(f"{bundle_id}\t{hit.segment_id}\t{snippet}")
+    return 0
+
+
+def _library_cite(args: Sequence[str], state_path: Path, json_output: bool) -> int:
+    if len(args) != 2:
+        _library_usage()
+        return 2
+    try:
+        segment_id = int(args[1])
+    except ValueError:
+        print("library: SEGMENT_ID must be an integer", file=sys.stderr)
+        return 2
+    with open_state(state_path) as state:
+        anchor, resolved = state.cite_segment(args[0], segment_id)
+    if json_output:
+        _print_json(
+            {
+                "rendered": anchor.rendered(),
+                "anchor": anchor.to_dict(),
+                "outcome": resolved.outcome.value,
+                "resolution": resolved.to_dict(),
+            }
+        )
+    else:
+        serialized_anchor = json.dumps(anchor.to_dict(), sort_keys=True, separators=(",", ":"))
+        print(f"{anchor.rendered()}\t{serialized_anchor}\t{resolved.outcome.value}")
+    return 0
+
+
 def _library_usage() -> None:
-    print("usage: lectern library {list|show BUNDLE_ID} [--state PATH] [--json]", file=sys.stderr)
+    print(
+        "usage: lectern library {list|show BUNDLE_ID|search [--] QUERY [--operators]|"
+        "cite BUNDLE_ID SEGMENT_ID} [--state PATH] [--json]",
+        file=sys.stderr,
+    )
+
+
+def _migrate_bundle(args: Sequence[str]) -> int:
+    if len(args) != 1 or args[0].startswith("-"):
+        print("usage: lectern migrate BUNDLE", file=sys.stderr)
+        return 2
+    try:
+        result = migrate_bundle(Path(args[0]))
+    except MigrationError as exc:
+        print(f"migrate: {exc}", file=sys.stderr)
+        return 3
+    _print_json(result.to_public_dict())
+    return 0
 
 
 def _usage() -> None:
@@ -596,6 +733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _doctor()
         if args and args[0] == "ingest":
             return _ingest(args[1:])
+        if args and args[0] == "migrate":
+            return _migrate_bundle(args[1:])
         if args and args[0] == "library":
             return _library(args[1:])
         if args and args[0] == "queue":

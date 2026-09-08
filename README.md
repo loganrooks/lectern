@@ -92,6 +92,14 @@ providers, and does not claim transcript faithfulness. A user-supplied command
 runs with the user's privileges; Lectern cannot prove that command never opens a
 network connection.
 
+Before planning or processing, Lectern captures a private temporary media copy
+and the sidecar bytes, if present. Queued ingest checks those captured inputs
+against the existing approval before normalization or transcription; planning,
+replay selection, and processing use the same capture. Approval still covers a
+present sidecar when an explicit command supplies the transcript instead.
+This binds the input Lectern supplies, not the behavior or faithfulness of an
+arbitrary user command. It does not authenticate previously generated bundles.
+
 Lectern also has an early local automation spine for folder sources. It records
 source and queue state in local SQLite, scans local folders without network
 access, requires explicit queue approval before ingesting a discovered item, and
@@ -106,7 +114,16 @@ uv run lectern queue ingest <queue-item-id>
 uv run lectern library list
 ```
 
+Plain `library list` and `library show <bundle-id>` rows contain three tab-separated
+fields: bundle ID, creation time, and status (`ready`, `incomplete`, `failed`, or
+`needs-reprocessing`).
+
 Use `--json` on source, queue, and library commands for machine-readable output.
+
+A failed ingest rerun still reports its invocation error, but retains the prior
+completion when that exact owned, registered bundle survives. Readiness remains
+separately derived from current evidence. Queue state is not a complete history
+of every invocation.
 The state database is local run state under `.lectern/` by default and should not
 be committed.
 
@@ -149,20 +166,54 @@ item in the terminal `unsupported` state with an explanatory error, and
 through a failure that can never succeed. Use `queue list --queue-state
 unsupported` to inspect them.
 
+## Search and citations
+
+`lectern library search QUERY --state PATH` searches transcript segments and is
+literal by default; pass `--operators` only when you intentionally want SQLite
+FTS operators. When literal query text contains option-like tokens such as
+`--json`, put a standalone `--` before the query.
+`lectern library cite BUNDLE_ID SEGMENT_ID --state PATH` returns
+an anchor tied to the cited transcript content. An `exact` resolution means the
+segment ID and content digest agree; it does not establish that the timestamp is
+within the recording or playable. The separate anchor-correctness sampler checks
+temporal bounds and ordering. Displayed timestamps truncate to whole seconds
+and retain a negative sign when the recorded time is negative.
+
+Search tokenization separates words on whitespace and punctuation for Latin,
+Greek, Cyrillic, Arabic, and Hebrew, including right-to-left text. Literal search
+uses bounded character segmentation for the listed Han, kana, Hangul and Bopomofo
+ranges: CJK unified/compatibility ideographs and their supported extensions;
+Hiragana, Katakana, half-width Katakana, Katakana Phonetic Extensions, Kana
+Supplement, Kana Extended-A/B and Small Kana Extension; Hangul syllables and
+Jamo ranges; and Bopomofo and Bopomofo Extended. This is not exhaustive support
+for every language, orthography or Unicode script. Two-character terms can match
+inside longer runs, with substring false positives and no word-boundary accuracy;
+stemming is not provided. Operator-mode queries refuse these character ranges;
+use literal search for them. Later search work may add ranking or semantic
+retrieval; the current literal search and citation commands are available now.
+
+The [recorded M5a latency datum](docs/benchmarks/m5a-search-latency.json)
+captures one synthetic 1,000-bundle measurement and its conditions; it is not
+a performance guarantee. The state store currently reconciles registered
+transcript files on each command open to keep search results aligned with
+changed or missing bundle content. The datum keeps separately labeled historical open/reconcile measurements
+alongside the current SQLite query-only timing; the open-path measurements were
+not rerun for the current segmenter version.
+
 ## Current Limits
 
 - YouTube support is limited to public-playlist metadata discovery through an
   API key. OAuth/private playlist access is not implemented.
 - Lectern does not download media, captions, or transcripts from external
   services.
-- MCP/API access, richer search, visual evidence, OCR, reference resolution, and
+- MCP/API access, ranked or semantic search, visual evidence, OCR, reference resolution, and
   citation-gated synthesis are later roadmap items.
 - The local command transcriber path is an integration point, not a bundled ASR
   engine or transcript-quality guarantee.
 - Local bundles can contain sensitive media-derived artifacts. Keep them out of
   commits and issue reports.
 - Bundle manifest compatibility is tied to the manifest `schema_version`. The
-  current manifest schema version is `0.1.0`; pre-release compatibility policy
+  current manifest schema version is `1.0.0`; pre-release compatibility policy
   is described in [SUPPORT.md](SUPPORT.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security
@@ -172,6 +223,7 @@ and privacy reporting guidance is in [SECURITY.md](SECURITY.md).
 
 - [Design](docs/DESIGN.md)
 - [Grey Areas](docs/GREY_AREAS.md)
+- [Bundle migrations](docs/MIGRATIONS.md)
 - [Privacy](PRIVACY.md)
 - [Roadmap](ROADMAP.md)
 - [Support and compatibility](SUPPORT.md)
