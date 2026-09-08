@@ -5,6 +5,25 @@ versioned release notes will become stricter once preview support stabilizes.
 
 ## Unreleased
 
+- Bound local planning and processing to a private captured input, checked
+  against existing queue approval before processing. Preserved existing source
+  identities, sidecar consent coverage, replay behavior, and original-media
+  mutation refusal.
+
+- Aligned migration, library readiness, indexing, and new citations on strict
+  manifest-backed source and selected-transcript evidence. Missing or
+  contradictory declarations are refused while existing-anchor diagnostics
+  retain their changed-evidence outcomes.
+
+- Established nonblank transcript segment validity in the pre-release `1.0.0`
+  contract, with matching runtime and exported schema constraints. Migration
+  rejects blank evidence without changing the original bundle; valid text is
+  preserved exactly. Registered readers remove invalid documents from retrieval
+  and refuse new citations.
+
+- Changed local manifest `source.ref` from a filesystem path to a content
+  identity, raised the manifest schema to `1.0.0`, and added the explicit
+  `lectern migrate BUNDLE` procedure with a retained `0.1.0` backup.
 - Added local command transcription support for media without a transcript
   sidecar.
 - Added transcript method metadata, timestamped transcript artifacts, and
@@ -28,4 +47,4 @@ The package version and bundle manifest schema version are separate.
   and agents.
 
 The current package version is `0.0.1`. The current manifest schema version is
-`0.1.0`.
+`1.0.0`.

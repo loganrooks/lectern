@@ -42,6 +42,25 @@ records that Lectern itself did not invoke a remote service. It cannot prove tha
 an arbitrary executable never opens a network connection internally. Use only
 transcriber commands you trust for the media being processed.
 
+## Temporary Input Capture
+
+Local ingestion makes one private temporary media copy and captures any sidecar
+bytes before processing. Queue ingestion verifies their existing combined
+approval digest before exposing the captured input to normalization or a local
+transcriber. One-shot registration uses the captured content identity, while
+registry locations still refer to the original files. A present sidecar remains
+part of approval even when a command does not use it.
+
+The raw media copy uses restrictive file and directory permissions and is kept
+outside published bundles. It requires additional temporary disk space roughly
+equal to the media size, alongside normal bundle staging; sidecar bytes are held
+in memory. Captures are removed on normal completion, errors, and Python
+interruptions such as KeyboardInterrupt. Forced process termination or power
+loss can leave temporary files behind. This is not isolation from hostile
+processes running as the same user or a guarantee about an arbitrary command's
+other file accesses. The existing final original-media check still refuses publication when its
+digest or size at that check differs from the captured input.
+
 ## Local Artifacts
 
 Generated bundles, local state databases, caches, and media-derived outputs can

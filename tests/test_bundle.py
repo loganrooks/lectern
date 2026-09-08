@@ -1,10 +1,12 @@
 """Bundle schema seed tests: round-trip and schema export (M0 acceptance basis)."""
 
+import json
 import os
 import stat
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from pytest import MonkeyPatch
 
 from lectern.bundle import (
@@ -18,14 +20,91 @@ from lectern.bundle import (
     StageState,
     atomic_write_text,
     export_json_schema,
+    schema_version_is_compatible,
 )
+
+CONTENT_DIGEST = "a" * 64
 
 
 def make_manifest() -> Manifest:
     return Manifest(
         bundle_id="test-0001",
-        source=Source(kind=SourceKind.LOCAL, ref="/tmp/talk.wav", title="Fixture Talk"),
+        source=Source(
+            kind=SourceKind.LOCAL,
+            ref=f"sha256:{CONTENT_DIGEST}",
+            bytes=12,
+            title="Fixture Talk",
+        ),
     )
+
+
+def test_manifest_schema_is_one_zero() -> None:
+    assert SCHEMA_VERSION == "1.0.0"
+
+
+@pytest.mark.parametrize("version", ["0.1.0", "1.0.1", "1.1.0", "2.0.0", "1", "garbage"])
+def test_manifest_schema_compatibility_requires_the_exact_version(version: str) -> None:
+    assert not schema_version_is_compatible(version)
+
+
+def test_manifest_schema_compatibility_accepts_the_current_version() -> None:
+    assert schema_version_is_compatible(SCHEMA_VERSION)
+
+
+def test_manifest_load_refuses_a_later_minor_before_artifact_validation(tmp_path: Path) -> None:
+    manifest = make_manifest()
+    path = manifest.save(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "1.1.0"
+    payload["optional_1_1_field"] = "unknown to the 1.0.0 model"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported bundle schema version '1.1.0'"):
+        Manifest.load(tmp_path)
+
+
+def test_local_source_requires_content_identity_and_size() -> None:
+    with pytest.raises(ValidationError, match="content identity"):
+        Source(kind=SourceKind.LOCAL, ref="/tmp/talk.wav", bytes=12)
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}")
+
+
+def test_local_source_accepts_content_identity() -> None:
+    source = Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}", bytes=12)
+    assert source.ref == f"sha256:{CONTENT_DIGEST}"
+
+
+def test_local_source_rejects_a_negative_size() -> None:
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source(kind=SourceKind.LOCAL, ref=f"sha256:{CONTENT_DIGEST}", bytes=-1)
+
+
+@pytest.mark.parametrize("raw_bytes", ["12", True])
+def test_local_source_rejects_coercive_byte_values(raw_bytes: object) -> None:
+    with pytest.raises(ValidationError, match="source byte size"):
+        Source.model_validate(
+            {
+                "kind": SourceKind.LOCAL,
+                "ref": f"sha256:{CONTENT_DIGEST}",
+                "bytes": raw_bytes,
+            }
+        )
+
+
+@pytest.mark.parametrize("kind", [SourceKind.YOUTUBE, SourceKind.URL])
+def test_non_local_source_preserves_negative_bytes(kind: SourceKind) -> None:
+    source = Source(kind=kind, ref="remote-id", bytes=-1)
+    assert source.bytes == -1
+
+
+@pytest.mark.parametrize(("raw_bytes", "expected"), [("12", 12), (True, 1)])
+@pytest.mark.parametrize("kind", [SourceKind.YOUTUBE, SourceKind.URL])
+def test_non_local_source_preserves_coercive_bytes(
+    kind: SourceKind, raw_bytes: object, expected: int
+) -> None:
+    source = Source.model_validate({"kind": kind, "ref": "remote-id", "bytes": raw_bytes})
+    assert source.bytes == expected
 
 
 def test_manifest_round_trip(tmp_path: Path) -> None:
@@ -111,3 +190,28 @@ def test_atomic_write_temporary_is_restricted_before_content(
     assert observed == [0o600]
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert target.read_text(encoding="utf-8") == '{"a": 1}\n'
+
+
+@pytest.mark.parametrize("raw_bytes", [12, 12.0])
+def test_manifest_load_preserves_integral_local_byte_compatibility(
+    tmp_path: Path, raw_bytes: int | float
+) -> None:
+    path = make_manifest().save(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["source"]["bytes"] = raw_bytes
+    path.write_text(json.dumps(payload))
+    original = path.read_bytes()
+    assert Manifest.load(tmp_path).source.bytes == 12
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("raw_bytes", [12.5, "12", True])
+def test_manifest_load_refuses_fractional_or_coercive_local_bytes(
+    tmp_path: Path, raw_bytes: object
+) -> None:
+    path = make_manifest().save(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["source"]["bytes"] = raw_bytes
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValidationError):
+        Manifest.load(tmp_path)

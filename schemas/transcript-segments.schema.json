@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "TranscriptSegmentRecord": {
+      "additionalProperties": false,
+      "description": "One row of `transcript/segments.json`, the unit a citation anchors to.",
+      "properties": {
+        "id": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Id",
+          "type": "integer"
+        },
+        "start_s": {
+          "title": "Start S",
+          "type": "number"
+        },
+        "end_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End S"
+        },
+        "text": {
+          "pattern": "[^\\u0009-\\u000d\\u001c-\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]",
+          "title": "Text",
+          "type": "string"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "start_s",
+        "text",
+        "source"
+      ],
+      "title": "TranscriptSegmentRecord",
+      "type": "object"
+    }
+  },
+  "description": "`transcript/segments.json`, which is written as an ARRAY.\n\nExporting the element model gave the committed schema an object root, so\nvalidating a real artifact against it failed immediately. A round-trip test\nover elements cannot catch that: it exercises the model and never the\nartifact.",
+  "items": {
+    "$ref": "#/$defs/TranscriptSegmentRecord"
+  },
+  "minItems": 1,
+  "title": "TranscriptSegmentsDocument",
+  "type": "array",
+  "x-lectern-uniqueBy": "id"
+}

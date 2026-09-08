@@ -1,0 +1,296 @@
+{
+  "$defs": {
+    "ContentIdentity": {
+      "additionalProperties": false,
+      "description": "Digest and size, with no field for a location.\n\nThe absence is the design: after LW-11 a bundle records what its media was,\nnot where it sat, and a schema that still admitted a path would leave the\ndoor open for one to reappear.",
+      "properties": {
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "ContentIdentity",
+      "type": "object"
+    },
+    "NormalizedAudio": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "minimum": 0,
+          "title": "Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "title": "NormalizedAudio",
+      "type": "object"
+    },
+    "RemoteServices": {
+      "additionalProperties": false,
+      "description": "The network posture recorded alongside a transcript.\n\nModelled rather than left as free-form JSON because it is the field a\nprivacy review reads first, and an unmodelled field is one no schema\nconstrains.",
+      "properties": {
+        "allowed": {
+          "title": "Allowed",
+          "type": "boolean"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "lectern_invoked": {
+          "title": "Lectern Invoked",
+          "type": "boolean"
+        },
+        "requires_explicit_per_item_consent": {
+          "title": "Requires Explicit Per Item Consent",
+          "type": "boolean"
+        },
+        "transcriber_network_posture": {
+          "title": "Transcriber Network Posture",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed",
+        "scope",
+        "lectern_invoked",
+        "requires_explicit_per_item_consent",
+        "transcriber_network_posture"
+      ],
+      "title": "RemoteServices",
+      "type": "object"
+    },
+    "SchemaContract": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_schema_versioned": {
+          "title": "Manifest Schema Versioned",
+          "type": "boolean"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest_schema_versioned",
+        "note"
+      ],
+      "title": "SchemaContract",
+      "type": "object"
+    },
+    "TranscriptArtifacts": {
+      "additionalProperties": false,
+      "properties": {
+        "segments": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Segments",
+          "type": "string"
+        },
+        "transcript": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Transcript",
+          "type": "string"
+        },
+        "summary": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "segments",
+        "transcript",
+        "summary"
+      ],
+      "title": "TranscriptArtifacts",
+      "type": "object"
+    },
+    "TranscriptBackend": {
+      "additionalProperties": false,
+      "description": "How the transcript was produced.\n\nThe `local_command` fields are declared rather than tolerated: pydantic\nignores unknown keys, so a model that omitted them silently discarded the\nidentity of the command that produced the transcript on every round trip,\nand generated-schema consumers were never told the fields exist. Provenance\nthat only survives when nobody reads it is not provenance.",
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "argv0": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Argv0"
+        },
+        "command_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command Sha256"
+        },
+        "argv_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Argv Sha256"
+        },
+        "input_argument_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Input Argument Mode"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout S"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "TranscriptBackend",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`transcript/metadata.json`.",
+  "properties": {
+    "schema": {
+      "title": "Schema",
+      "type": "string"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "method": {
+      "title": "Method",
+      "type": "string"
+    },
+    "backend": {
+      "$ref": "#/$defs/TranscriptBackend"
+    },
+    "remote_services": {
+      "$ref": "#/$defs/RemoteServices"
+    },
+    "evidence_limit": {
+      "title": "Evidence Limit",
+      "type": "string"
+    },
+    "source_media": {
+      "$ref": "#/$defs/ContentIdentity"
+    },
+    "normalized_audio": {
+      "$ref": "#/$defs/NormalizedAudio"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/TranscriptArtifacts"
+    },
+    "schema_contract": {
+      "$ref": "#/$defs/SchemaContract"
+    }
+  },
+  "required": [
+    "schema",
+    "generated_at",
+    "method",
+    "backend",
+    "remote_services",
+    "evidence_limit",
+    "source_media",
+    "normalized_audio",
+    "artifacts",
+    "schema_contract"
+  ],
+  "title": "TranscriptMetadataDocument",
+  "type": "object"
+}

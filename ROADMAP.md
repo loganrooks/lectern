@@ -22,7 +22,7 @@ Its bounded surface includes:
 - An optional local JSON transcriber command for media without a transcript
   sidecar.
 - Local folder source registration, discovery and review queues, a local SQLite
-  state store, and library list/show/status commands.
+  state store, and library `list`/`show` commands with status information.
 - Literal local transcript search, content-bound citation anchors, and
   reconciliation against changed or missing bundle evidence.
 - Metadata-only public YouTube playlist discovery through the local source

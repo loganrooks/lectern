@@ -1,17 +1,21 @@
 {
   "$defs": {
     "ArtifactRef": {
+      "additionalProperties": false,
       "description": "A produced file, content-addressed for idempotence checks.",
       "properties": {
         "path": {
+          "pattern": "^(?![A-Za-z]:)(?![\\s\\S]*\\u0000)(?![\\s\\S]*\\\\)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
           "title": "Path",
           "type": "string"
         },
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
         },
         "bytes": {
+          "minimum": 0,
           "title": "Bytes",
           "type": "integer"
         }
@@ -25,6 +29,32 @@
       "type": "object"
     },
     "Source": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "local"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "bytes": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "bytes"
+            ]
+          }
+        }
+      ],
       "description": "Provenance. `local` sources trigger the privacy hard rule (ADR-0002).",
       "properties": {
         "kind": {
@@ -33,6 +63,18 @@
         "ref": {
           "title": "Ref",
           "type": "string"
+        },
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
         },
         "title": {
           "anyOf": [
@@ -115,6 +157,7 @@
       "type": "string"
     },
     "StageRecord": {
+      "additionalProperties": false,
       "properties": {
         "state": {
           "$ref": "#/$defs/StageState",
@@ -181,9 +224,10 @@
       "type": "string"
     }
   },
+  "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "default": "0.1.0",
+      "default": "1.0.0",
       "title": "Schema Version",
       "type": "string"
     },
@@ -211,6 +255,7 @@
     }
   },
   "required": [
+    "schema_version",
     "bundle_id",
     "source"
   ],
